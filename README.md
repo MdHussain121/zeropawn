@@ -1,6 +1,6 @@
 # ZeroPawn: AlphaZero-Style Chess Reinforcement Learning Platform
 
-[![CI](https://github.com/MdHussain121/zeropawn/actions/workflows/ci.yml/badge.svg)](https://github.com/MdHussain121/zeropawn/actions/workflows/ci.yml)
+[![CI](https://github.com/MdHussain121/zeropawn/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/MdHussain121/zeropawn/actions/workflows/ci.yml)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue.svg)](https://www.python.org/)
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](https://en.cppreference.com/w/cpp/17)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)]()
