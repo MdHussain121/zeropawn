@@ -85,14 +85,14 @@ class SharedMemoryPool:
                     shm = shared_memory.SharedMemory(name=name, create=True, size=size_bytes)
                 else:
                     shm = shared_memory.SharedMemory(name=name, create=False)
-                    if shm.size != size_bytes:
+                    if shm.size < size_bytes:
                         shm.close()
                         raise ValueError(
-                            f"Shared segment {name} size {shm.size} != expected {size_bytes}"
+                            f"Shared segment {name} size {shm.size} < expected {size_bytes}"
                         )
 
                 self.shm_blocks[key] = shm
-                self.arrays[key] = np.ndarray(shape, dtype=dtype, buffer=shm.buf)
+                self.arrays[key] = np.ndarray(shape, dtype=dtype, buffer=shm.buf[:size_bytes])
 
             if create:
                 atexit.register(self.cleanup)

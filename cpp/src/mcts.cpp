@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <numeric>
 #include <cassert>
+#include <stdexcept>
 
 namespace zeropawn {
 

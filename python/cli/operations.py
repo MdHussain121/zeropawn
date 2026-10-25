@@ -928,7 +928,7 @@ OPERATIONS_REGISTRY: List[OperationDef] = [
         category_name="Inference & Benchmarking",
         name="Extended Batch Scaling Sweep (B=1 to 256)",
         description="Measures pure CUDA inference latency and full MCTS search scaling across configurable batch sizes.",
-        direct_command="chess bench batch-sweep",
+        direct_command="zeropawn bench batch-sweep",
         requires_model="required",
         arguments=[
             OpArgument(
@@ -955,7 +955,7 @@ OPERATIONS_REGISTRY: List[OperationDef] = [
         category_name="Inference & Benchmarking",
         name="Worker Concurrency & Pipelining Delay Sweep",
         description="Sweeps concurrent workers (1-32) and batching delays (0.5-3.0ms) to identify throughput peaks.",
-        direct_command="chess bench concurrency-sweep",
+        direct_command="zeropawn bench concurrency-sweep",
         requires_model="required",
         arguments=[
             OpArgument(
@@ -980,7 +980,7 @@ OPERATIONS_REGISTRY: List[OperationDef] = [
         category_name="Inference & Benchmarking",
         name="End-to-End Pipeline Verification",
         description="Runs full verification across neural inference, MCTS search, tactical puzzles, and match play.",
-        direct_command="chess bench verify",
+        direct_command="zeropawn bench verify",
         requires_model="required",
         arguments=[],
     ),
@@ -1152,8 +1152,8 @@ OPERATIONS_REGISTRY: List[OperationDef] = [
         category_name="MCTS & Search Diagnostics",
         name="MCTS Position Search & Evaluation",
         description="Executes serial or batched MCTS search on any FEN position and reports best move and throughput.",
-        direct_command="chess search",
-        requires_model="required",
+        direct_command="zeropawn search",
+        requires_model="optional",
         arguments=[
             OpArgument(
                 "fen",
@@ -1413,7 +1413,7 @@ OPERATIONS_REGISTRY: List[OperationDef] = [
         category_name="Logs, Telemetry & Diagnostics",
         name="Hardware Profile & Autotuning Targets",
         description="Inspects active hardware fingerprint, autotuned batch size targets, or triggers recalibration.",
-        direct_command="chess hardware profile",
+        direct_command="zeropawn hardware profile",
         requires_model="none",
         arguments=[
             OpArgument("show", "--show", "bool", True, "Display the active hardware profile"),
@@ -1441,7 +1441,7 @@ OPERATIONS_REGISTRY: List[OperationDef] = [
         category_name="Logs, Telemetry & Diagnostics",
         name="Low-Level System Hardware Detection",
         description="Detects CPU cores/threads, RAM, GPU, VRAM, BF16/FP16, and C++ extensions.",
-        direct_command="chess hardware info",
+        direct_command="zeropawn hardware info",
         requires_model="none",
         arguments=[],
     ),
@@ -1451,7 +1451,7 @@ OPERATIONS_REGISTRY: List[OperationDef] = [
         category_name="Logs, Telemetry & Diagnostics",
         name="Calibrate Hardware Autotuner",
         description="Runs micro-benchmarks across batch sizes to calibrate optimal targets for current machine.",
-        direct_command="chess hardware calibrate",
+        direct_command="zeropawn hardware calibrate",
         requires_model="none",
         arguments=[
             OpArgument(

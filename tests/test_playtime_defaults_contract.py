@@ -86,9 +86,11 @@ def test_contract_defaults():
 
 def test_seeded_visit_count_20_positions():
     """Verify that play-time defaults produce bitwise-identical visit counts across 20 positions."""
-    device = "cuda" if torch.cuda.is_available() else "cpu"
     ckpt_path = Path("models/checkpoints_finetune/best_model.pt")
+    if not ckpt_path.is_file():
+        pytest.skip("Protected finetuned best_model.pt not present on clean checkout.")
 
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     sd = ckpt.get("model", ckpt.get("state_dict", ckpt))
     model = ChessNet(num_blocks=12, num_filters=128).to(device)

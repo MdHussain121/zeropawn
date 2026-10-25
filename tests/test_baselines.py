@@ -150,7 +150,7 @@ def test_cli_puzzles_eval_args():
     assert args_default.update_baseline is False
 
 
-def test_puzzles_eval_none_baseline_formatting(monkeypatch, capsys):
+def test_puzzles_eval_none_baseline_formatting(tmp_path, monkeypatch, capsys):
     """Verify evaluation reports 'vs_baseline N/A' cleanly when no baseline exists."""
     from unittest.mock import MagicMock
     from python.cli.commands_puzzles import run_eval_puzzles
@@ -168,10 +168,15 @@ def test_puzzles_eval_none_baseline_formatting(monkeypatch, capsys):
         lambda p, device=None: (MagicMock(), {"step": 1000}),
     )
 
+    dummy_ckpt = tmp_path / "best_model.pt"
+    dummy_ckpt.write_bytes(b"dummy")
+    dummy_puzzles = tmp_path / "puzzles.csv"
+    dummy_puzzles.write_text("id,fen,moves,rating\n", encoding="utf-8")
+
     args = argparse.Namespace(
-        checkpoint="models/checkpoints_scaled/best_model.pt",
+        checkpoint=str(dummy_ckpt),
         device="cpu",
-        puzzles_file="data/puzzles/lichess_puzzles_1000_1200_1600.csv",
+        puzzles_file=str(dummy_puzzles),
         mcts_puzzles=10,
         mcts_sims=10,
         search_mode="serial",
@@ -191,7 +196,7 @@ def test_puzzles_eval_none_baseline_formatting(monkeypatch, capsys):
     assert "vs_baseline N/A (no baseline recorded)" in captured
 
 
-def test_eval_puzzles_now_none_baseline_formatting(monkeypatch, capsys):
+def test_eval_puzzles_now_none_baseline_formatting(tmp_path, monkeypatch, capsys):
     """Verify scripts/eval_puzzles_now.py reports 'vs_baseline N/A' cleanly when no baseline exists."""
     from unittest.mock import MagicMock
     from scripts.eval_puzzles_now import main
@@ -216,14 +221,19 @@ def test_eval_puzzles_now_none_baseline_formatting(monkeypatch, capsys):
     monkeypatch.setattr("python.model.chess_net.ChessNet.load_state_dict", lambda self, sd: None)
     monkeypatch.setattr("python.model.chess_net.ChessNet.to", lambda self, dev: self)
 
+    dummy_ckpt = tmp_path / "best_model.pt"
+    dummy_ckpt.write_bytes(b"dummy")
+    dummy_puzzles = tmp_path / "puzzles.csv"
+    dummy_puzzles.write_text("id,fen,moves,rating\n", encoding="utf-8")
+
     test_args = [
         "eval_puzzles_now.py",
         "--weights",
-        "models/checkpoints_scaled/best_model.pt",
+        str(dummy_ckpt),
         "--device",
         "cpu",
         "--puzzles",
-        "data/puzzles/lichess_puzzles_1000_1200_1600.csv",
+        str(dummy_puzzles),
         "--mcts-puzzles",
         "10",
         "--mcts-sims",

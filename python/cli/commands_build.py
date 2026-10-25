@@ -108,8 +108,9 @@ def run_build_status(args: argparse.Namespace) -> int:
         REPO_ROOT / "build_zeropawn" / "cpp" / "zeropawn_tests.exe",
         REPO_ROOT / "build" / "cpp" / "zeropawn_tests.exe",
         REPO_ROOT / "build" / "cmake" / "cpp" / "zeropawn_tests.exe",
-        REPO_ROOT / "build" / "cmake" / "cpp" / "zeropawn_tests.exe",
-        REPO_ROOT / "build" / "cpp" / "zeropawn_tests.exe",
+        REPO_ROOT / "build" / "cmake" / "cpp" / "zeropawn_tests",
+        REPO_ROOT / "build_zeropawn" / "cpp" / "zeropawn_tests",
+        REPO_ROOT / "build" / "cpp" / "zeropawn_tests",
     ]
     tests_exe = None
     for cand in tests_candidates:
@@ -243,8 +244,9 @@ def run_build_test(args: argparse.Namespace) -> int:
         REPO_ROOT / "build_zeropawn" / "cpp" / "zeropawn_tests.exe",
         REPO_ROOT / "build" / "cpp" / "zeropawn_tests.exe",
         REPO_ROOT / "build" / "cmake" / "cpp" / "zeropawn_tests.exe",
-        REPO_ROOT / "build" / "cmake" / "cpp" / "zeropawn_tests.exe",
-        REPO_ROOT / "build" / "cpp" / "zeropawn_tests.exe",
+        REPO_ROOT / "build" / "cmake" / "cpp" / "zeropawn_tests",
+        REPO_ROOT / "build_zeropawn" / "cpp" / "zeropawn_tests",
+        REPO_ROOT / "build" / "cpp" / "zeropawn_tests",
     ]
     tests_exe = None
     for cand in tests_candidates:

@@ -159,7 +159,9 @@ def get_system_memory_snapshot() -> Dict[str, Any]:
     procs = []
     for p in psutil.process_iter(["pid", "name", "memory_info"]):
         try:
-            procs.append((p.info["pid"], p.info["name"], p.info["memory_info"].rss))
+            mem = p.info.get("memory_info")
+            if mem is not None:
+                procs.append((p.info["pid"], p.info["name"], mem.rss))
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
     procs.sort(key=lambda x: x[2], reverse=True)

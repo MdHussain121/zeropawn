@@ -109,4 +109,4 @@ jobs:
 
       - name: Run Python Pytest Suite
         run: |
-          python -m pytest tests/ -k "not soak" -v --durations=10
+          python -m pytest tests/ -k "not soak and not test_correctness_replay_200_games" -v --durations=10

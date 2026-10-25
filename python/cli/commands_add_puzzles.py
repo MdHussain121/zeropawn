@@ -478,6 +478,7 @@ def run_list_puzzles(args: argparse.Namespace) -> int:
 
     ctx = run_context("puzzles-list")
     t0 = time.time()
+    log_path = "logs/zeropawn.log"
 
     try:
         puzzles_dir = safe_resolve(args.dir)
@@ -487,6 +488,7 @@ def run_list_puzzles(args: argparse.Namespace) -> int:
                 f"Invalid --dir path: {e}",
                 "path escapes repo or is malformed",
                 "pass a repo-relative dir, then see LOG",
+                log_path,
             )
         )
         emit_report(summary_block("FAILED", time.time() - t0, 0, 1))
@@ -515,7 +517,10 @@ def run_list_puzzles(args: argparse.Namespace) -> int:
     if not puzzles_dir.is_dir():
         emit_error(
             error_block(
-                f"Directory not found: {puzzles_dir}", "wrong --dir", "check --dir, then see LOG"
+                f"Directory not found: {puzzles_dir}",
+                "wrong --dir",
+                "check --dir, then see LOG",
+                log_path,
             )
         )
         emit_report(summary_block("FAILED", time.time() - t0, 0, 1))

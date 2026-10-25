@@ -39,14 +39,16 @@ def test_models_download_verify_only_corrupted(tmp_path: Path):
 
 
 def test_models_download_no_url_and_missing_file(tmp_path: Path):
-    """Running download without URL or existing weights returns 1 with helpful guidance."""
+    """Running download with network error returns 1 with helpful guidance."""
+    import urllib.error
+
     target_file = tmp_path / "target.pt"
     args = argparse.Namespace(
         output=str(target_file),
         verify_only=False,
         url=None,
     )
-    with patch.dict("os.environ", {}, clear=False):
+    with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("Network unreachable")):
         ret = run_models_download(args)
     assert ret == 1
     assert not target_file.exists()

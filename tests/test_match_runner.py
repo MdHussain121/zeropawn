@@ -9,6 +9,7 @@ import torch
 
 import zeropawn_cpp
 from python.model.chess_net import ChessNet
+from python.cli.common import get_default_stockfish_path
 from python.eval.match_runner import (
     StockfishPlayer,
     MatchRunner,
@@ -19,9 +20,17 @@ from python.eval.match_runner import (
 )
 
 
+def _resolve_test_stockfish() -> str:
+    sf = get_default_stockfish_path()
+    if sf is None or not sf.is_file():
+        pytest.skip("Stockfish executable not found in tools/ or system PATH.")
+    return str(sf)
+
+
 def test_stockfish_player_basic():
+    sf_bin = _resolve_test_stockfish()
     print("\n  [Op 1/2] Connecting to Stockfish engine (nodes=100)...")
-    sf = StockfishPlayer(stockfish_path="tools/stockfish.exe", nodes=100)
+    sf = StockfishPlayer(stockfish_path=sf_bin, nodes=100)
     try:
         start_fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
         print("  [Op 2/2] Querying best move for standard starting position...")
@@ -33,7 +42,15 @@ def test_stockfish_player_basic():
         sf.close()
 
 
-def test_match_runner_single_pair():
+def test_match_runner_single_pair(tmp_path):
+    sf_bin = _resolve_test_stockfish()
+    openings_file = Path("data/openings/eval_openings_50.epd")
+    if not openings_file.is_file():
+        openings_file = tmp_path / "test_openings.epd"
+        openings_file.write_text(
+            "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1\n", encoding="utf-8"
+        )
+
     print(
         "\n  [Op 1/2] Initializing MatchRunner (ChessNet dummy model, Stockfish at 50 nodes, 10 MCTS sims)..."
     )
@@ -42,10 +59,10 @@ def test_match_runner_single_pair():
     runner = MatchRunner(
         model=model,
         device=device,
-        stockfish_path="tools/stockfish.exe",
+        stockfish_path=sf_bin,
         stockfish_nodes=50,
         mcts_sims=10,
-        openings_path="data/openings/eval_openings_50.epd",
+        openings_path=str(openings_file),
     )
     try:
         # Run match with 1 opening (2 games total: 1 White, 1 Black)
@@ -329,18 +346,26 @@ def test_stockfish_elo_validation():
     assert sig.parameters["stockfish_elo"].default is None
 
 
-def test_match_runner_batched_mode():
+def test_match_runner_batched_mode(tmp_path):
+    sf_bin = _resolve_test_stockfish()
+    openings_file = Path("data/openings/eval_openings_50.epd")
+    if not openings_file.is_file():
+        openings_file = tmp_path / "test_openings.epd"
+        openings_file.write_text(
+            "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1\n", encoding="utf-8"
+        )
+
     model = ChessNet(num_blocks=2, num_filters=32)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     runner = MatchRunner(
         model=model,
         device=device,
-        stockfish_path="tools/stockfish.exe",
+        stockfish_path=sf_bin,
         stockfish_nodes=50,
         mcts_sims=10,
         search_mode="batched",
         batch_size=8,
-        openings_path="data/openings/eval_openings_50.epd",
+        openings_path=str(openings_file),
     )
     assert runner.search_mode == "batched"
     assert runner.batch_size == 8

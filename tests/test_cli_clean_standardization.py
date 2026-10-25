@@ -83,6 +83,7 @@ def test_obsolete_launchers_removed():
         assert not p.exists(), f"Obsolete launcher still exists: {p}"
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows batch files require cmd.exe")
 def test_canonical_launcher_and_wrapper_behavior():
     """Verify primary launcher zeropawn.cmd and compatibility wrapper chess.cmd."""
     # 1. Primary launcher zeropawn.cmd forwards arguments and preserves exit code

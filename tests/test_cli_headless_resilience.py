@@ -96,7 +96,7 @@ def test_path_containment_strict_bounds():
     assert _is_subpath_of(fake_prefix, REPO_ROOT) is False
 
     # Grandparent escape attempt
-    outside = Path("C:/Windows")
+    outside = Path("C:/Windows" if sys.platform == "win32" else "/etc")
     assert _is_subpath_of(outside, REPO_ROOT) is False
 
     # Traversal rejection in safe_resolve
