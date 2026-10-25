@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+message: "If you use ZeroPawn in your research or project, please cite it as below."
+authors:
+  - name: "ZeroPawn Maintainers"
+title: "ZeroPawn: AlphaZero-Style Chess Reinforcement Learning Platform"
+version: 0.1.0
+date-released: 2026-10-25
+url: "https://github.com/MdHussain121/zeropawn"
+repository-code: "https://github.com/MdHussain121/zeropawn.git"
+license: "MIT"
+keywords:
+  - chess
+  - reinforcement-learning
+  - alphazero
+  - monte-carlo-tree-search
+  - pytorch
+  - cpp17

@@ -1,0 +1,34 @@
+{
+  "version": "1.0",
+  "updated_at": "2026-10-15T09:43:46.884298",
+  "presets": {
+    "run1-512": {
+      "id": "run1-512",
+      "name": "run1-512",
+      "description": "User preset for Phase 2 Supervised Warm-Start",
+      "operation": "train_supervised",
+      "subcommand": null,
+      "args": [
+        "--epochs",
+        "4",
+        "--batch-size",
+        "512",
+        "--lr",
+        "0.0002",
+        "--checkpoint",
+        "models/checkpoints_scaled/best_model.pt"
+      ],
+      "parameters": {
+        "epochs": 4,
+        "batch_size": 512,
+        "lr": 0.0002,
+        "train_dir": "data/dataset_scaled/train",
+        "val_dir": "data/dataset_scaled/val"
+      },
+      "model": "models/checkpoints_scaled/best_model.pt",
+      "is_builtin": false,
+      "created_at": "2026-10-15T09:43:46.884298",
+      "updated_at": "2026-10-15T09:43:46.884298"
+    }
+  }
+}

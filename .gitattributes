@@ -1,0 +1,35 @@
+# Auto-detect text files and normalize line endings to LF on commit
+* text=auto
+
+# Python, C++, config, and docs source files: always LF
+*.py text eol=lf
+*.pyi text eol=lf
+*.cpp text eol=lf
+*.hpp text eol=lf
+*.h text eol=lf
+*.md text eol=lf
+*.toml text eol=lf
+*.json text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.txt text eol=lf
+*.sh text eol=lf
+
+# Windows command batch files: always CRLF
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# Binary files
+*.bin binary
+*.pt binary
+*.pyd binary
+*.dll binary
+*.so binary
+*.dylib binary
+*.exe binary
+*.tfevents* binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary

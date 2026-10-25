@@ -1,0 +1,97 @@
+# ── Build & Compilers ────────────────────────────────────────────────────────
+build*/
+_build/
+cmake-build-*/
+tools/
+*.o
+*.obj
+*.exe
+*.pyd
+*.so
+*.dylib
+*.dll
+*.a
+*.lib
+
+# ── CMake Artifacts ──────────────────────────────────────────────────────────
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+compile_commands.json
+CTestTestfile.cmake
+Testing/
+CMakeUserPresets.json
+
+# ── Python & Packaging ───────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+*.whl
+.installed.cfg
+
+# ── Virtual Environments ────────────────────────────────────────────────────
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+# ── Testing & Linting ────────────────────────────────────────────────────────
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+.hypothesis/
+
+# ── Machine Learning Artifacts, Big Data & Local Directories ──────
+/models/
+/data/
+/apps/
+/docs/
+/reports/
+/runs/
+/scratch/
+tests/apps/
+.streamlit/
+*.pt
+*.onnx
+*.safetensors
+/data/syzygy/
+*.bin
+*.tfevents*
+
+# ── IDE & Editors ────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*.sublime-project
+*.sublime-workspace
+.project
+.cproject
+.settings/
+
+# ── Operating System Junk ────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+ehthumbs.db
+desktop.ini
+
+# ── Temporary Outputs & Logs ─────────────────────────────────────────────────
+/tmp/
+/temp/
+/scratch/*.tmp
+/logs/
+*.log
+stdout*.txt
+stderr*.txt
+tests_output*.txt
+quarantine/

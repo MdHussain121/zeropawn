@@ -1,0 +1,101 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 20,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "default",
+      "displayName": "Default Release",
+      "description": "Standard Release build in build/cmake",
+      "binaryDir": "${sourceDir}/build/cmake",
+      "generator": "Ninja",
+      "configurationTypes": ["Release"],
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CHESSRL_BUILD_PYTHON": "ON",
+        "CHESSRL_BUILD_TESTS": "ON"
+      }
+    },
+    {
+      "name": "windows-mingw",
+      "displayName": "Windows MinGW Release",
+      "description": "Windows build using MinGW/GCC and Ninja",
+      "binaryDir": "${sourceDir}/build/cmake",
+      "generator": "Ninja",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CHESSRL_BUILD_PYTHON": "ON",
+        "CHESSRL_BUILD_TESTS": "ON"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    },
+    {
+      "name": "linux-gcc",
+      "displayName": "Linux GCC Release",
+      "description": "Linux build using GCC and Ninja",
+      "binaryDir": "${sourceDir}/build/cmake",
+      "generator": "Ninja",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CHESSRL_BUILD_PYTHON": "ON",
+        "CHESSRL_BUILD_TESTS": "ON"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      }
+    },
+    {
+      "name": "macos-clang",
+      "displayName": "macOS Clang Release",
+      "description": "macOS build using Apple Clang and Ninja",
+      "binaryDir": "${sourceDir}/build/cmake",
+      "generator": "Ninja",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CHESSRL_BUILD_PYTHON": "ON",
+        "CHESSRL_BUILD_TESTS": "ON"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "default",
+      "configurePreset": "default"
+    },
+    {
+      "name": "windows-mingw",
+      "configurePreset": "windows-mingw"
+    },
+    {
+      "name": "linux-gcc",
+      "configurePreset": "linux-gcc"
+    },
+    {
+      "name": "macos-clang",
+      "configurePreset": "macos-clang"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "default",
+      "configurePreset": "default",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}
