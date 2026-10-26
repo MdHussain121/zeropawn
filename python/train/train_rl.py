@@ -579,6 +579,7 @@ class RLTrainer:
         ckpt = {
             "model": self.model.state_dict(),
             "optimizer": self.optimizer.state_dict(),
+            "_optimizer_type": type(self.optimizer).__name__,
             "scheduler": self.scheduler.state_dict(),
             "step": self.step_num,
             "num_blocks": num_blocks,
@@ -626,6 +627,67 @@ class RLTrainer:
                 logger.debug("checkpoint prune skipped: %s", e)
         return str(path)
 
+    # Keys torch re-derives on load or shares across optimizer families.
+    _COMMON_OPTIMIZER_KEYS = frozenset(
+        {
+            "lr",
+            "weight_decay",
+            "maximize",
+            "foreach",
+            "fused",
+            "differentiable",
+            "capturable",
+            "nesterov",
+            "initial_lr",
+        }
+    )
+
+    def _optimizer_state_compatible(
+        self,
+        opt_state: Dict[str, Any],
+        saved_type: Optional[str],
+        path: Union[str, Path],
+    ) -> bool:
+        """Return True only when optimizer state may be restored without poisoning this trainer.
+
+        Restoring a foreign optimizer's state_dict (e.g. supervised AdamW state into the
+        RL SGD optimizer) silently replaces SGD's hyperparameters and crashes on the
+        first step with ``KeyError: 'momentum'``. Per the optimizer-isolation decision,
+        model weights are always restored; foreign optimizer state is discarded.
+        """
+        current_type = type(self.optimizer).__name__
+        if saved_type is not None:
+            if saved_type == current_type:
+                return True
+            logger.warning(
+                "Checkpoint optimizer (%s) differs from configured optimizer (%s); "
+                "restoring model weights only (optimizer state discarded): %s",
+                saved_type,
+                current_type,
+                path,
+            )
+            return False
+        current_keys: set = set()
+        for group in self.optimizer.param_groups:
+            current_keys.update(group.keys())
+        for group in opt_state.get("param_groups") or []:
+            extra = (
+                {k for k in group if k not in current_keys}
+                - self._COMMON_OPTIMIZER_KEYS
+                - {"params"}
+            )
+            if extra:
+                logger.warning(
+                    "Checkpoint optimizer state (unexpected keys %s) does not match "
+                    "configured optimizer (%s); restoring model weights only "
+                    "(optimizer state discarded): %s",
+                    sorted(extra),
+                    current_type,
+                    path,
+                )
+                return False
+        return True
+
     def load_checkpoint(
         self,
         path: Union[str, Path],
@@ -640,13 +702,15 @@ class RLTrainer:
             raise RuntimeError(f"Checkpoint '{path}' is invalid: missing 'model' weights.")
         _validate_arch(ckpt, self.model, path)
         self.model.load_state_dict(ckpt.get("model"))
-        if ckpt.get("optimizer") is not None:
-            try:
-                self.optimizer.load_state_dict(ckpt["optimizer"])
-            except (RuntimeError, KeyError, ValueError) as e:
-                raise RuntimeError(
-                    f"Checkpoint '{path}' has an incompatible optimizer state: {e}"
-                ) from e
+        opt_state = ckpt.get("optimizer")
+        if opt_state is not None:
+            if self._optimizer_state_compatible(opt_state, ckpt.get("_optimizer_type"), path):
+                try:
+                    self.optimizer.load_state_dict(opt_state)
+                except (RuntimeError, KeyError, ValueError) as e:
+                    raise RuntimeError(
+                        f"Checkpoint '{path}' has an incompatible optimizer state: {e}"
+                    ) from e
         if ckpt.get("scheduler") is not None and hasattr(self.scheduler, "load_state_dict"):
             try:
                 saved_sched = ckpt["scheduler"]

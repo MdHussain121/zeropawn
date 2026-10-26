@@ -46,7 +46,8 @@ CATEGORIES: Dict[int, str] = {
     10: "Maintenance & Utilities",
 }
 
-# The complete, unified 42-operation registry
+# The complete, unified operations registry (88 curated operations; enriched at runtime
+# with all discoverable parser subcommands)
 OPERATIONS_REGISTRY: List[OperationDef] = [
     # ---------------- Category 1: Training & RL ----------------
     OperationDef(

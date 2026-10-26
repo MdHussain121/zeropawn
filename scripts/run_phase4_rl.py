@@ -1487,18 +1487,7 @@ class Phase4Orchestrator:
             self._exit_reason = "interrupted"
             return 0
         except Exception as e:
-            self.stop()
-            emit_error(
-                error_block(
-                    f"unexpected failure: {e}",
-                    "unhandled exception in self-play, training, or evaluation",
-                    "see LOG traceback, fix the cause, resume with the same command",
-                    str(self.log_dir / "phase4_rl.log"),
-                )
-            )
-            self._print_summary("FAILED")
-            self._exit_reason = "error"
-            return 1
+            return self._handle_unexpected_error(e)
         else:
             self.stop()
             self._print_summary("SUCCESS")
@@ -1506,6 +1495,22 @@ class Phase4Orchestrator:
             return 0
         finally:
             self.stop()
+
+    def _handle_unexpected_error(self, e: Exception) -> int:
+        """Clean up after an unhandled exception and report it (always logs the traceback)."""
+        logger.exception("Phase 4 run failed: %s", e)
+        self.stop()
+        emit_error(
+            error_block(
+                f"unexpected failure: {e}",
+                "unhandled exception in self-play, training, or evaluation",
+                "see LOG traceback, fix the cause, resume with the same command",
+                str(self.log_dir / "phase4_rl.log"),
+            )
+        )
+        self._print_summary("FAILED")
+        self._exit_reason = "error"
+        return 1
 
     def _print_summary(self, status: str) -> None:
         """Exit/SIGINT summary: totals from counters + standard footer."""

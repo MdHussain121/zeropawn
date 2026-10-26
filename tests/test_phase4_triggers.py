@@ -304,3 +304,31 @@ def test_passive_would_resign_logging_at_ply_ge_30():
 
     assert game.would_have_resigned is True
     assert game.would_have_resigned_side_white is True
+
+
+def test_unexpected_error_handler_logs_traceback(tmp_path, caplog):
+    """Unhandled exceptions must always record the traceback in the log.
+
+    Regression for the 2026-10-26 Phase 4 KeyError: 'momentum' incident, where the
+    except-handler printed only str(e) to stdout and the log file carried no traceback.
+    """
+    orchestrator = object.__new__(Phase4Orchestrator)
+    orchestrator.stop = MagicMock()
+    orchestrator._print_summary = MagicMock()
+    orchestrator._exit_reason = None
+    orchestrator.log_dir = tmp_path
+
+    with caplog.at_level(logging.ERROR, logger="phase4_rl"):
+        try:
+            raise KeyError("momentum")
+        except KeyError as exc:
+            exit_code = orchestrator._handle_unexpected_error(exc)
+
+    assert exit_code == 1
+    assert orchestrator._exit_reason == "error"
+    orchestrator.stop.assert_called_once()
+    orchestrator._print_summary.assert_called_once_with("FAILED")
+    traceback_records = [r for r in caplog.records if r.exc_info is not None]
+    assert traceback_records, "Handler must log the exception traceback"
+    assert isinstance(traceback_records[0].exc_info[1], KeyError)
+    assert "momentum" in str(traceback_records[0].exc_info[1])
