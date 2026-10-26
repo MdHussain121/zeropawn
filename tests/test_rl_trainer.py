@@ -519,3 +519,130 @@ def test_cli_parser_defaults_and_user_customization():
     sig = inspect.signature(Phase4Orchestrator.__init__)
     assert sig.parameters["policy_target_temp"].default == 0.5
     assert sig.parameters["entropy_bonus"].default == 0.001
+
+
+def test_rl_trainer_checkpoint_stamps_optimizer_type(tmp_path):
+    """Verify RL checkpoints record the producing optimizer type for safe resume detection."""
+    buf = ReplayBuffer(buffer_dir=tmp_path / "buf_stamp", capacity=100, create_new=True)
+    buf.add_positions(_create_dummy_positions(32, full_prob=0.5))
+    model = ChessNet(num_blocks=2, num_filters=32)
+    trainer = RLTrainer(
+        model=model,
+        replay_buffer=buf,
+        batch_size=16,
+        checkpoint_dir=tmp_path / "ckpts_stamp",
+        sync_weights_path=tmp_path / "sync.pt",
+    )
+    ckpt_file = trainer.save_checkpoint()
+    ckpt = torch.load(ckpt_file, map_location="cpu", weights_only=True)
+    assert ckpt.get("_optimizer_type") == "SGD"
+
+
+def test_rl_trainer_resume_from_foreign_optimizer_discards_state(tmp_path, caplog):
+    """Warm-starting from a supervised (AdamW) checkpoint must not poison the SGD optimizer.
+
+    Regression for the 2026-10-26 Phase 4 incident: importing AdamW optimizer state into
+    the SGD trainer crashed on the first train_step with KeyError: 'momentum'.
+    """
+    import logging
+
+    buf = ReplayBuffer(buffer_dir=tmp_path / "buf_foreign", capacity=100, create_new=True)
+    buf.add_positions(_create_dummy_positions(32, full_prob=0.5))
+
+    old_model = ChessNet(num_blocks=2, num_filters=32)
+    adamw = torch.optim.AdamW(old_model.parameters(), lr=0.0002)
+    ckpt = {
+        "model": old_model.state_dict(),
+        "optimizer": adamw.state_dict(),
+        "_optimizer_type": "AdamW",
+        "scheduler": None,
+        "step": 6000,
+        "num_blocks": 2,
+        "num_filters": 32,
+    }
+    ckpt_file = tmp_path / "supervised_ckpt.pt"
+    torch.save(ckpt, ckpt_file)
+
+    model = ChessNet(num_blocks=2, num_filters=32)
+    trainer = RLTrainer(
+        model=model,
+        replay_buffer=buf,
+        batch_size=16,
+        checkpoint_dir=tmp_path / "ckpts_foreign",
+        sync_weights_path=tmp_path / "sync.pt",
+    )
+    with caplog.at_level(logging.WARNING, logger="python.train.train_rl"):
+        trainer.load_checkpoint(ckpt_file)
+    assert any("restoring model weights only" in r.message for r in caplog.records)
+    assert trainer.step_num == 6000
+    # SGD hyperparameters remain intact and the first optimizer step succeeds.
+    metrics = trainer.train_step()
+    assert metrics["step"] == 6001
+
+
+def test_rl_trainer_resume_from_legacy_unstamped_foreign_optimizer(tmp_path, caplog):
+    """Unstamped (legacy) foreign optimizer state must also be detected and discarded."""
+    import logging
+
+    buf = ReplayBuffer(buffer_dir=tmp_path / "buf_legacy", capacity=100, create_new=True)
+    buf.add_positions(_create_dummy_positions(32, full_prob=0.5))
+
+    old_model = ChessNet(num_blocks=2, num_filters=32)
+    adamw = torch.optim.AdamW(old_model.parameters(), lr=0.0002)
+    ckpt = {
+        "model": old_model.state_dict(),
+        "optimizer": adamw.state_dict(),
+        "scheduler": None,
+        "step": 100,
+        "num_blocks": 2,
+        "num_filters": 32,
+    }
+    ckpt_file = tmp_path / "legacy_ckpt.pt"
+    torch.save(ckpt, ckpt_file)
+
+    model = ChessNet(num_blocks=2, num_filters=32)
+    trainer = RLTrainer(
+        model=model,
+        replay_buffer=buf,
+        batch_size=16,
+        checkpoint_dir=tmp_path / "ckpts_legacy",
+        sync_weights_path=tmp_path / "sync.pt",
+    )
+    with caplog.at_level(logging.WARNING, logger="python.train.train_rl"):
+        trainer.load_checkpoint(ckpt_file)
+    assert any("restoring model weights only" in r.message for r in caplog.records)
+    metrics = trainer.train_step()
+    assert metrics["step"] == 101
+
+
+def test_rl_trainer_resume_restores_sgd_momentum_state(tmp_path):
+    """Same-optimizer resume keeps restoring SGD momentum buffers (no behavior change)."""
+    buf = ReplayBuffer(buffer_dir=tmp_path / "buf_sgd", capacity=100, create_new=True)
+    buf.add_positions(_create_dummy_positions(32, full_prob=0.5))
+    model = ChessNet(num_blocks=2, num_filters=32)
+    trainer = RLTrainer(
+        model=model,
+        replay_buffer=buf,
+        batch_size=16,
+        checkpoint_dir=tmp_path / "ckpts_sgd",
+        sync_weights_path=tmp_path / "sync.pt",
+    )
+    trainer.train_step()
+    ckpt_file = trainer.save_checkpoint()
+    assert any(
+        "momentum_buffer" in state for state in trainer.optimizer.state.values()
+    ), "SGD momentum buffers should exist after a training step"
+
+    resumed_model = ChessNet(num_blocks=2, num_filters=32)
+    resumed = RLTrainer(
+        model=resumed_model,
+        replay_buffer=buf,
+        batch_size=16,
+        checkpoint_dir=tmp_path / "ckpts_sgd",
+        sync_weights_path=tmp_path / "sync.pt",
+    )
+    resumed.load_checkpoint(ckpt_file)
+    restored = sum(
+        1 for state in resumed.optimizer.state.values() if "momentum_buffer" in state
+    )
+    assert restored > 0, "Same-optimizer resume must still restore SGD momentum buffers"

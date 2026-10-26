@@ -9,7 +9,7 @@
 
 **ZeroPawn** is an end-to-end AlphaZero-style chess reinforcement learning platform and chess engine designed for high throughput, reproducibility, and robust evaluation on consumer hardware.
 
-ZeroPawn pairs an optimized C++17 bitboard chess engine and Monte Carlo Tree Search (MCTS) core with a PyTorch dual-head Residual Neural Network (`ChessNet`). It incorporates an asynchronous batched inference server, memory-mapped replay buffers with dynamic human data tapering, Syzygy endgame tablebase adjudication, Stockfish calibration baselines, and a comprehensive 80-operation Rich terminal CLI.
+ZeroPawn pairs an optimized C++17 bitboard chess engine and Monte Carlo Tree Search (MCTS) core with a PyTorch dual-head Residual Neural Network (`ChessNet`). It incorporates an asynchronous batched inference server, memory-mapped replay buffers with dynamic human data tapering, Syzygy endgame tablebase adjudication, Stockfish calibration baselines, and a comprehensive Rich terminal CLI (124 executable commands; 88 curated operations across 10 functional categories).
 
 ---
 
@@ -207,7 +207,7 @@ zeropawn eval baseline --elo 1500 --openings 50 --sims 800
 
 ## 📚 Core CLI Workflows & Interactive Discovery
 
-ZeroPawn provides an exhaustive Rich terminal CLI spanning 114 executable commands and 360+ arguments across 10 functional categories.
+ZeroPawn provides an exhaustive Rich terminal CLI spanning 124 executable commands and 460+ arguments across 10 functional categories (88 curated operations in the operations registry).
 
 ### Interactive Discovery & Argument Builders
 Explore and configure all supported commands and combinations directly from your terminal:

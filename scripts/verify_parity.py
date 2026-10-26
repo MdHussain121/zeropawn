@@ -249,7 +249,7 @@ def verify_checkpoints() -> tuple[bool, str]:
     after_file.write_text(json.dumps(after_info, indent=2), encoding="utf-8")
 
     # Verify locked warm-start checkpoint SHA-256
-    LOCKED_BEST_MODEL_SHA = "54d462823837f77c60621fb72e1a1474eca3dc9dbb2a2969d87ced18ada2b7df"
+    LOCKED_BEST_MODEL_SHA = "79a72ef746f4bfda2555fe7d0ec04970be7ccd4a39e282e16a05594ed15bc36b"
     best_info = after_info.get("models/checkpoints_scaled/best_model.pt", {})
     if best_info.get("sha256") != LOCKED_BEST_MODEL_SHA:
         return (

@@ -28,9 +28,10 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
-# Known SHA-256 for protected supervised baseline checkpoint
-EXPECTED_BASELINE_HASH_PREFIX = "54d46282"
-FULL_BASELINE_SHA256 = "54d462823837f77c60621fb72e1a1474eca3dc9dbb2a2969d87ced18ada2b7df"
+# SHA-256 of the certified supervised baseline checkpoint (models/manifest.json,
+# "active_baseline", certified 2026-10-22).
+EXPECTED_BASELINE_HASH_PREFIX = "79a72ef7"
+FULL_BASELINE_SHA256 = "79a72ef746f4bfda2555fe7d0ec04970be7ccd4a39e282e16a05594ed15bc36b"
 
 
 def compute_file_sha256(path: Path, max_bytes: Optional[int] = None) -> str:
