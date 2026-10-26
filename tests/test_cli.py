@@ -31,7 +31,8 @@ def test_cli_parser_build():
     assert args.command in ["train", "tr"]
     assert args.max_hours == 10.0
     assert args.verify is True
-    assert args.concurrent_games == 48
+    # R-13: CLI default matches the standalone runner (24) to bound the RAM footprint.
+    assert args.concurrent_games == 24
 
     args = parser.parse_args(["match", "-n", "10", "--mcts-sims", "30"])
     assert args.command in ["match", "play", "stockfish", "vs"]

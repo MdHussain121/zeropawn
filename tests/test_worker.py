@@ -121,6 +121,34 @@ def test_playout_cap_randomization(test_inference_client):
     assert full_count + fast_count == len(positions)
 
 
+def test_worker_assigns_distinct_per_game_seeds(test_inference_client):
+    """R-09: concurrent games in a seeded worker must not share one RNG seed.
+
+    Sharing the worker seed across all game threads makes every game draw identical
+    Dirichlet noise and temperature samples, so a 24-game batch degenerates into
+    duplicates of one game.
+    """
+    worker = SelfPlayWorker(
+        worker_id=1,
+        client=test_inference_client,
+        num_concurrent_games=4,
+        game_type="chess",
+        seed=42,
+    )
+    seeds = [worker._game_seed(game_id) for game_id in range(1, 25)]
+    assert all(s is not None for s in seeds)
+    assert len(set(seeds)) == len(seeds)
+
+    unseeded = SelfPlayWorker(
+        worker_id=2,
+        client=test_inference_client,
+        num_concurrent_games=2,
+        game_type="chess",
+        seed=None,
+    )
+    assert unseeded._game_seed(7) is None
+
+
 def test_concurrent_selfplay_worker(test_inference_client):
     """Verify SelfPlayWorker runs multiple concurrent games and generates positions."""
     collected_positions = []

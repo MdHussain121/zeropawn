@@ -84,6 +84,51 @@ def test_rl_trainer_loss_masking_and_step(tmp_path):
     assert metrics["total_loss"] > 0
 
 
+def test_policy_entropy_metric_is_legal_move_masked(tmp_path):
+    """R-01: policy entropy must be measured over legal moves, not all 4672 slots.
+
+    A position with k visited (legal) moves has entropy <= log(k). Measuring the raw
+    4672-way softmax instead yields ~log(4672)=8.45 regardless of the legal-move
+    distribution, which is what made the entropy-collapse trigger blind.
+    """
+    torch.manual_seed(0)
+    buf = ReplayBuffer(buffer_dir=tmp_path / "entropy_buf", capacity=64, create_new=True)
+    model = ChessNet(num_blocks=2, num_filters=32)
+    trainer = RLTrainer(
+        model=model,
+        replay_buffer=buf,
+        batch_size=8,
+        checkpoint_dir=tmp_path / "ckpt_entropy",
+        sync_weights_path=tmp_path / "sync_entropy.pt",
+    )
+
+    n = 8
+    planes = torch.randn(n, 19, 8, 8)
+    visits = torch.zeros(n, 4672)
+    legal_counts = []
+    for i in range(n):
+        k = (i % 4) + 1  # 1..4 legal moves per row
+        legal_counts.append(k)
+        visits[i, i * 7 : i * 7 + k] = 1.0
+    batch = {
+        "planes": planes,
+        "visits": visits,
+        "outcomes": torch.zeros(n, dtype=torch.long),
+        "is_full_search": torch.ones(n, dtype=torch.bool),
+    }
+
+    metrics = trainer.train_step(batch_dict=batch)
+    assert metrics["policy_entropy"] <= float(np.log(max(legal_counts))) + 1e-3
+
+    # Degenerate case: exactly one legal move per position -> entropy is 0.
+    visits_one = torch.zeros(n, 4672)
+    for i in range(n):
+        visits_one[i, i] = 1.0
+    batch_one = dict(batch, visits=visits_one)
+    metrics_one = trainer.train_step(batch_dict=batch_one)
+    assert metrics_one["policy_entropy"] < 1e-4
+
+
 def test_rl_trainer_push_weights_and_resumability(tmp_path):
     """Verify pushing weights to inference server and resuming from checkpoint."""
     buf = ReplayBuffer(
@@ -314,8 +359,13 @@ def test_rl_trainer_loss_equivalence_with_defaults(tmp_path):
     # Pre-change: target was full_visits directly
     expected_pol_loss = -(full_visits * log_probs).sum(dim=-1).mean()
     expected_wdl_loss = torch.nn.functional.cross_entropy(w_logits.float(), outcomes)
-    probs_full = torch.nn.functional.softmax(full_p_logits, dim=-1)
-    expected_entropy_reg = -(probs_full * torch.log(probs_full + 1e-12)).sum(dim=-1).mean()
+    # Entropy is measured over the legal-move set only (R-01): the visited slots are the
+    # legal-move proxy, so illegal slots are excluded from the distribution.
+    legal_mask = full_visits > 0
+    expected_log_probs = torch.nn.functional.log_softmax(
+        full_p_logits.masked_fill(~legal_mask, -1e9), dim=-1
+    )
+    expected_entropy_reg = -(expected_log_probs.exp() * expected_log_probs).sum(dim=-1).mean()
     expected_total_loss = expected_pol_loss + 0.5 * expected_wdl_loss - 0.005 * expected_entropy_reg
 
     # Run actual train step on model2
@@ -338,7 +388,10 @@ def test_entropy_bonus_scaling(tmp_path):
     planes = torch.randn(8, 19, 8, 8, dtype=torch.float32)
     visits = torch.zeros(8, 4672, dtype=torch.float32)
     for i in range(8):
+        # Several visited (legal) moves so the legal-move entropy is non-zero.
         visits[i, 1] = 10.0
+        visits[i, 2] = 5.0
+        visits[i, 3] = 2.0
     outcomes = torch.tensor([1] * 8, dtype=torch.long)
     is_full = torch.tensor([True] * 8, dtype=torch.bool)
     batch_dict = {

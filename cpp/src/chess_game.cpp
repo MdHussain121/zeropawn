@@ -170,8 +170,16 @@ std::vector<int> ChessGame::legal_actions() const {
 }
 
 void ChessGame::apply_action(int action) {
+    // Hot path for MCTS/self-play: the action index was produced by
+    // index_to_move()/legal_actions(), so it is already legal. Decoding and applying
+    // it directly avoids regenerating the whole legal move list (which make_move_uci
+    // would do) on every simulation step.
     std::string uci = index_to_move(*this, action);
-    make_move_uci(uci);
+    if (uci.empty()) return;
+    chess::Move m = chess::uci::uciToMove(board_, uci);
+    if (m == chess::Move::NO_MOVE) return;
+    board_.makeMove(m);
+    move_history_.push_back(m);
 }
 
 bool ChessGame::is_terminal() const {

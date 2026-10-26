@@ -35,6 +35,9 @@ public:
     bool is_insufficient_material() const;
     int half_move_clock() const;
     int full_move_number() const;
+    // Number of moves applied in this game object (exact ply count, unlike the
+    // halfmove-clock estimate derived from a FEN).
+    int history_len() const { return static_cast<int>(move_history_.size()); }
 
     // Game interface overrides
     std::unique_ptr<Game> clone() const override;

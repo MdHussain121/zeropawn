@@ -51,6 +51,25 @@ def create_mock_orchestrator(tmp_path) -> Phase4Orchestrator:
     return orchestrator
 
 
+def test_promotion_gate_requires_sample_and_score(tmp_path):
+    """R-07: best_eval.pt promotion needs a real match sample and a real score."""
+    orchestrator = object.__new__(Phase4Orchestrator)
+    orchestrator.promotion_min_games = 100
+    orchestrator.promotion_min_score = 0.55
+
+    ok, reason = orchestrator._promotion_gate({"total_games": 10, "engine_score": 0.95})
+    assert not ok
+    assert "insufficient sample" in reason
+
+    ok, reason = orchestrator._promotion_gate({"total_games": 100, "engine_score": 0.54})
+    assert not ok
+    assert "engine score" in reason
+
+    ok, reason = orchestrator._promotion_gate({"total_games": 100, "engine_score": 0.56})
+    assert ok
+    assert "100 games" in reason
+
+
 def test_false_resign_log_only_warning(tmp_path, caplog):
     """Test (g): False-resign rate > 5% logs a warning and does NOT raise SafetyTriggerException."""
     orchestrator = create_mock_orchestrator(tmp_path)

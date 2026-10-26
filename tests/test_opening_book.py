@@ -131,6 +131,33 @@ def test_book_depth_cutoff(sample_book_file: Path):
     assert res is None
 
 
+def test_cpp_game_history_len_is_exact():
+    """R-04: the C++ game must expose its exact ply count.
+
+    The opening-book depth cutoff is measured from the real ply, not from a FEN-derived
+    estimate, so the binding has to report the number of applied moves.
+    """
+    import zeropawn_cpp
+
+    game = zeropawn_cpp.ChessGame()
+    assert game.history_len() == 0
+    for uci in ("e2e4", "e7e5", "g1f3"):
+        game.apply_action(game.string_to_action(uci))
+    assert game.history_len() == 3
+    assert game.unmake_move()
+    assert game.history_len() == 2
+    game.set_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
+    assert game.history_len() == 0
+
+
+def test_book_lookup_honours_explicit_current_ply(sample_book_file: Path):
+    """R-04: an explicit ply overrides the position-derived ply for the depth cutoff."""
+    book = OpeningBook(book_path=sample_book_file, max_depth_plies=2)
+    board = chess.Board()
+    assert book.lookup(board, current_ply=0) is not None
+    assert book.lookup(board, current_ply=2) is None
+
+
 def test_book_fallback_when_disabled(sample_book_file: Path):
     """Verify book lookup returns None when disabled."""
     book = OpeningBook(book_path=sample_book_file, enabled=False)

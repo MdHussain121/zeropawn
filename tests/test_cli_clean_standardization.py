@@ -86,9 +86,15 @@ def test_obsolete_launchers_removed():
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows batch files require cmd.exe")
 def test_canonical_launcher_and_wrapper_behavior():
     """Verify primary launcher zeropawn.cmd and compatibility wrapper chess.cmd."""
+    # Absolute paths: with NoDefaultCurrentDirectoryInExePath set (hardened Windows
+    # default on some machines) cmd.exe refuses to launch a bare script name from the
+    # current directory, which would fail this test for environmental reasons.
+    zeropawn_cmd = str(REPO_ROOT / "zeropawn.cmd")
+    chess_cmd = str(REPO_ROOT / "chess.cmd")
+
     # 1. Primary launcher zeropawn.cmd forwards arguments and preserves exit code
     zp_proc = subprocess.run(
-        ["cmd.exe", "/c", "zeropawn.cmd", "--version"],
+        ["cmd.exe", "/c", zeropawn_cmd, "--version"],
         capture_output=True,
         text=True,
         cwd=str(REPO_ROOT),
@@ -98,7 +104,7 @@ def test_canonical_launcher_and_wrapper_behavior():
 
     # 2. Compatibility wrapper chess.cmd forwards arguments and prints deprecation to stderr
     ch_proc = subprocess.run(
-        ["cmd.exe", "/c", "chess.cmd", "--version"],
+        ["cmd.exe", "/c", chess_cmd, "--version"],
         capture_output=True,
         text=True,
         cwd=str(REPO_ROOT),
@@ -109,7 +115,7 @@ def test_canonical_launcher_and_wrapper_behavior():
 
     # 3. Compatibility wrapper chess.cmd in UCI mode suppresses deprecation on stderr
     uci_proc = subprocess.run(
-        ["cmd.exe", "/c", "chess.cmd", "uci"],
+        ["cmd.exe", "/c", chess_cmd, "uci"],
         input="quit\n",
         capture_output=True,
         text=True,

@@ -382,8 +382,11 @@ def main() -> None:
     parser.add_argument(
         "--concurrent-games",
         type=int,
-        default=48,
-        help="Number of concurrent self-play games (default 48)",
+        default=24,
+        help=(
+            "Number of concurrent self-play games (default 24, matching the training "
+            "default; raise deliberately — 48 roughly doubles the RAM footprint)"
+        ),
     )
     parser.add_argument(
         "--buffer-capacity",

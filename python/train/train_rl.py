@@ -62,6 +62,38 @@ def _safe_numpy_rng_state(state: Optional[tuple] = None) -> tuple:
     return s
 
 
+# Finite stand-in for -inf when masking illegal policy logits. Using -inf directly
+# makes exp(log_softmax) == 0 and 0 * -inf == NaN in the entropy expression.
+_MASKED_LOGIT = -1e9
+
+
+def _masked_policy_entropy(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Mean Shannon entropy (nats) of softmax(logits) restricted to ``mask``.
+
+    ``logits`` is [B, A] and ``mask`` is a bool [B, A] legal-action mask. Illegal
+    actions are pushed to ``_MASKED_LOGIT`` so they carry exactly zero probability and
+    contribute nothing to the entropy, keeping every intermediate finite (hence
+    differentiable).
+    """
+    log_probs = F.log_softmax(logits.masked_fill(~mask, _MASKED_LOGIT), dim=-1)
+    return -(log_probs.exp() * log_probs).sum(dim=-1).mean()
+
+
+def _legal_move_mask(visits: torch.Tensor) -> torch.Tensor:
+    """Derive a legal-move mask from MCTS visit counts.
+
+    MCTS only ever visits legal moves, so ``visits > 0`` identifies a subset of the
+    legal actions for a position. Rows with no visits at all keep a single slot so
+    that ``log_softmax`` stays finite (such rows carry a zero policy target anyway).
+    """
+    mask = visits > 0
+    empty = ~mask.any(dim=-1)
+    if bool(empty.any()):
+        mask = mask.clone()
+        mask[empty, 0] = True
+    return mask
+
+
 def _restore_numpy_rng_state(s: Any) -> None:
     if isinstance(s, (tuple, list)) and len(s) == 5:
         keys = np.array(s[1], dtype=np.uint32)
@@ -384,11 +416,15 @@ class RLTrainer:
                     wdl_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
 
             # 6. Combined total loss with small entropy regularization (prevents sharp collapse)
-            # Entropy bonus: maximize entropy of the policy head on full-search positions.
+            # Entropy bonus: maximize entropy of the policy head over LEGAL moves on
+            # full-search positions. Masking to the legal-move set is essential: most of
+            # the 4672 action slots are illegal for any given position, and rewarding
+            # entropy over them would push probability mass onto impossible moves.
             entropy_reg = 0.0
+            legal_mask = None
             if full_mask.any():
-                probs_full = F.softmax(full_p_logits, dim=-1)
-                entropy_reg = -(probs_full * torch.log(probs_full + 1e-12)).sum(dim=-1).mean()
+                legal_mask = _legal_move_mask(full_visits)
+                entropy_reg = _masked_policy_entropy(full_p_logits, legal_mask)
             total_loss = policy_loss + 0.5 * wdl_loss - self.entropy_bonus * entropy_reg
 
             # 7. Backward pass and optimizer step
@@ -413,10 +449,19 @@ class RLTrainer:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             self.optimizer.step()
 
-            # 8. Compute policy entropy metric
+            # 8. Compute policy entropy metric over LEGAL moves only.
+            # The raw 4672-way softmax is dominated by illegal-move slots, so the
+            # unmasked entropy is inflated by a large, position-independent constant and
+            # cannot detect a collapse of the legal-move distribution (which is what the
+            # safety trigger in run_phase4_rl.py cares about). Positions without a
+            # legal-move mask (human/tactical one-hot rows) are excluded from the metric;
+            # if a batch has no full-search rows we fall back to the unmasked value.
             with torch.no_grad():
-                probs = F.softmax(p_logits.float(), dim=-1)
-                policy_entropy_t = -(probs * torch.log(probs + 1e-12)).sum(dim=-1).mean()
+                if full_mask.any() and legal_mask is not None:
+                    policy_entropy_t = _masked_policy_entropy(full_p_logits, legal_mask)
+                else:
+                    probs = F.softmax(p_logits.float(), dim=-1)
+                    policy_entropy_t = -(probs * torch.log(probs + 1e-12)).sum(dim=-1).mean()
 
             # Bottleneck F elimination: batch scalar transfers in a single host-device sync
             metrics_t = (

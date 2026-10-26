@@ -2,6 +2,7 @@
 
 #include <vector>
 #include <string>
+#include <list>
 #include <memory>
 #include <unordered_map>
 #include <functional>
@@ -47,9 +48,10 @@ using RawBatchEvaluator =
 
 class MCTS {
 public:
-    // Upper bound on cached NN evaluations. Simple size guard: when the
-    // cache exceeds this, an arbitrary (oldest-ish) entry is evicted.
-    // Keeps memory bounded during long self-play sessions.
+    // Upper bound on cached NN evaluations. When the cache reaches this size, the
+    // least-recently-used entry is evicted (true LRU, see cache_lookup/cache_insert).
+    // Keeps memory bounded during long self-play sessions without discarding entries
+    // that are still being hit every simulation.
     static constexpr size_t NN_CACHE_CAP = 100000;
 
     explicit MCTS(const MCTSConfig& config = MCTSConfig{});
@@ -109,11 +111,15 @@ private:
     struct CachedEval {
         std::vector<float> policy;
         float value;
+        // Position of this key in nn_cache_lru_ (front = most recently used).
+        std::list<uint64_t>::iterator lru_it;
     };
 
     MCTSConfig config_;
     std::mt19937_64 rng_;
     std::unordered_map<uint64_t, CachedEval> nn_cache_;
+    // Recency order for nn_cache_: front is the most recently used key.
+    std::list<uint64_t> nn_cache_lru_;
 
     std::unique_ptr<Node> root_;
     int last_retained_visits_ = 0;
@@ -127,6 +133,9 @@ private:
     void set_priors(Node& node, const float* policy, int policy_size, int num_actions, bool is_root);
     void backup_path(const std::vector<std::pair<Node*, int>>& path, float leaf_val);
     void cache_insert(uint64_t h, std::vector<float> policy, float value);
+    // Look up h, marking it most-recently-used. Returns nullptr on a miss.
+    const CachedEval* cache_lookup(uint64_t h);
+    void cache_evict_lru();
     SearchResult aggregate(const Node& root, int num_legal, int num_actions) const;
     void sample_dirichlet(int k, float alpha, std::vector<float>& out_noise);
     int select_action(const Node& node, float parent_q) const;

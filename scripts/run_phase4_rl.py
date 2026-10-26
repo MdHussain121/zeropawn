@@ -132,7 +132,7 @@ class Phase4Orchestrator:
             if Path("data/dataset_training/train").is_dir()
             else "data/dataset_scaled/train"
         ),
-        puzzle_csv_path: str = "data/puzzles/lichess_puzzles_1000_1200_1600.csv",
+        puzzle_csv_path: str = "data/puzzles/eval_certified_1200_1800.csv",
         openings_path: str = "data/openings/eval_openings_50.epd",
         stockfish_path: str = "tools/stockfish.exe",
         stockfish_nodes: int = 1000,
@@ -170,6 +170,8 @@ class Phase4Orchestrator:
         entropy_bonus: float = 0.001,
         eval_openings: int = 50,
         eval_sims: Optional[int] = None,
+        promotion_min_games: int = 100,
+        promotion_min_score: float = 0.55,
         # ──────────────────────────────────────────────────────────────────
     ) -> None:
         self.max_hours = max_hours
@@ -263,6 +265,10 @@ class Phase4Orchestrator:
         self.entropy_bonus = float(entropy_bonus)
         self.eval_openings = int(eval_openings)
         self.eval_sims = int(eval_sims) if eval_sims is not None else None
+        # Strength gate for best_eval.pt (R-07): promotion now needs a real sample and
+        # a real score advantage instead of any composite-score improvement.
+        self.promotion_min_games = int(promotion_min_games)
+        self.promotion_min_score = float(promotion_min_score)
         self._steps_this_run = 0
 
         # Task 5: watchdog limits
@@ -278,6 +284,29 @@ class Phase4Orchestrator:
 
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        # Persisted promotion state so a resumed run does not overwrite a better
+        # best_eval.pt just because in-memory state was lost.
+        self._best_eval_state_path = self.checkpoint_dir / "best_eval.json"
+        self._best_eval_comp_score: Optional[float] = None
+        # Only trust the persisted score when the checkpoint it describes still exists.
+        if (
+            self._best_eval_state_path.is_file()
+            and (self.checkpoint_dir / "best_eval.pt").is_file()
+        ):
+            try:
+                previous = json.loads(self._best_eval_state_path.read_text(encoding="utf-8"))
+                self._best_eval_comp_score = float(previous["comp_score"])
+                logger.info(
+                    "[PROMOTION] Loaded previous best_eval composite score %.4f (step %s)",
+                    self._best_eval_comp_score,
+                    previous.get("step"),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[PROMOTION] Could not read %s (%s); starting promotion tracking fresh",
+                    self._best_eval_state_path,
+                    exc,
+                )
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         setup_logging(log_dir=self.log_dir, log_filename="phase4_rl.log")
@@ -285,6 +314,9 @@ class Phase4Orchestrator:
 
         p_cand = [
             Path(puzzle_csv_path) if puzzle_csv_path else None,
+            # Contamination-free eval set (see scripts/check_puzzle_overlap.py).
+            Path("data/puzzles/eval_certified_1200_1800.csv"),
+            _repo_root / "data/puzzles/eval_certified_1200_1800.csv",
             Path("data/puzzles/lichess_puzzles_1000_1200_1600.csv"),
             _repo_root / "data/puzzles/lichess_puzzles_1000_1200_1600.csv",
             Path("data/puzzles/lichess_puzzles_5000_1800_2800.csv"),
@@ -300,6 +332,7 @@ class Phase4Orchestrator:
                 resolved_puzzle_path = cand
                 break
         self.puzzle_csv_path = resolved_puzzle_path or Path(puzzle_csv_path)
+        self.puzzle_certified = self._report_puzzle_certification()
         openings_p = Path(openings_path)
         if not openings_p.is_file() and (_repo_root / openings_p).is_file():
             openings_p = _repo_root / openings_p
@@ -557,6 +590,67 @@ class Phase4Orchestrator:
                 writer = csv.writer(f)
                 writer.writerow(headers)
 
+    def _promotion_gate(self, match_res: dict) -> tuple[bool, str]:
+        """Strength gate for best_eval.pt promotion (R-07).
+
+        A 100-game match has an Elo confidence interval of roughly ±90-140 Elo, and the
+        composite score weights it at 0.7, so a purely luckier match can out-score a
+        stronger engine. Require both a real sample and a real score before promoting.
+        """
+        games = int(match_res.get("total_games", 0) or 0)
+        score = float(match_res.get("engine_score", 0.0) or 0.0)
+        if games < self.promotion_min_games:
+            return (
+                False,
+                f"insufficient sample ({games} < {self.promotion_min_games} games)",
+            )
+        if score < self.promotion_min_score:
+            return (
+                False,
+                f"engine score {score:.3f} < required {self.promotion_min_score:.3f}",
+            )
+        return True, f"{games} games, engine score {score:.3f}"
+
+    def _save_best_eval_state(self, **fields: object) -> None:
+        payload = dict(fields)
+        payload["saved_at"] = time.time()
+        tmp = self._best_eval_state_path.with_name(self._best_eval_state_path.name + ".tmp")
+        tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(tmp, self._best_eval_state_path)
+
+    def _report_puzzle_certification(self) -> bool:
+        """Log whether the eval puzzle set is certified disjoint from training data.
+
+        A certified set is produced by scripts/check_puzzle_overlap.py, which writes a
+        ``<csv>.certified.json`` manifest next to the CSV after removing every puzzle
+        that also occurs in the tactics training data. Without that manifest the puzzle
+        solve rate (and the puzzle-decline safety trigger) may be measuring memorisation.
+        """
+        manifest = Path(str(self.puzzle_csv_path) + ".certified.json")
+        if not manifest.is_file():
+            logger.warning(
+                "[EVAL] Puzzle set %s is NOT certified disjoint from tactics training data. "
+                "Solve rates may be optimistic; run scripts/check_puzzle_overlap.py to build a "
+                "certified set.",
+                self.puzzle_csv_path,
+            )
+            return False
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+        except Exception as exc:  # malformed manifest must not stop training
+            logger.warning("[EVAL] Unreadable puzzle certification manifest %s: %s", manifest, exc)
+            return False
+        logger.info(
+            "[EVAL] Puzzle set %s certified: %s puzzles, overlap_in_output=%s, "
+            "source_overlap=%s/%s",
+            self.puzzle_csv_path,
+            data.get("output_puzzles"),
+            data.get("overlap_in_output"),
+            data.get("overlap_either"),
+            data.get("candidate_puzzles"),
+        )
+        return True
+
     def run_eval_cycle(
         self, max_puzzles: Optional[int] = None, match_openings: Optional[int] = None
     ) -> dict:
@@ -600,8 +694,11 @@ class Phase4Orchestrator:
         logger.info(
             f"[EVAL CYCLE] Running {openings * 2}-game match vs Stockfish ({self.stockfish_nodes} nodes)..."
         )
+        # R-08: at 200 simulations the engine is well below its policy-value strength and
+        # the match floors out against Stockfish(1000 nodes), hiding real improvement.
+        # 400 sims keeps the 100-game eval affordable while restoring discrimination.
         eval_sims = (
-            self.eval_sims if self.eval_sims is not None else (10 if self.is_verify_mode else 200)
+            self.eval_sims if self.eval_sims is not None else (10 if self.is_verify_mode else 400)
         )
         match_runner = MatchRunner(
             model=self.trainer.model,
@@ -704,20 +801,46 @@ class Phase4Orchestrator:
                 f"{[round(x, 4) for x in last4]}"
             )
 
-        # Promotion gate: save models/checkpoints_rl/best_eval.pt on improvement
+        # Promotion gate: save models/checkpoints_rl/best_eval.pt only when the candidate
+        # is demonstrably strong, then only when it improves on the previous best score.
         comp_score = float(match_res["engine_score"]) * 0.7 + float(solve_rate) * 0.3
-        if not hasattr(self, "_best_eval_comp_score") or comp_score > self._best_eval_comp_score:
-            self._best_eval_comp_score = comp_score
+        eligible, gate_reason = self._promotion_gate(match_res)
+        previous_best = self._best_eval_comp_score
+        if not eligible:
+            logger.info(
+                "[PROMOTION] Not eligible (%s); composite score %.4f not promoted%s",
+                gate_reason,
+                comp_score,
+                "" if previous_best is None else f" (best {previous_best:.4f})",
+            )
+            self._event("PROMOTION_SKIPPED", f"{gate_reason}; comp_score={comp_score:.4f}")
+        elif previous_best is None or comp_score > previous_best:
             best_eval_path = self.checkpoint_dir / "best_eval.pt"
             try:
                 import shutil
 
                 shutil.copyfile(ckpt_path, best_eval_path)
-                logger.info(
-                    f"[PROMOTION] New best eval checkpoint saved (score={comp_score:.3f}): {best_eval_path}"
+                self._best_eval_comp_score = comp_score
+                self._save_best_eval_state(
+                    comp_score=comp_score,
+                    match_score=float(match_res["engine_score"]),
+                    puzzle_rate=float(solve_rate),
+                    step=self.trainer.step_num,
+                    checkpoint=ckpt_name,
                 )
+                logger.info(
+                    f"[PROMOTION] New best eval checkpoint saved (score={comp_score:.3f}, "
+                    f"{gate_reason}): {best_eval_path}"
+                )
+                self._event("PROMOTION", f"best_eval.pt updated (score={comp_score:.4f})")
             except Exception as e:
                 logger.warning(f"Failed to copy best_eval.pt: {e}")
+        else:
+            logger.info(
+                "[PROMOTION] No improvement (composite %.4f <= best %.4f)",
+                comp_score,
+                previous_best,
+            )
 
         return {
             "puzzle": puzzle_res,
@@ -1650,7 +1773,19 @@ def main() -> None:
         "--eval-sims",
         type=int,
         default=None,
-        help="MCTS simulations per move during match evaluation (default: 200)",
+        help="MCTS simulations per move during match evaluation (default: 400)",
+    )
+    parser.add_argument(
+        "--promotion-min-games",
+        type=int,
+        default=100,
+        help="Minimum match games before best_eval.pt may be promoted (default: 100)",
+    )
+    parser.add_argument(
+        "--promotion-min-score",
+        type=float,
+        default=0.55,
+        help="Minimum match score before best_eval.pt may be promoted (default: 0.55)",
     )
     args = parser.parse_args()
 
@@ -1694,6 +1829,8 @@ def main() -> None:
             entropy_bonus=args.entropy_bonus,
             eval_openings=args.eval_openings,
             eval_sims=args.eval_sims,
+            promotion_min_games=args.promotion_min_games,
+            promotion_min_score=args.promotion_min_score,
         )
         sys.exit(orchestrator.run())
     else:
@@ -1735,6 +1872,8 @@ def main() -> None:
             entropy_bonus=args.entropy_bonus,
             eval_openings=args.eval_openings,
             eval_sims=args.eval_sims,
+            promotion_min_games=args.promotion_min_games,
+            promotion_min_score=args.promotion_min_score,
         )
         sys.exit(orchestrator.run())
 

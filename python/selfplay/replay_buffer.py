@@ -953,7 +953,14 @@ class ReplayBuffer:
                 logger.debug("mem_get_info check in human cache failed: %s", e)
 
         try:
-            indices = np.random.choice(total, size=n, replace=False)
+            # O(n) sampling without replacement (Floyd's algorithm). The legacy
+            # np.random.choice(replace=False) path permutes the whole dataset, so its
+            # cost grows with the dataset size (millions of entries) and it stalls the
+            # training thread that calls refresh_human_cache().
+            if n >= total:
+                indices = np.arange(total)
+            else:
+                indices = np.random.default_rng().choice(total, size=n, replace=False)
             planes_np = np.ascontiguousarray(self.human_dataset.planes[indices], dtype=np.float32)
             moves_np = np.ascontiguousarray(self.human_dataset.moves[indices], dtype=np.int64)
             outcomes_np = np.ascontiguousarray(self.human_dataset.outcomes[indices], dtype=np.int64)
@@ -1119,7 +1126,9 @@ class ReplayBuffer:
                 moves_np = np.ascontiguousarray(self.tactical_pool.moves, dtype=np.int64)
                 outcomes_np = np.ascontiguousarray(self.tactical_pool.outcomes, dtype=np.int64)
             else:
-                indices = np.random.choice(total, size=n, replace=False)
+                # Same O(n) sampler as the human cache: the legacy replace=False path
+                # permutes the entire pool, which scales with dataset size.
+                indices = np.random.default_rng().choice(total, size=n, replace=False)
                 planes_np = np.ascontiguousarray(
                     self.tactical_pool.planes[indices], dtype=np.float32
                 )

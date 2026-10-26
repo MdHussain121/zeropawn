@@ -582,7 +582,10 @@ class SelfPlayGame:
                 and self.opening_book.enabled
                 and self.ply < self.opening_book.max_depth_plies
             ):
-                book_res = self.opening_book.lookup(self.game)
+                # Pass the exact ply: the C++ ChessGame FEN cannot reproduce the
+                # move history, so deriving the ply from the position alone would
+                # misreport depth for mid-game starts.
+                book_res = self.opening_book.lookup(self.game, current_ply=self.ply)
                 if book_res is not None:
                     book_uci_str, book_meta = book_res  # (uci_str, meta_dict)
                     # Verify the book move is still legal in the C++ game state
@@ -1008,6 +1011,17 @@ class SelfPlayWorker:
             "est_cache_mb": est_bytes / (1024.0 * 1024.0),
         }
 
+    def _game_seed(self, game_id: int) -> Optional[int]:
+        """Seed for one game.
+
+        Every concurrent game gets its own seed (base seed + game id) so that a seeded
+        run produces independent games instead of N copies of the same Dirichlet noise
+        and temperature draws, while staying reproducible run-to-run.
+        """
+        if self.seed is None:
+            return None
+        return self.seed + game_id
+
     def _add_sims(self, n: int) -> None:
         with self.counter_lock:
             self.live_simulations += n
@@ -1043,7 +1057,7 @@ class SelfPlayWorker:
                 min_resign_ply=self.min_resign_ply,
                 on_sims=self._add_sims,
                 search_mode=self.search_mode,
-                seed=(self.seed + game_id) if self.seed is not None else None,
+                seed=self._game_seed(game_id),
                 use_book=self.use_book,
                 book_path=self.book_path,
                 book_policy=self.book_policy,

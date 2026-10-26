@@ -101,7 +101,24 @@ void MCTS::reset_root() {
 
 void MCTS::clear() {
     nn_cache_.clear();
+    nn_cache_lru_.clear();
     reset_root();
+}
+
+void MCTS::cache_evict_lru() {
+    if (nn_cache_lru_.empty()) return;
+    uint64_t victim = nn_cache_lru_.back();
+    nn_cache_lru_.pop_back();
+    nn_cache_.erase(victim);
+}
+
+const MCTS::CachedEval* MCTS::cache_lookup(uint64_t h) {
+    auto it = nn_cache_.find(h);
+    if (it == nn_cache_.end()) return nullptr;
+    // Promote to most-recently-used (splice keeps the list node, no allocation).
+    nn_cache_lru_.splice(nn_cache_lru_.begin(), nn_cache_lru_, it->second.lru_it);
+    it->second.lru_it = nn_cache_lru_.begin();
+    return &it->second;
 }
 
 void MCTS::set_seed(uint64_t seed) {
@@ -192,19 +209,15 @@ std::unique_ptr<MCTS::Node> MCTS::create_node(const Game& state, bool is_root, c
     }
 
     uint64_t h = state.get_hash();
-    auto it = nn_cache_.find(h);
-    if (it != nn_cache_.end()) {
-        return create_node_from_eval(state, is_root, it->second.policy, it->second.value);
+    if (const CachedEval* cached = cache_lookup(h)) {
+        return create_node_from_eval(state, is_root, cached->policy, cached->value);
     }
 
     auto eval_res = evaluator(state);
     float eval_val = eval_res.second;
-    // Simple size guard: evict oldest-ish entry if over cap.
-    if (nn_cache_.size() >= MCTS::NN_CACHE_CAP) {
-        nn_cache_.erase(nn_cache_.begin());
-    }
-    auto inserted = nn_cache_.emplace(h, CachedEval{std::move(eval_res.first), eval_val});
-    return create_node_from_eval(state, is_root, inserted.first->second.policy, eval_val);
+    cache_insert(h, std::move(eval_res.first), eval_val);
+    const CachedEval* cached = cache_lookup(h);
+    return create_node_from_eval(state, is_root, cached->policy, eval_val);
 }
 
 int MCTS::select_action(const Node& node, float parent_q) const {
@@ -554,10 +567,9 @@ SearchResult MCTS::search(const Game& root_state, int num_simulations, const Eva
                                 cand.leaf_val = 0.0f;
                             } else {
                                 uint64_t h = cand.sim_state->get_hash();
-                                auto it = nn_cache_.find(h);
-                                if (it != nn_cache_.end()) {
+                                if (const CachedEval* cached = cache_lookup(h)) {
                                     cand.needs_eval = false;
-                                    cand.leaf_val = it->second.value;
+                                    cand.leaf_val = cached->value;
                                 } else {
                                     cand.needs_eval = true;
                                 }
@@ -606,13 +618,10 @@ SearchResult MCTS::search(const Game& root_state, int num_simulations, const Eva
                         cand.leaf_val = eval_res.second;
 
                         uint64_t h = cand.sim_state->get_hash();
-                        if (nn_cache_.size() >= MCTS::NN_CACHE_CAP) {
-                            nn_cache_.erase(nn_cache_.begin());
-                        }
-                        auto inserted = nn_cache_.emplace(h, CachedEval{std::move(eval_res.first), cand.leaf_val});
                         cand.parent_node->children[cand.action_idx] = create_node_from_eval(
-                            *cand.sim_state, false, inserted.first->second.policy, cand.leaf_val
+                            *cand.sim_state, false, eval_res.first, cand.leaf_val
                         );
+                        cache_insert(h, std::move(eval_res.first), cand.leaf_val);
                     }
                 }
 
@@ -624,9 +633,11 @@ SearchResult MCTS::search(const Game& root_state, int num_simulations, const Eva
                             );
                         } else {
                             uint64_t h = cand.sim_state->get_hash();
-                            auto it = nn_cache_.find(h);
+                            const CachedEval* cached = cache_lookup(h);
                             cand.parent_node->children[cand.action_idx] = create_node_from_eval(
-                                *cand.sim_state, false, it->second.policy, it->second.value
+                                *cand.sim_state, false,
+                                cached ? cached->policy : std::vector<float>{},
+                                cached ? cached->value : cand.leaf_val
                             );
                         }
                     }
@@ -775,10 +786,20 @@ void MCTS::backup_path(const std::vector<std::pair<Node*, int>>& path, float lea
 }
 
 void MCTS::cache_insert(uint64_t h, std::vector<float> policy, float value) {
-    if (nn_cache_.size() >= MCTS::NN_CACHE_CAP) {
-        nn_cache_.erase(nn_cache_.begin());
+    auto it = nn_cache_.find(h);
+    if (it != nn_cache_.end()) {
+        // Refreshing an existing key must not leave a stale duplicate in the LRU list.
+        it->second.policy = std::move(policy);
+        it->second.value = value;
+        nn_cache_lru_.splice(nn_cache_lru_.begin(), nn_cache_lru_, it->second.lru_it);
+        it->second.lru_it = nn_cache_lru_.begin();
+        return;
     }
-    nn_cache_.emplace(h, CachedEval{std::move(policy), value});
+    if (nn_cache_.size() >= MCTS::NN_CACHE_CAP) {
+        cache_evict_lru();
+    }
+    nn_cache_lru_.push_front(h);
+    nn_cache_.emplace(h, CachedEval{std::move(policy), value, nn_cache_lru_.begin()});
 }
 
 SearchResult MCTS::aggregate(const Node& root, int num_legal, int num_actions) const {
@@ -824,7 +845,7 @@ SearchResult MCTS::search_batched(const Game& root_state, int num_simulations,
 
     // Root evaluation (single-element batch if not in cache)
     uint64_t root_h = root_state.get_hash();
-    auto root_it = nn_cache_.find(root_h);
+    const CachedEval* root_cached = cache_lookup(root_h);
     auto root = create_unscored_node(root_state);
     int num_legal = static_cast<int>(root->legal_actions.size());
     if (num_legal == 0 || root->is_terminal) {
@@ -834,9 +855,9 @@ SearchResult MCTS::search_batched(const Game& root_state, int num_simulations,
         return early;
     }
 
-    if (root_it != nn_cache_.end()) {
-        set_priors(*root, root_it->second.policy.data(),
-                   static_cast<int>(root_it->second.policy.size()), num_actions, true);
+    if (root_cached != nullptr) {
+        set_priors(*root, root_cached->policy.data(),
+                   static_cast<int>(root_cached->policy.size()), num_actions, true);
     } else {
         std::vector<float> root_planes(static_cast<size_t>(state_size));
         root_state.encode_state(root_planes.data());
@@ -928,11 +949,10 @@ SearchResult MCTS::search_batched(const Game& root_state, int num_simulations,
             }
 
             uint64_t h = sim_state->get_hash();
-            auto it = nn_cache_.find(h);
-            if (it != nn_cache_.end()) {
-                set_priors(*curr_node, it->second.policy.data(),
-                           static_cast<int>(it->second.policy.size()), num_actions, false);
-                backup_path(search_path, it->second.value);
+            if (const CachedEval* cached = cache_lookup(h)) {
+                set_priors(*curr_node, cached->policy.data(),
+                           static_cast<int>(cached->policy.size()), num_actions, false);
+                backup_path(search_path, cached->value);
                 sims_done++;
                 continue;
             }

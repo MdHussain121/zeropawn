@@ -109,7 +109,7 @@ def test_config_crud_and_validation(tmp_path):
     ok_reset, _ = reset_config_option("selfplay.concurrent_games", config_path=cfg_path)
     assert ok_reset
     val_reset, _ = get_config_option("selfplay.concurrent_games", config_path=cfg_path)
-    assert val_reset == 48  # Default
+    assert val_reset == 24  # Default (R-13: aligned with the standalone runner)
 
 
 def test_presets_diff():

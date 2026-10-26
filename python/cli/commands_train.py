@@ -250,8 +250,12 @@ def register_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument(
         "--concurrent-games",
         type=int,
-        default=48,
-        help="Number of concurrent self-play games (default: 48)",
+        default=24,
+        help=(
+            "Number of concurrent self-play games (default: 24, matching the standalone "
+            "runner; 48 games roughly doubles the RAM footprint and can trip the "
+            "free-RAM watchdog on 16 GB machines)"
+        ),
     )
     parser.add_argument(
         "--buffer-capacity",
@@ -1341,6 +1345,8 @@ def run_training(args: argparse.Namespace) -> int:
             str(e), "stockfish binary not found", "install tools/stockfish.exe, then see LOG"
         )
     puzzle_candidates = [
+        # Certified disjoint eval set first (scripts/check_puzzle_overlap.py).
+        "data/puzzles/eval_certified_1200_1800.csv",
         "data/puzzles/lichess_puzzles_1000_1200_1600.csv",
         "data/puzzles/lichess_puzzles_5000_1800_2800.csv",
         "data/puzzles/lichess_puzzles_5000_1000_1600.csv",

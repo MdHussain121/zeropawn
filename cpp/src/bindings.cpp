@@ -60,6 +60,8 @@ PYBIND11_MODULE(zeropawn_cpp, m) {
         .def("is_insufficient_material", &zeropawn::ChessGame::is_insufficient_material)
         .def("half_move_clock", &zeropawn::ChessGame::half_move_clock)
         .def("full_move_number", &zeropawn::ChessGame::full_move_number)
+        .def("history_len", &zeropawn::ChessGame::history_len,
+             "Number of moves applied to this game (exact ply count)")
         .def("perft", &zeropawn::ChessGame::perft, py::arg("depth"));
 
     // Connect4 class

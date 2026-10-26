@@ -368,10 +368,13 @@ CONFIG_REGISTRY: Dict[str, ConfigField] = {
         key="selfplay.concurrent_games",
         alias="concurrent_games",
         type_name="int",
-        default=48,
+        default=24,
         min_val=1,
         max_val=128,
-        description="Number of concurrent self-play game simulations",
+        description=(
+            "Number of concurrent self-play game simulations (24 matches the standalone "
+            "runner; higher values multiply the RAM footprint)"
+        ),
         applicable_workflows=["train", "bench"],
         cli_flags=["--concurrent-games"],
         runtime_dest="Phase4Orchestrator.num_concurrent_games",
