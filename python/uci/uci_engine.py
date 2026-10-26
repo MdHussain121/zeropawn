@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any, List, Optional, Tuple, Union
 
@@ -97,9 +98,117 @@ class UCIEngine:
         self.prev_moves: List[str] = []
         self.prev_fen: str = "startpos"
 
+        # Real-time search control (F-3): stop event + abort deadline shared
+        # with the in-search abort predicate, a rolling simulation-rate
+        # estimate used for clock allocation, and the running search thread.
+        self._stop_event = threading.Event()
+        self._search_thread: Optional[threading.Thread] = None
+        self._search_state_lock = threading.Lock()
+        # Conservative initial sims/s estimate; measured serial rate on this
+        # hardware is 167-250 sims/s (docs/perf/BATCH_SWEEP_EXTENDED.json).
+        self._sims_per_sec: float = 200.0
+
         # Load model if checkpoint exists
         if self.checkpoint_path and Path(self.checkpoint_path).is_file():
             self._load_model(self.checkpoint_path)
+
+    # ------------------------------------------------------------------
+    # Time management (F-3)
+    # ------------------------------------------------------------------
+
+    def allocate_time(
+        self, arg_dict: dict, side_is_white: bool
+    ) -> Tuple[int, Optional[float], bool]:
+        """Convert ``go`` arguments into a (simulation cap, deadline, infinite).
+
+        The simulation cap is a soft budget derived from the rolling measured
+        simulation rate; the deadline is an absolute monotonic-clock timestamp
+        in **seconds** (``time.perf_counter()`` domain) enforced inside the
+        search every ~32 simulations. For ``go nodes`` the simulation cap is
+        exact and no deadline is set (stop is still honored). ``go infinite``
+        returns a huge cap and no deadline.
+        """
+        if arg_dict.get("infinite"):
+            return (2_000_000_000, None, True)
+
+        if "nodes" in arg_dict:
+            try:
+                return (max(10, int(arg_dict["nodes"])), None, False)
+            except (TypeError, ValueError):
+                return (max(10, self.default_sims), None, False)
+
+        rate = max(1.0, float(self._sims_per_sec))
+        now = time.perf_counter()
+
+        if "movetime" in arg_dict:
+            try:
+                movetime_ms = max(1.0, float(arg_dict["movetime"]))
+            except (TypeError, ValueError):
+                movetime_ms = 1000.0
+            # Reserve a small margin for move selection, info/bestmove output,
+            # and UCI write latency.
+            margin_ms = min(50.0, movetime_ms * 0.05)
+            budget_ms = max(1.0, movetime_ms - margin_ms)
+            sims = max(10, int((budget_ms / 1000.0) * rate))
+            return (sims, now + budget_ms / 1000.0, False)
+
+        # Clock play: wtime/btime with optional increment. Keep the historical
+        # allocation policy (wtime/30 + inc, clamped) as the per-move budget —
+        # what changed is that it is now enforced against the real clock.
+        time_key = "wtime" if side_is_white else "btime"
+        inc_key = "winc" if side_is_white else "binc"
+        if time_key in arg_dict:
+            try:
+                total_time_ms = max(0.0, float(arg_dict[time_key]))
+                inc_ms = max(0.0, float(arg_dict.get(inc_key, 0.0)))
+            except (TypeError, ValueError):
+                return (max(10, self.default_sims), None, False)
+            allocated_ms = (total_time_ms / 30.0) + (inc_ms * 0.9)
+            allocated_ms = max(100.0, min(allocated_ms, total_time_ms * 0.4, 10_000.0))
+            margin_ms = min(100.0, allocated_ms * 0.05)
+            budget_ms = max(1.0, allocated_ms - margin_ms)
+            sims = max(20, int((budget_ms / 1000.0) * rate))
+            return (sims, now + budget_ms / 1000.0, False)
+
+        # No clock information: fixed simulation budget (legacy behavior).
+        return (max(10, self.default_sims), None, False)
+
+    def _make_abort_fn(self, deadline_ms: Optional[float]):
+        """Build the in-search abort predicate.
+
+        Called by the C++ search approximately every 32 simulations. Returns
+        True when a stop was requested or the wall-clock deadline passed.
+        """
+        stop_event = self._stop_event
+
+        def abort() -> bool:
+            if stop_event.is_set():
+                return True
+            if deadline_ms is not None and time.perf_counter() >= deadline_ms:
+                return True
+            return False
+
+        return abort
+
+    def _update_rate_estimate(self, sims: int, elapsed_sec: float) -> None:
+        """EWMA-update the rolling sims/s estimate used for clock allocation."""
+        if elapsed_sec <= 0.0 or sims <= 0:
+            return
+        measured = sims / elapsed_sec
+        # Guard against absurd one-off spikes (e.g., an aborted 1-sim search).
+        if measured <= 0 or measured > 100_000:
+            return
+        self._sims_per_sec = 0.7 * self._sims_per_sec + 0.3 * measured
+
+    def _wait_for_running_search(self, timeout: float = 10.0) -> None:
+        """Block until any in-flight search finishes (state-mutation safety)."""
+        thread = self._search_thread
+        if thread is not None and thread.is_alive():
+            logger.warning("Command arrived during active search; waiting for bestmove")
+            self._stop_event.set()
+            thread.join(timeout=timeout)
+            if thread.is_alive():
+                logger.error("Search thread did not finish after stop; proceeding unsafely")
 
     def _load_model(self, path: Union[str, Path]) -> bool:
         try:
@@ -119,13 +228,16 @@ class UCIEngine:
             logger.error("Failed to load model from %s: %s", path, e)
             return False
 
-    def _eval_callback(self, game: Any) -> Tuple[List[float], float]:
+    def _eval_callback(self, game: Any) -> Tuple[Any, float]:
         if self.model is None:
             num_actions = game.num_actions()
-            return ([1.0 / num_actions] * num_actions, 0.0)
+            return (np.full(num_actions, 1.0 / num_actions, dtype=np.float32), 0.0)
 
-        chess_g = self.zeropawn_cpp.ChessGame(game.get_fen())
-        planes = self.zeropawn_cpp.encode_state(chess_g)
+        # Fast path: encode the live game state directly. The previous
+        # ChessGame(game.get_fen()) round-trip was slower and lossy — the
+        # reconstructed game has no move history, so the repetition plane
+        # (plane 18) read 0 on any once-repeated position.
+        planes = self.zeropawn_cpp.encode_state(game)
         t = torch.from_numpy(planes).unsqueeze(0).to(self.device)
         if self.device == "cuda":
             t = t.to(memory_format=torch.channels_last)
@@ -137,11 +249,11 @@ class UCIEngine:
                         p_logits, v_wdl = self.model(t)
                 else:
                     p_logits, v_wdl = self.model(t)
-            p_probs = torch.softmax(p_logits.float(), dim=-1).squeeze(0).cpu().numpy().tolist()
+            p_probs = torch.softmax(p_logits.float(), dim=-1).squeeze(0).cpu().numpy()
             v_probs = torch.softmax(v_wdl.float(), dim=-1).squeeze(0).cpu().numpy()
             scalar_val = float(v_probs[0] - v_probs[2])
 
-        return (p_probs, scalar_val)
+        return (np.ascontiguousarray(p_probs, dtype=np.float32), scalar_val)
 
     def _batched_eval_callback(self, batch_planes: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         n = int(batch_planes.shape[0])
@@ -166,22 +278,16 @@ class UCIEngine:
 
         return (policy.astype(np.float32), values)
 
-    def _eval_batch_callback(self, games: List[Any]) -> List[Tuple[List[float], float]]:
+    def _eval_batch_callback(self, games: List[Any]) -> List[Tuple[Any, float]]:
         if not games:
             return []
         if self.model is None:
             num_actions = games[0].num_actions()
-            uniform_policy = [1.0 / num_actions] * num_actions
+            uniform_policy = np.full(num_actions, 1.0 / num_actions, dtype=np.float32)
             return [(uniform_policy, 0.0) for _ in games]
 
-        batch_planes = []
-        for g in games:
-            if hasattr(g, "get_fen"):
-                cg = self.zeropawn_cpp.ChessGame(g.get_fen())
-                batch_planes.append(self.zeropawn_cpp.encode_state(cg))
-            else:
-                batch_planes.append(self.zeropawn_cpp.encode_state(g))
-
+        # Fast path: encode the live game states directly (see _eval_callback).
+        batch_planes = [self.zeropawn_cpp.encode_state(g) for g in games]
         batch_arr = np.stack(batch_planes)
         t = torch.from_numpy(batch_arr).to(self.device)
         if self.device == "cuda":
@@ -200,7 +306,9 @@ class UCIEngine:
 
         results = []
         for i in range(len(games)):
-            results.append((p_probs[i].tolist(), float(scalar_vals[i])))
+            results.append(
+                (np.ascontiguousarray(p_probs[i], dtype=np.float32), float(scalar_vals[i]))
+            )
         return results
 
     def _init_opening_book(self) -> None:
@@ -217,9 +325,20 @@ class UCIEngine:
             logger.debug("Opening book initialization skipped: %s", e)
             self.opening_book = None
 
-    def search_and_respond(self, sims: int) -> str:
-        """Run MCTS search on current game state and output bestmove."""
+    def search_and_respond(
+        self, sims: int, deadline_ms: Optional[float] = None
+    ) -> str:
+        """Run MCTS search on current game state and output bestmove.
+
+        ``deadline_ms`` is a monotonic-clock timestamp; when set, the search
+        aborts at the next ~32-simulation poll after the deadline passes (or
+        immediately once :attr:`_stop_event` is set). The best move is chosen
+        from whatever tree was built, so a partial search still answers.
+        """
         self._require_serial_search(self.search_mode, "UCIEngine.search_and_respond")
+        start = time.perf_counter()
+        abort_fn = self._make_abort_fn(deadline_ms)
+
         if self.game.is_game_over():
             self.mcts.reset_root()
             self.last_engine_action = None
@@ -254,21 +373,57 @@ class UCIEngine:
                     sys.stdout.flush()
                     return book_move
 
-        # Search with MCTS
+        # Search with MCTS. The abort predicate enforces the wall-clock
+        # deadline and stop requests from inside the C++ search loop.
         self.prev_moves_at_search = list(self.prev_moves)
-        res = self.mcts.search(self.game, sims, self._eval_callback, self._eval_batch_callback)
+        res = self.mcts.search(
+            self.game, sims, self._eval_callback, self._eval_batch_callback, abort_fn
+        )
         best_action = res.best_action
         best_move = self.game.action_to_string(best_action)
         root_val = res.root_value
         self.last_engine_action = best_action
         self.last_engine_move = best_move
 
+        actual_sims = int(getattr(res, "new_simulations", sims))
+        elapsed = time.perf_counter() - start
+        self._update_rate_estimate(actual_sims, elapsed)
+
         # Score in centipawns (AlphaZero approx: score_cp = int(root_val * 400))
         score_cp = int(root_val * 400)
-        sys.stdout.write(f"info depth 10 nodes {sims} score cp {score_cp} pv {best_move}\n")
+        sys.stdout.write(f"info depth 10 nodes {actual_sims} score cp {score_cp} pv {best_move}\n")
         sys.stdout.write(f"bestmove {best_move}\n")
         sys.stdout.flush()
         return best_move
+
+    def _search_worker(self, sims: int, deadline_ms: Optional[float]) -> None:
+        """Thread body for ``go``: run the search and emit bestmove.
+
+        Stdin stays responsive while this runs, so ``stop`` and ``quit`` are
+        processed immediately. Any failure must still emit a bestmove so the
+        GUI never waits forever.
+        """
+        try:
+            self.search_and_respond(sims, deadline_ms)
+        except Exception as e:
+            logger.exception("Search failed during go: %s", e)
+            sys.stdout.write("bestmove 0000\n")
+            sys.stdout.flush()
+
+    def _start_search(self, sims: int, deadline_ms: Optional[float]) -> None:
+        # Never overlap two searches: the previous one must have emitted its
+        # bestmove before a new tree/state is used.
+        self._wait_for_running_search()
+        # Fresh stop event per search: a "stop" that arrived before this "go"
+        # belonged to the previous search and must not abort this one, while a
+        # "stop" arriving after this point is guaranteed to be seen by the
+        # in-search abort predicate (the event object is already installed).
+        self._stop_event = threading.Event()
+        thread = threading.Thread(
+            target=self._search_worker, args=(sims, deadline_ms), daemon=True
+        )
+        self._search_thread = thread
+        thread.start()
 
     def handle_line(self, line: str) -> bool:
         """Handle a single UCI protocol command line. Returns False if 'quit'."""
@@ -320,6 +475,9 @@ class UCIEngine:
             sys.stdout.flush()
 
         elif cmd == "setoption":
+            # Several options rebuild the MCTS object or reload weights; those
+            # must not race an in-flight search.
+            self._wait_for_running_search()
             try:
                 name_idx = tokens.index("name") + 1
                 val_idx = tokens.index("value") + 1 if "value" in tokens else None
@@ -399,6 +557,7 @@ class UCIEngine:
                 logger.debug("Failed parsing setoption: %s", e)
 
         elif cmd == "ucinewgame":
+            self._wait_for_running_search()
             self.mcts.clear()
             self.mcts.reset_root()
             self.game = self.zeropawn_cpp.ChessGame()
@@ -409,6 +568,7 @@ class UCIEngine:
             self.prev_fen = "startpos"
 
         elif cmd == "position":
+            self._wait_for_running_search()
             idx = 1
             moves_idx = None
             if "moves" in tokens:
@@ -474,7 +634,6 @@ class UCIEngine:
             self.prev_moves_at_search = None
 
         elif cmd == "go":
-            sims = self.default_sims
             side = self.game.side_to_move()
 
             args = tokens[1:]
@@ -493,37 +652,22 @@ class UCIEngine:
                     arg_dict[k] = True
                     i += 1
 
-            if "nodes" in arg_dict:
-                try:
-                    sims = max(10, int(arg_dict["nodes"]))
-                except ValueError:
-                    pass
-            elif "movetime" in arg_dict:
-                try:
-                    ms = float(arg_dict["movetime"])
-                    sims = max(10, min(10000, int((ms / 1000.0) * 400)))
-                except ValueError:
-                    pass
-            else:
-                # NOTE: side_to_move() returns bool (True = White to move).
-                time_key = "wtime" if side else "btime"
-                inc_key = "winc" if side else "binc"
-                if time_key in arg_dict:
-                    try:
-                        total_time_ms = float(arg_dict[time_key])
-                        inc_ms = float(arg_dict.get(inc_key, 0.0))
-                        allocated_sec = (total_time_ms / 30000.0) + (inc_ms / 1000.0)
-                        allocated_sec = max(0.1, min(10.0, allocated_sec))
-                        sims = max(20, min(2000, int(allocated_sec * 400)))
-                    except ValueError:
-                        pass
-
-            self.search_and_respond(sims)
+            sims, deadline_ms, infinite = self.allocate_time(arg_dict, side)
+            if infinite:
+                logger.info("go infinite: searching until stop")
+            self._start_search(sims, deadline_ms)
 
         elif cmd == "stop":
-            pass
+            # Honor stop promptly: the in-search abort predicate polls this
+            # event every ~32 simulations; the search thread then emits
+            # bestmove for the tree built so far.
+            self._stop_event.set()
 
         elif cmd == "quit":
+            self._stop_event.set()
+            thread = self._search_thread
+            if thread is not None and thread.is_alive():
+                thread.join(timeout=2.0)
             return False
 
         return True
@@ -539,6 +683,11 @@ class UCIEngine:
                     break
             except (EOFError, KeyboardInterrupt):
                 break
+        # Clean shutdown: don't leave a search thread writing to a dead pipe.
+        self._stop_event.set()
+        thread = self._search_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
 
 
 def main() -> int:

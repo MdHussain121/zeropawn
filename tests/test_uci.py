@@ -47,6 +47,8 @@ def test_uci_position_and_go():
         stdout_buf.truncate(0)
         stdout_buf.seek(0)
         assert engine.handle_line("go nodes 15") is True
+        if engine._search_thread is not None:
+            engine._search_thread.join(timeout=30)  # async go: wait for bestmove
         output = stdout_buf.getvalue()
         assert "bestmove" in output
         assert "info depth" in output
@@ -82,6 +84,8 @@ def test_uci_batched_search_options():
         assert engine.handle_line("ucinewgame") is True
         assert engine.handle_line("position startpos") is True
         assert engine.handle_line("go nodes 20") is True
+        if engine._search_thread is not None:
+            engine._search_thread.join(timeout=30)  # async go: wait for bestmove
         go_out = stdout_buf.getvalue()
         assert "bestmove" in go_out
         assert "info depth" in go_out

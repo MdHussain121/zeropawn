@@ -26,7 +26,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Any, Optional, Union
+from typing import Any, Callable, Optional, Union
 import numpy as np
 import torch
 
@@ -41,8 +41,12 @@ VALID_SEARCH_MODES = ("serial", "batched")
 def check_search_mode(search_mode: str) -> str:
     """Validate an explicit search-mode setting (default ``serial``).
 
-    The ``batched`` C++ path does not exist on this branch; requesting it
-    raises at use time. Unknown values raise immediately.
+    Both modes exist in the current build: ``serial`` runs ``search()`` with
+    one leaf per evaluation; ``batched`` coalesces leaves (canonical contract:
+    ``search(..., batch_evaluator)``; the raw ``search_batched()`` entry point
+    is used by the ``search`` CLI and ``match run --search-mode batched``).
+    Play contracts (match runner, self-play) may still restrict a caller to
+    ``serial`` via :func:`require_serial_search`. Unknown values raise.
     """
     if search_mode not in VALID_SEARCH_MODES:
         raise ValueError(
@@ -52,7 +56,12 @@ def check_search_mode(search_mode: str) -> str:
 
 
 def require_serial_search(search_mode: str, caller: str) -> None:
-    """Validate search mode support."""
+    """Validate that the bound build supports the requested search mode.
+
+    ``batched`` requires ``zeropawn_cpp.MCTS.search_batched`` (present in the
+    current build). Callers with a serial-only play contract enforce that
+    separately; this check only rejects unsupported builds.
+    """
     if search_mode == "batched":
         if not hasattr(zeropawn_cpp.MCTS, "search_batched"):
             raise RuntimeError(
@@ -480,8 +489,11 @@ class MatchRunner:
         return fens
 
     def _eval_callback(self, game: zeropawn_cpp.Game):
-        chess_g = zeropawn_cpp.ChessGame(game.get_fen())
-        planes = zeropawn_cpp.encode_state(chess_g)
+        # Fast path: encode the live game state directly. The previous FEN
+        # round-trip (ChessGame(game.get_fen())) was both slower and lossy —
+        # a reconstructed game has no move history, so the repetition plane
+        # (plane 18) would read 0 on any once-repeated position.
+        planes = zeropawn_cpp.encode_state(game)
         t = torch.from_numpy(planes).unsqueeze(0).to(self.device)
         if self.device == "cuda":
             t = t.to(memory_format=torch.channels_last)
@@ -495,11 +507,11 @@ class MatchRunner:
             with self._lock:
                 with autocast_ctx:
                     p_logits, v_wdl = self.model(t)
-            p_probs = torch.softmax(p_logits.float(), dim=-1).squeeze(0).cpu().numpy().tolist()
+            p_probs = torch.softmax(p_logits.float(), dim=-1).squeeze(0).cpu().numpy()
             v_probs = torch.softmax(v_wdl.float(), dim=-1).squeeze(0).cpu().numpy()
             scalar_val = float(v_probs[0] - v_probs[2])
 
-        return (p_probs, scalar_val)
+        return (np.ascontiguousarray(p_probs, dtype=np.float32), scalar_val)
 
     def _batched_eval_callback(self, batch_planes: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         n = int(batch_planes.shape[0])
@@ -525,16 +537,12 @@ class MatchRunner:
 
         return policy.astype(np.float32), values
 
-    def _eval_batch_callback(self, games: list) -> list[tuple[list[float], float]]:
+    def _eval_batch_callback(self, games: list) -> list[tuple]:
         if not games:
             return []
-        batch_planes = []
-        for g in games:
-            if hasattr(g, "get_fen"):
-                cg = zeropawn_cpp.ChessGame(g.get_fen())
-                batch_planes.append(zeropawn_cpp.encode_state(cg))
-            else:
-                batch_planes.append(zeropawn_cpp.encode_state(g))
+        # Fast path: encode the live game states directly (see _eval_callback
+        # for why the FEN round-trip was removed).
+        batch_planes = [zeropawn_cpp.encode_state(g) for g in games]
 
         batch_arr = np.stack(batch_planes)
         t = torch.from_numpy(batch_arr).to(self.device)
@@ -556,7 +564,9 @@ class MatchRunner:
 
         results = []
         for i in range(len(games)):
-            results.append((p_probs[i].tolist(), float(scalar_vals[i])))
+            results.append(
+                (np.ascontiguousarray(p_probs[i], dtype=np.float32), float(scalar_vals[i]))
+            )
         return results
 
     def _play_game_worker(
@@ -718,13 +728,18 @@ class MatchRunner:
         self,
         num_openings: int = 50,
         pgn_path: Optional[Union[str, Path]] = None,
+        on_game_result: Optional[Callable[[dict], None]] = None,
     ) -> dict[str, Union[int, float]]:
         """Run 2 * num_openings games in parallel across opening pairs with persistent workers.
 
         Game ``i`` (opening index ``idx``, engine-white first) uses MCTS seed
         ``self.seed + 2*idx`` / ``+ 2*idx+1`` — deterministic per game. If
         ``pgn_path`` is given, all games are appended as PGN (board-relative).
-        Returns the tally plus a ``games`` detail list and ``pgn_path``.
+        ``on_game_result`` is invoked with each game dict the moment it
+        completes so callers can persist results incrementally (an interrupted
+        match then keeps every finished game). Returns the tally plus a
+        ``games`` detail list and ``pgn_path``; on interruption the tally
+        covers exactly the completed games and ``interrupted`` is True.
         """
         selected_openings = self.openings[:num_openings]
         engine_wins = 0
@@ -809,35 +824,60 @@ class MatchRunner:
                 results_as_white: list[str] = []
                 results_as_black: list[str] = []
                 games: list[dict] = []
-                for future in concurrent.futures.as_completed(futures):
-                    game_w, game_b = future.result()
-                    games.extend([game_w, game_b])
-                    # Board-relative strings tallied per engine color.
-                    results_as_white.append(game_w["result"])
-                    results_as_black.append(game_b["result"])
-                    tally = score_board_results(results_as_white, results_as_black)
-                    engine_wins, engine_draws, engine_losses = (
-                        tally["engine_wins"],
-                        tally["engine_draws"],
-                        tally["engine_losses"],
-                    )
+                interrupted = False
+                try:
+                    for future in concurrent.futures.as_completed(futures):
+                        game_w, game_b = future.result()
+                        games.extend([game_w, game_b])
+                        # Persist each game the moment it completes (F-15):
+                        # an interrupted match must not lose finished games.
+                        if on_game_result is not None:
+                            try:
+                                on_game_result(game_w)
+                                on_game_result(game_b)
+                            except Exception:
+                                logger.exception(
+                                    "on_game_result callback failed; continuing match"
+                                )
+                        # Board-relative strings tallied per engine color.
+                        results_as_white.append(game_w["result"])
+                        results_as_black.append(game_b["result"])
+                        tally = score_board_results(results_as_white, results_as_black)
+                        engine_wins, engine_draws, engine_losses = (
+                            tally["engine_wins"],
+                            tally["engine_draws"],
+                            tally["engine_losses"],
+                        )
 
-                    completed_pairs += 1
-                    games_done = completed_pairs * 2
-                    score = (engine_wins + 0.5 * engine_draws) / games_done
-                    elapsed = time.time() - start_time
-                    logger.info(
-                        f"Match Progress: {games_done:3d}/{total_games} games | "
-                        f"W: {engine_wins:2d} D: {engine_draws:2d} L: {engine_losses:2d} | "
-                        f"Score: {score * 100:5.1f}% | Elapsed: {elapsed:5.1f}s "
-                        f"({elapsed / games_done:.1f}s/game)"
+                        completed_pairs += 1
+                        games_done = completed_pairs * 2
+                        score = (engine_wins + 0.5 * engine_draws) / games_done
+                        elapsed = time.time() - start_time
+                        logger.info(
+                            f"Match Progress: {games_done:3d}/{total_games} games | "
+                            f"W: {engine_wins:2d} D: {engine_draws:2d} L: {engine_losses:2d} | "
+                            f"Score: {score * 100:5.1f}% | Elapsed: {elapsed:5.1f}s "
+                            f"({elapsed / games_done:.1f}s/game)"
+                        )
+                except (KeyboardInterrupt, concurrent.futures.CancelledError):
+                    interrupted = True
+                    logger.warning(
+                        "Match interrupted after %d/%d games; returning partial tally",
+                        completed_pairs * 2,
+                        total_games,
                     )
+                    for f in futures:
+                        f.cancel()
         finally:
             for ctx in contexts:
                 ctx.close()
 
-        score_pct = (engine_wins + 0.5 * engine_draws) / total_games if total_games > 0 else 0.0
-        draw_rate = engine_draws / total_games if total_games > 0 else 0.0
+        # total_games below reflects what actually finished when interrupted so
+        # rates stay well-defined and the tally never counts unplayed games.
+        actual_total = max(1, len(results_as_white) + len(results_as_black)) if games else 0
+        denominator = actual_total if interrupted else total_games
+        score_pct = (engine_wins + 0.5 * engine_draws) / denominator if denominator > 0 else 0.0
+        draw_rate = engine_draws / denominator if denominator > 0 else 0.0
         games.sort(key=lambda g: (g["opening_idx"], not g["engine_is_white"]))
 
         pgn_saved: Optional[str] = None
@@ -845,7 +885,8 @@ class MatchRunner:
             pgn_saved = write_match_pgn(games, pgn_path)
 
         return {
-            "total_games": total_games,
+            "total_games": denominator if interrupted else total_games,
+            "completed_games": len(results_as_white) + len(results_as_black),
             "engine_wins": engine_wins,
             "engine_draws": engine_draws,
             "engine_losses": engine_losses,
@@ -854,6 +895,7 @@ class MatchRunner:
             "search_mode": self.search_mode,
             "seed": self.seed,
             "stockfish_elo": self.stockfish_elo,
+            "interrupted": interrupted,
             "games": games,
             "pgn_path": pgn_saved,
             "elapsed_sec": round(time.time() - start_time, 2),

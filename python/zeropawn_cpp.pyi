@@ -63,6 +63,7 @@ class MCTSConfig:
     reuse_tree: bool
     max_nodes: int
     batch_size: int
+    nn_cache_cap: int
     def __init__(self) -> None: ...
 
 class SearchResult:
@@ -96,4 +97,13 @@ class MCTS:
         num_simulations: int,
         evaluator: Callable[[Game], tuple[list[float], float]],
         batch_evaluator: Optional[Callable[[list[Game]], list[tuple[list[float], float]]]] = None,
+        abort_fn: Optional[Callable[[], bool]] = None,
+    ) -> SearchResult: ...
+    def search_batched(
+        self,
+        game: Game,
+        num_simulations: int,
+        batch_size_or_evaluator: Any,
+        evaluator_or_batch_size: Any,
+        abort_fn: Optional[Callable[[], bool]] = None,
     ) -> SearchResult: ...

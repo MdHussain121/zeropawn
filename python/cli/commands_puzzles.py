@@ -942,6 +942,12 @@ def run_solve_puzzles(args: argparse.Namespace) -> int:
         print_error(err)
         return 1
 
+    # Fail fast on interactive-only mode before any model or puzzle I/O.
+    is_tty = bool(sys.stdin and hasattr(sys.stdin, "isatty") and sys.stdin.isatty())
+    if getattr(args, "human_guess", False) and not is_tty:
+        print_error("Human guess mode requires an interactive terminal (stdin is not a TTY).")
+        return 1
+
     ckpt_path = args.checkpoint or get_default_checkpoint_path()
     if not ckpt_path:
         print_error("No model checkpoint found! Please specify --checkpoint.")
@@ -988,7 +994,8 @@ def run_solve_puzzles(args: argparse.Namespace) -> int:
             except (ValueError, OSError):
                 pass
     if puzzle_path is None or not puzzle_path.exists():
-        print_error(f"Puzzle file/dir not found: {args.puzzles_file}")
+        puzzle_label = getattr(args, "puzzles_file", None) or getattr(args, "puzzles", None)
+        print_error(f"Puzzle file/dir not found: {puzzle_label or 'no puzzle source given'}")
         return 1
 
     try:
@@ -1003,11 +1010,6 @@ def run_solve_puzzles(args: argparse.Namespace) -> int:
     puzzles = load_puzzles(puzzle_path)
     total_puzzles = len(puzzles)
     idx = max(0, min(args.start_index, total_puzzles - 1))
-
-    is_tty = bool(sys.stdin and hasattr(sys.stdin, "isatty") and sys.stdin.isatty())
-    if args.human_guess and not is_tty:
-        print_error("Human guess mode requires an interactive terminal (stdin is not a TTY).")
-        return 1
 
     mcts_cfg = zeropawn_cpp.MCTSConfig()
     mcts_cfg.c_puct = 2.0
