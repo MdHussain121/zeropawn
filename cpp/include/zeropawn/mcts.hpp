@@ -86,6 +86,15 @@ public:
     );
     size_t cache_size() const { return nn_cache_.size(); }
 
+    // NN-cache key: position hash mixed with the game's draw-relevant history
+    // (halfmove clock, repetition flag). Two transpositions with different
+    // draw status therefore never share an evaluation (SR-02).
+    static uint64_t cache_key(const Game& state) {
+        uint64_t h = state.get_hash();
+        h ^= state.draw_history_key() * 0xBF58476D1CE4E5B9ULL + 0x9E3779B97F4A7C15ULL;
+        return h;
+    }
+
     // Subtree reuse API
     bool advance_root(int my_action, int opp_action, const Game& new_state);
     bool advance_root(int action, const Game& new_state);

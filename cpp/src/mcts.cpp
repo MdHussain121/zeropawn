@@ -146,7 +146,10 @@ void MCTS::sample_dirichlet(int k, float alpha, std::vector<float>& out_noise) {
 std::unique_ptr<MCTS::Node> MCTS::create_node_from_eval(
     const Game& state, bool is_root, const std::vector<float>& full_policy, float eval_val) {
     auto node = std::make_unique<Node>();
-    node->state_hash = state.get_hash();
+    // Node identity includes draw-relevant history: a tree built for a
+    // position must not validate against a transposition with a different
+    // halfmove clock / repetition state (SR-02).
+    node->state_hash = MCTS::cache_key(state);
     node->legal_actions = state.legal_actions();
     int k = static_cast<int>(node->legal_actions.size());
 
@@ -208,7 +211,7 @@ std::unique_ptr<MCTS::Node> MCTS::create_node(const Game& state, bool is_root, c
         return create_node_from_eval(state, is_root, {}, 0.0f);
     }
 
-    uint64_t h = state.get_hash();
+    const uint64_t h = MCTS::cache_key(state);
     if (const CachedEval* cached = cache_lookup(h)) {
         return create_node_from_eval(state, is_root, cached->policy, cached->value);
     }
@@ -289,7 +292,7 @@ bool MCTS::advance_root(int my_action, int opp_action, const Game& new_state) {
     Node* grandchild = child->children[opp_idx].get();
 
     // 3. Verify state integrity
-    if (grandchild->state_hash != new_state.get_hash() ||
+    if (grandchild->state_hash != MCTS::cache_key(new_state) ||
         grandchild->is_terminal != new_state.is_terminal() ||
         grandchild->legal_actions != new_state.legal_actions()) {
         reset_root();
@@ -330,7 +333,7 @@ bool MCTS::advance_root(int action, const Game& new_state) {
     }
     Node* child = root_->children[idx].get();
 
-    if (child->state_hash != new_state.get_hash() ||
+    if (child->state_hash != MCTS::cache_key(new_state) ||
         child->is_terminal != new_state.is_terminal() ||
         child->legal_actions != new_state.legal_actions()) {
         reset_root();
@@ -358,7 +361,7 @@ SearchResult MCTS::search(const Game& root_state, int num_simulations, const Eva
     int retained_visits = 0;
     if (config_.reuse_tree && root_ != nullptr) {
         // Validate that retained root_ matches root_state
-        if (root_->state_hash != root_state.get_hash() ||
+        if (root_->state_hash != MCTS::cache_key(root_state) ||
             root_->is_terminal != root_state.is_terminal() ||
             root_->legal_actions != root_state.legal_actions() ||
             live_node_count() > config_.max_nodes) {
@@ -587,7 +590,7 @@ SearchResult MCTS::search(const Game& root_state, int num_simulations, const Eva
                                 cand.needs_eval = false;
                                 cand.leaf_val = 0.0f;
                             } else {
-                                uint64_t h = cand.sim_state->get_hash();
+                                const uint64_t h = MCTS::cache_key(*cand.sim_state);
                                 if (const CachedEval* cached = cache_lookup(h)) {
                                     cand.needs_eval = false;
                                     cand.leaf_val = cached->value;
@@ -638,7 +641,7 @@ SearchResult MCTS::search(const Game& root_state, int num_simulations, const Eva
                         auto& eval_res = batch_results[k];
                         cand.leaf_val = eval_res.second;
 
-                        uint64_t h = cand.sim_state->get_hash();
+                        const uint64_t h = MCTS::cache_key(*cand.sim_state);
                         cand.parent_node->children[cand.action_idx] = create_node_from_eval(
                             *cand.sim_state, false, eval_res.first, cand.leaf_val
                         );
@@ -653,7 +656,7 @@ SearchResult MCTS::search(const Game& root_state, int num_simulations, const Eva
                                 *cand.sim_state, false, {}, cand.leaf_val
                             );
                         } else {
-                            uint64_t h = cand.sim_state->get_hash();
+                            const uint64_t h = MCTS::cache_key(*cand.sim_state);
                             const CachedEval* cached = cache_lookup(h);
                             cand.parent_node->children[cand.action_idx] = create_node_from_eval(
                                 *cand.sim_state, false,
@@ -870,7 +873,7 @@ SearchResult MCTS::search_batched(const Game& root_state, int num_simulations,
     const int num_actions = root_state.num_actions();
 
     // Root evaluation (single-element batch if not in cache)
-    uint64_t root_h = root_state.get_hash();
+    const uint64_t root_h = MCTS::cache_key(root_state);
     const CachedEval* root_cached = cache_lookup(root_h);
     auto root = create_unscored_node(root_state);
     int num_legal = static_cast<int>(root->legal_actions.size());
@@ -978,7 +981,7 @@ SearchResult MCTS::search_batched(const Game& root_state, int num_simulations,
                 continue;
             }
 
-            uint64_t h = sim_state->get_hash();
+            const uint64_t h = MCTS::cache_key(*sim_state);
             if (const CachedEval* cached = cache_lookup(h)) {
                 set_priors(*curr_node, cached->policy.data(),
                            static_cast<int>(cached->policy.size()), num_actions, false);

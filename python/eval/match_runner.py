@@ -517,6 +517,10 @@ class MatchWorkerContext:
         mcts_cfg.seed = seed
         mcts_cfg.reuse_tree = reuse_tree
         mcts_cfg.batch_size = max(1, int(batch_size))
+        # Long matches accumulate distinct positions; bound the per-context
+        # cache with LRU eviction (~16k entries ~= 300 MB) instead of letting
+        # it grow to the 100k default (~1.9 GB).
+        mcts_cfg.nn_cache_cap = 16384
         self.mcts = zeropawn_cpp.MCTS(mcts_cfg)
 
     def close(self) -> None:

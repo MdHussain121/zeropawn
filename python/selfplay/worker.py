@@ -611,6 +611,11 @@ class SelfPlayGame:
         self.mcts_config.dirichlet_alpha = dirichlet_alpha
         self.mcts_config.dirichlet_weight = dirichlet_weight
         self.mcts_config.seed = mcts_seed
+        # LRU-bounded per-game cache (SR-03): replaces the old wholesale
+        # clear() at 2048 entries — same memory envelope (~2048 x 18.7 KB per
+        # game), but eviction is least-recently-used instead of forgetting
+        # everything, so priors survive within a game.
+        self.mcts_config.nn_cache_cap = 2048
         self.mcts = zeropawn_cpp.MCTS(self.mcts_config)
 
         # Game state
@@ -701,14 +706,6 @@ class SelfPlayGame:
                                     white_won = None
                                     game_result = "1/2-1/2"
                                 termination_reason = "tablebase_adjudication"
-
-                        # Bound MCTS cache growth (same as normal path)
-                        if hasattr(self.mcts, "cache_size") and hasattr(self.mcts, "clear"):
-                            try:
-                                if self.mcts.cache_size() > 2048:
-                                    self.mcts.clear()
-                            except Exception:
-                                pass
 
                         if adjudicated:
                             break
@@ -825,14 +822,6 @@ class SelfPlayGame:
 
             self.game.apply_action(chosen_action)
             self.ply += 1
-
-            # Bound C++ MCTS cache growth during long games
-            if hasattr(self.mcts, "cache_size") and hasattr(self.mcts, "clear"):
-                try:
-                    if self.mcts.cache_size() > 2048:
-                        self.mcts.clear()
-                except Exception:
-                    pass
 
             # Tablebase adjudication check (after move applied)
             if (

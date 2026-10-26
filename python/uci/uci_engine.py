@@ -87,6 +87,9 @@ class UCIEngine:
         self.mcts_config.batch_size = self.batch_size
         self.mcts_config.virtual_loss = 1
         self.mcts_config.add_noise = False  # Deterministic / no root noise for play mode per PRD
+        # Long interactive sessions accumulate positions; LRU-bound the cache
+        # (~16k entries ~= 300 MB) instead of the 100k default (~1.9 GB).
+        self.mcts_config.nn_cache_cap = 16384
         self.mcts = self.zeropawn_cpp.MCTS(self.mcts_config)
 
         # Game state and subtree reuse tracking

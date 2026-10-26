@@ -164,3 +164,49 @@ def test_repetition_flag_agrees_with_is_repetition_across_paths():
         planes = zeropawn_cpp.encode_state(game)
         expected = 1.0 if game.is_repetition(1) else 0.0
         assert _plane18(planes) == expected, f"plane 18 mismatch after {uci}"
+
+
+def test_nn_cache_does_not_share_draw_different_transpositions():
+    """SR-02: the NN-cache key must include draw-relevant history. The start
+    position reached with halfmove clock 4 (after a knight round-trip) must
+    NOT reuse the evaluation cached for the fresh start position (clock 0)."""
+    calls = []
+    knight_move = zeropawn_cpp.ChessGame().string_to_action("g1f3")
+
+    def counting_eval(game):
+        calls.append(game.half_move_clock())
+        # Bias the prior hard toward the knight move: pawn pushes reset the
+        # halfmove clock to 0 and legitimately share entries across the two
+        # games, so the discriminating node must be a knight move (clock 1
+        # vs clock 5, identical placement).
+        policy = np.full(game.num_actions(), 1.0 / game.num_actions(), dtype=np.float32)
+        policy[knight_move] = 100.0
+        return (policy, 0.0)
+
+    cfg = zeropawn_cpp.MCTSConfig()
+    cfg.add_noise = False
+    mcts = zeropawn_cpp.MCTS(cfg)
+
+    fresh = zeropawn_cpp.ChessGame()
+    mcts.search(fresh, 8, counting_eval)
+    calls_after_fresh = len(calls)
+    assert calls_after_fresh >= 1
+
+    round_trip = zeropawn_cpp.ChessGame()
+    for uci in ["g1f3", "g8f6", "f3g1", "f6g8"]:
+        round_trip.make_move_uci(uci)
+    assert round_trip.get_fen().split()[0] == fresh.get_fen().split()[0]
+    assert round_trip.half_move_clock() == 4
+
+    mcts.search(round_trip, 8, counting_eval)
+    # The clock-4 root and the clock-5 knight child are transpositions of
+    # clock-0/1 entries: with the fixed key they MUST be fresh evaluations
+    # (the pre-fix key hit the clock-0 entries and added zero calls). Deeper
+    # siblings may legitimately share (pawn children reset the clock to 0 in
+    # both games — same placement AND same draw state).
+    new_calls = calls[calls_after_fresh:]
+    assert len(new_calls) >= 2, (
+        f"second search made {len(new_calls)} fresh evaluations; "
+        "draw-different transpositions shared cache entries"
+    )
+    assert 4 in [c for c in new_calls], f"clock-4 root not re-evaluated: {new_calls}"
