@@ -153,11 +153,13 @@ class Phase4Orchestrator:
         openings_path: str = "data/openings/eval_openings_50.epd",
         stockfish_path: str = "tools/stockfish.exe",
         stockfish_nodes: int = 1000,
-        # Opponent calibration (audit F-14): full-strength SF at 1000 nodes is
-        # a floor opponent for the promotion match (measured 0/30). Set an
-        # UCI_Elo limit (1320-1700 ladder recommended) so the match score is
-        # discriminating. None keeps the legacy full-strength behavior.
-        stockfish_elo: Optional[int] = None,
+        # Opponent calibration (EV-01): full-strength Stockfish at 1000 nodes is
+        # a floor opponent for the promotion match (measured 0/30 — the match
+        # term of the promotion composite saturates at 0 and promotion rides on
+        # a policy metric). The default is the calibrated UCI_Elo 1500 cell of
+        # the baseline protocol; pass --stockfish-full-strength to restore the
+        # legacy behavior deliberately.
+        stockfish_elo: Optional[int] = 1500,
         allow_unverified_warm_start: bool = False,
         is_verify_mode: bool = False,
         skip_baseline_eval: bool = False,
@@ -195,6 +197,7 @@ class Phase4Orchestrator:
         eval_sims: Optional[int] = None,
         promotion_min_games: int = 100,
         promotion_min_score: float = 0.55,
+        promotion_sprt_max_games: int = 0,
         # ──────────────────────────────────────────────────────────────────
     ) -> None:
         self.max_hours = max_hours
@@ -292,6 +295,10 @@ class Phase4Orchestrator:
         # a real score advantage instead of any composite-score improvement.
         self.promotion_min_games = int(promotion_min_games)
         self.promotion_min_score = float(promotion_min_score)
+        # 0 disables the promotion SPRT (threshold gate only, documented);
+        # >0 requires an ACCEPT_H1 SPRT vs best_eval/warm-start to promote.
+        self.promotion_sprt_max_games = int(promotion_sprt_max_games)
+        self._baseline_puzzle_rate: Optional[float] = None
         self._steps_this_run = 0
 
         # Task 5: watchdog limits
@@ -707,6 +714,14 @@ class Phase4Orchestrator:
                 # whether the match was interrupted before completion.
                 "model_sha256",
                 "match_interrupted",
+                # Opponent provenance + search-aware puzzle metric (EV-01/EV-04).
+                "sf_engine",
+                "sf_elo",
+                "sf_elo_verified",
+                "mcts_puzzle_sims",
+                "mcts_puzzle_solved",
+                "mcts_puzzle_total",
+                "mcts_puzzle_rate",
             ]
             with open(self.eval_csv_path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
@@ -780,12 +795,14 @@ class Phase4Orchestrator:
             f.flush()
             os.fsync(f.fileno())
 
-    def _promotion_gate(self, match_res: dict) -> tuple[bool, str]:
-        """Strength gate for best_eval.pt promotion (R-07).
+    def _promotion_gate(self, match_res: dict, puzzle_rate: Optional[float] = None) -> tuple[bool, str]:
+        """Strength gate for best_eval.pt promotion (R-07, hardened per EV-01/EV-04).
 
         A 100-game match has an Elo confidence interval of roughly ±90-140 Elo, and the
         composite score weights it at 0.7, so a purely luckier match can out-score a
-        stronger engine. Require both a real sample and a real score before promoting.
+        stronger engine. Require a real sample, a real score, a COMPLETE match record
+        (an interrupted/failed eval must never read as a promotion signal), and that
+        the candidate still retains baseline supervised puzzle strength.
         """
         games = int(match_res.get("total_games", 0) or 0)
         score = float(match_res.get("engine_score", 0.0) or 0.0)
@@ -799,7 +816,81 @@ class Phase4Orchestrator:
                 False,
                 f"engine score {score:.3f} < required {self.promotion_min_score:.3f}",
             )
+        if match_res.get("interrupted"):
+            return (False, "match interrupted before completion (record incomplete)")
+        if match_res.get("completed_games", games) < games:
+            return (
+                False,
+                f"match record incomplete ({match_res.get('completed_games')} of {games} games persisted)",
+            )
+        # Baseline retention (EV-01/B4): a candidate that loses the warm-start's
+        # supervised puzzle strength must not promote on a lucky match score.
+        baseline = self._baseline_puzzle_rate
+        if baseline is not None and puzzle_rate is not None:
+            retention_band = max(2.0 * self.puzzle_noise_band, 0.03)
+            if puzzle_rate < baseline - retention_band:
+                return (
+                    False,
+                    f"puzzle solve rate {puzzle_rate:.3f} below baseline retention "
+                    f"({baseline:.3f} - band {retention_band:.3f})",
+                )
         return True, f"{games} games, engine score {score:.3f}"
+
+    def _run_promotion_sprt(self, candidate_ckpt: Path, openings: int) -> tuple[str, str]:
+        """Bounded SPRT of the candidate against the current promotion baseline.
+
+        The baseline is the current ``best_eval.pt`` when one exists, otherwise
+        the run's warm-start checkpoint. Returns ``(decision, detail)``; only
+        ``ACCEPT_H1`` promotes (EV-03: threshold passes can be noise, and an
+        INCONCLUSIVE result must not promote either).
+        """
+        import shutil
+        import tempfile
+
+        base_path = self.checkpoint_dir / "best_eval.pt"
+        baseline_label = "best_eval"
+        if not base_path.exists():
+            ws = str(getattr(self, "_active_checkpoint_path", "") or "")
+            if not ws or ws == "random_init":
+                return "UNAVAILABLE", "no best_eval and no warm-start baseline to test against"
+            base_path = Path(ws)
+            baseline_label = "warm-start"
+        if not base_path.exists():
+            return "UNAVAILABLE", f"baseline checkpoint missing: {base_path}"
+
+        with tempfile.TemporaryDirectory(prefix="sprt_promotion_") as td:
+            cand_copy = Path(td) / "candidate.pt"
+            base_copy = Path(td) / "base.pt"
+            shutil.copyfile(candidate_ckpt, cand_copy)
+            shutil.copyfile(base_path, base_copy)
+            try:
+                from scripts.run_sprt import SprtMatchRunner
+
+                runner = SprtMatchRunner(
+                    candidate_checkpoint=str(cand_copy),
+                    base_checkpoint=str(base_copy),
+                    device=self.device,
+                    sims=self.eval_sims if self.eval_sims else 400,
+                    workers=8,
+                )
+                result = runner.run_sprt(
+                    f"promotion_step{self.trainer.step_num}",
+                    {"c_puct": 2.0, "fpu_reduction": 0.2},
+                    {"c_puct": 2.0, "fpu_reduction": 0.2},
+                    Path(td) / "out",
+                    max_games=self.promotion_sprt_max_games,
+                )
+            except Exception as e:
+                logger.exception("Promotion SPRT failed; refusing to promote on failure")
+                return "FAILED", f"{type(e).__name__}: {e}"
+        s = result["sprt"]
+        detail = (
+            f"{s['n']} games W{s['wins']}/D{s['draws']}/L{s['losses']} vs {baseline_label}, "
+            f"LLR {s['llr']:+.2f} bounds [{s['lower_bound']:.2f}, {s['upper_bound']:.2f}]"
+        )
+        logger.info("[PROMOTION SPRT] %s — %s", result["final_status"], detail)
+        self._event("PROMOTION_SPRT", f"{result['final_status']}: {detail}")
+        return result["final_status"], detail
 
     def _save_best_eval_state(self, **fields: object) -> None:
         payload = dict(fields)
@@ -861,7 +952,7 @@ class Phase4Orchestrator:
         self._known_ckpt_names.add(ckpt_name)
         self._event("CHECKPOINT", f"saved {ckpt_path} sha={short_hash(str(ckpt_path))} (eval)")
 
-        # 1. Evaluate Puzzles
+        # 1. Evaluate Puzzles (policy top-1) — a policy metric, never a rating.
         logger.info(
             f"[EVAL CYCLE] Evaluating {len(self.puzzles) if not max_puzzles else max_puzzles} puzzles..."
         )
@@ -871,14 +962,38 @@ class Phase4Orchestrator:
         )
         puzzle_res = evaluator.evaluate_policy(batch_size=128)
         solve_rate = puzzle_res["solve_rate"]
+        # 1b. Search-aware puzzle evaluation (EV-04): the policy head alone is
+        # insensitive to search regressions; the MCTS path measures the whole
+        # play pipeline on the same fixed certified set.
+        mcts_eval_sims = 50 if self.is_verify_mode else 200
+        try:
+            mcts_res = evaluator.evaluate_mcts(num_simulations=mcts_eval_sims)
+            mcts_rate = float(mcts_res.get("solve_rate", 0.0))
+            mcts_solved = int(mcts_res.get("solved", 0))
+            mcts_total = int(mcts_res.get("total", 0))
+            logger.info(
+                f"[EVAL CYCLE] MCTS-{mcts_eval_sims} puzzle solve rate: {mcts_rate * 100:.2f}% "
+                f"({mcts_solved}/{mcts_total})"
+            )
+        except Exception as e:
+            logger.exception("MCTS puzzle evaluation failed; recording as unavailable")
+            mcts_rate, mcts_solved, mcts_total = None, 0, 0
         self._event(
             "EVAL",
             f"puzzles solve_rate={solve_rate * 100:.2f}% "
-            f"({puzzle_res['solved']}/{puzzle_res['total']})",
+            f"({puzzle_res['solved']}/{puzzle_res['total']}) "
+            f"mcts_{mcts_eval_sims}={mcts_rate if mcts_rate is not None else 'unavailable'}",
         )
         logger.info(
             f"[EVAL CYCLE] Puzzle solve rate: {solve_rate * 100:.2f}% ({puzzle_res['solved']}/{puzzle_res['total']})"
         )
+
+        if self._baseline_puzzle_rate is None:
+            # First completed eval of this run anchors baseline retention: at
+            # run start (or --skip-baseline-eval absent) this IS the warm
+            # start's supervised strength.
+            self._baseline_puzzle_rate = solve_rate
+            logger.info(f"[EVAL CYCLE] Baseline puzzle rate anchored at {solve_rate:.4f}")
 
         self.puzzle_solve_history.append(solve_rate)
 
@@ -910,8 +1025,12 @@ class Phase4Orchestrator:
             search_mode="serial",
         )
         try:
+            match_pgn_dir = self.log_dir / "matches"
+            match_pgn_dir.mkdir(parents=True, exist_ok=True)
             match_res = match_runner.run_match(
-                num_openings=openings, on_game_result=self._persist_match_game
+                num_openings=openings,
+                pgn_path=match_pgn_dir / f"eval_step{self.trainer.step_num}.pgn",
+                on_game_result=self._persist_match_game,
             )
         finally:
             match_runner.close()
@@ -964,14 +1083,40 @@ class Phase4Orchestrator:
         try:
             from python.eval.match_runner import elo_interval
 
-            elo_diff, elo_lo, elo_hi = elo_interval(
-                match_res["engine_wins"], match_res["engine_losses"], match_res["engine_draws"]
+            # Signature is (wins, draws, losses) — the previous call passed
+            # (wins, losses, draws), inverting the sign of every recorded Elo.
+            # elo_interval returns a dict; the previous 3-tuple unpacking
+            # raised and every eval row recorded "n/a" instead of numbers.
+            interval = elo_interval(
+                match_res["engine_wins"], match_res["engine_draws"], match_res["engine_losses"]
             )
-            row.extend([round(elo_diff, 1), round(elo_lo, 1), round(elo_hi, 1)])
+            elo_diff = interval["elo_diff"]
+            elo_lo = interval["lo"]
+            elo_hi = interval["hi"]
+            row.extend(
+                [
+                    round(elo_diff, 1) if elo_diff is not None else "n/a",
+                    round(elo_lo, 1) if elo_lo is not None else "n/a",
+                    round(elo_hi, 1) if elo_hi is not None else "n/a",
+                ]
+            )
         except Exception:
             row.extend(["n/a", "n/a", "n/a"])
         # Provenance columns (append-only): exact model identity of this eval.
         row.extend([model_sha, int(match_res.get("interrupted", 0))])
+        # Opponent provenance + search-aware puzzle metric (append-only).
+        engine_info = match_res.get("engine") or {}
+        row.extend(
+            [
+                engine_info.get("engine_name", "unknown"),
+                self.stockfish_elo if self.stockfish_elo else "full",
+                int(bool(engine_info.get("elo_verified"))),
+                mcts_eval_sims,
+                mcts_solved,
+                mcts_total,
+                round(mcts_rate, 4) if mcts_rate is not None else "unavailable",
+            ]
+        )
         self._append_eval_row(row)
 
         # Log to TensorBoard
@@ -1005,7 +1150,15 @@ class Phase4Orchestrator:
         # Promotion gate: save models/checkpoints_rl/best_eval.pt only when the candidate
         # is demonstrably strong, then only when it improves on the previous best score.
         comp_score = float(match_res["engine_score"]) * 0.7 + float(solve_rate) * 0.3
-        eligible, gate_reason = self._promotion_gate(match_res)
+        eligible, gate_reason = self._promotion_gate(match_res, puzzle_rate=solve_rate)
+        if eligible and self.promotion_sprt_max_games > 0:
+            # Sequential-testing protocol (EV-03): a threshold pass alone can be
+            # noise; when enabled, promotion additionally requires an SPRT
+            # decision (never an INCONCLUSIVE or REJECT_H1 result).
+            sprt_decision, sprt_detail = self._run_promotion_sprt(ckpt_path, openings)
+            if sprt_decision != "ACCEPT_H1":
+                eligible = False
+                gate_reason = f"SPRT {sprt_decision}: {sprt_detail}"
         previous_best = self._best_eval_comp_score
         if not eligible:
             logger.info(
@@ -1923,11 +2076,26 @@ def main() -> None:
     parser.add_argument(
         "--stockfish-elo",
         type=int,
-        default=None,
+        default=1500,
         help=(
             "Limit the eval/promotion opponent with UCI_LimitStrength at this UCI_Elo "
-            "(1320-3190). Recommended for a discriminating promotion ladder; default "
-            "keeps legacy full-strength Stockfish at --stockfish-nodes."
+            "(1320-3190). Default 1500 = the calibrated baseline cell; the match score "
+            "is otherwise a floor against full-strength Stockfish."
+        ),
+    )
+    parser.add_argument(
+        "--stockfish-full-strength",
+        action="store_true",
+        help="Explicitly disable the UCI_Elo limit (legacy full-strength opponent).",
+    )
+    parser.add_argument(
+        "--promotion-sprt-max-games",
+        type=int,
+        default=0,
+        help=(
+            "Bounded SPRT games required before promotion (0 = threshold gate only). "
+            "When >0, promotion additionally requires an ACCEPT_H1 decision vs "
+            "best_eval.pt (or the warm start) at H0=0/H1=+30."
         ),
     )
     parser.add_argument(
@@ -2065,8 +2233,9 @@ def main() -> None:
             watchdog_free_ram_gb=args.watchdog_free_ram_gb,
             max_wait_ms=args.max_wait_ms,
             stockfish_nodes=args.stockfish_nodes,
-            stockfish_elo=args.stockfish_elo,
+            stockfish_elo=None if args.stockfish_full_strength else args.stockfish_elo,
             allow_unverified_warm_start=args.allow_unverified_warm_start,
+            promotion_sprt_max_games=args.promotion_sprt_max_games,
             base_lr=args.base_lr,
             min_lr=args.min_lr,
             tactical_mix=args.tactical_mix,
@@ -2110,8 +2279,9 @@ def main() -> None:
             watchdog_free_ram_gb=args.watchdog_free_ram_gb,
             max_wait_ms=args.max_wait_ms,
             stockfish_nodes=args.stockfish_nodes,
-            stockfish_elo=args.stockfish_elo,
+            stockfish_elo=None if args.stockfish_full_strength else args.stockfish_elo,
             allow_unverified_warm_start=args.allow_unverified_warm_start,
+            promotion_sprt_max_games=args.promotion_sprt_max_games,
             base_lr=args.base_lr,
             min_lr=args.min_lr,
             tactical_mix=args.tactical_mix,

@@ -56,6 +56,8 @@ def test_promotion_gate_requires_sample_and_score(tmp_path):
     orchestrator = object.__new__(Phase4Orchestrator)
     orchestrator.promotion_min_games = 100
     orchestrator.promotion_min_score = 0.55
+    orchestrator.puzzle_noise_band = 0.015
+    orchestrator._baseline_puzzle_rate = None
 
     ok, reason = orchestrator._promotion_gate({"total_games": 10, "engine_score": 0.95})
     assert not ok
@@ -68,6 +70,42 @@ def test_promotion_gate_requires_sample_and_score(tmp_path):
     ok, reason = orchestrator._promotion_gate({"total_games": 100, "engine_score": 0.56})
     assert ok
     assert "100 games" in reason
+
+
+def test_promotion_gate_rejects_incomplete_and_regressed_candidates():
+    """EV-01/B4 hardening: an interrupted/short eval record is never a
+    promotion signal, and a candidate that lost baseline puzzle strength is
+    blocked even with a lucky match score."""
+    orchestrator = object.__new__(Phase4Orchestrator)
+    orchestrator.promotion_min_games = 100
+    orchestrator.promotion_min_score = 0.55
+    orchestrator.puzzle_noise_band = 0.015
+    orchestrator._baseline_puzzle_rate = 0.60
+
+    full = {
+        "total_games": 100,
+        "completed_games": 100,
+        "engine_score": 0.56,
+        "interrupted": False,
+    }
+    interrupted = dict(full, interrupted=True)
+    ok, reason = orchestrator._promotion_gate(interrupted, puzzle_rate=0.60)
+    assert not ok
+    assert "interrupted" in reason
+
+    partial = dict(full, completed_games=62)
+    ok, reason = orchestrator._promotion_gate(partial, puzzle_rate=0.60)
+    assert not ok
+    assert "incomplete" in reason
+
+    regressed = dict(full)
+    ok, reason = orchestrator._promotion_gate(regressed, puzzle_rate=0.55)
+    assert not ok
+    assert "baseline retention" in reason
+
+    # Retained baseline + complete record: eligible.
+    ok, reason = orchestrator._promotion_gate(dict(full), puzzle_rate=0.60)
+    assert ok
 
 
 def test_false_resign_log_only_warning(tmp_path, caplog):

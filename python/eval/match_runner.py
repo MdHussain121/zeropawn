@@ -125,31 +125,46 @@ def default_mcts_seed() -> int:
 
 
 def elo_interval(wins: int, draws: int, losses: int) -> dict[str, Optional[float]]:
-    """Elo difference (engine − opponent) from W/D/L with Wald 95% interval.
+    """Elo difference (engine − opponent) from W/D/L with a finite 95% interval.
 
-    Formula: score s = (W + D/2) / N; diff = -400 * log10(1/s - 1) (logistic).
-    Interval: s ± 1.96 * sqrt(s(1-s)/N), endpoints clamped to (0.001, 0.999)
-    and transformed by the same logistic. Returns None endpoints when the
-    score is exactly 0 or 1 (unbounded). This is approximate: game pairs share
-    openings (not independent) and 100 games give wide intervals (±~70+ Elo
-    near 50%).
+    Delegates to :func:`python.eval.sprt.elo_ci` (Agresti-Caffo add-2 on the
+    logit scale): unlike the previous Wald clamp to (0.001, 0.999), the bounds
+    stay finite and honest at shutouts (10-0-0 reports a wide but bounded
+    interval instead of pretending +992 Elo is known). Game pairs share
+    openings (not independent), so intervals remain approximate.
     """
-    import math
+    from python.eval.sprt import elo_ci
 
     n = wins + draws + losses
     if n <= 0:
         return {"elo_diff": None, "lo": None, "hi": None, "score": 0.0}
     s = (wins + 0.5 * draws) / n
+    lo, hi = elo_ci(wins, draws, losses)
+    return {
+        "elo_diff": score_to_elo_safe(s),
+        "lo": lo,
+        "hi": hi,
+        "score": s,
+    }
 
-    def _to_elo(x: float) -> Optional[float]:
-        if x <= 0.0 or x >= 1.0:
-            return None
-        return -400.0 * math.log10(1.0 / x - 1.0)
 
-    se = math.sqrt(max(s * (1.0 - s), 0.0) / n)
-    lo_s = max(s - 1.96 * se, 0.001)
-    hi_s = min(s + 1.96 * se, 0.999)
-    return {"elo_diff": _to_elo(s), "lo": _to_elo(lo_s), "hi": _to_elo(hi_s), "score": s}
+def score_to_elo_safe(score: float) -> Optional[float]:
+    if score <= 0.0 or score >= 1.0:
+        return None
+    import math
+
+    return -400.0 * math.log10(1.0 / score - 1.0)
+
+
+def _parse_elo_option_range(option_line: str) -> Optional[tuple[int, int]]:
+    """Parse ``option name UCI_Elo type string default 1320 min 1320 max 3190``."""
+    import re
+
+    min_m = re.search(r"\bmin\s+(-?\d+)", option_line)
+    max_m = re.search(r"\bmax\s+(-?\d+)", option_line)
+    if not min_m or not max_m:
+        return None
+    return int(min_m.group(1)), int(max_m.group(1))
 
 
 def write_match_pgn(games: list[dict], pgn_path: Union[str, Path]) -> str:
@@ -258,6 +273,13 @@ class StockfishPlayer:
                 f"Stockfish binary on Windows must end with .exe: {self.stockfish_path}"
             )
         self.nodes = nodes
+        self.elo: Optional[int] = None
+        self.elo_verified = False
+        self.elo_verification = "full strength (no limit configured)"
+        self.engine_name = "unknown"
+        self.elo_option_range: Optional[tuple[int, int]] = None
+        self.threads = 1
+        self.hash_mb = 16
         self.proc: Optional[subprocess.Popen] = None
         self._line_queue: queue.Queue[Optional[str]] = queue.Queue()
         self._reader_thread: Optional[threading.Thread] = None
@@ -273,6 +295,23 @@ class StockfishPlayer:
             pass
         self._line_queue.put(None)
 
+    def _stderr_drainer(self) -> None:
+        """Drain the engine's stderr so a full pipe can never block it.
+
+        An undrained stderr PIPE stalls the Stockfish handshake after a few
+        lines on Windows (pipe buffer backpressure), which silently freezes
+        every match; the lines are logged for diagnostics instead.
+        """
+        if not self.proc or not self.proc.stderr:
+            return
+        try:
+            for line in iter(self.proc.stderr.readline, ""):
+                line = line.strip()
+                if line:
+                    logger.debug("stockfish stderr: %s", line)
+        except (OSError, ValueError):
+            pass
+
     def _start_process(self) -> None:
         if self.proc is not None:
             self.close()
@@ -287,42 +326,88 @@ class StockfishPlayer:
         )
         self._reader_thread = threading.Thread(target=self._reader_worker, daemon=True)
         self._reader_thread.start()
+        threading.Thread(target=self._stderr_drainer, daemon=True).start()
 
+        engine_name = "unknown"
+        elo_option_range: Optional[tuple[int, int]] = None
         self.send("uci")
+        saw_uciok = False
         while True:
             line = self.readline(timeout=10.0)
-            if line == "uciok" or not line:
+            if line is None:
+                break  # timeout or reader shutdown
+            if line.startswith("id name") and line.count(" ") >= 2:
+                engine_name = line.split(None, 2)[2]
+            elif line.startswith("option name UCI_Elo"):
+                elo_option_range = _parse_elo_option_range(line)
+            elif line == "uciok":
+                saw_uciok = True
                 break
+            # empty and unrelated lines are skipped (never treated as end)
+        if not saw_uciok:
+            logger.warning("Stockfish handshake: no uciok (options may be missing)")
+        self.engine_name = engine_name
+        self.elo_option_range = elo_option_range
+        # Explicit, reproducible opponent configuration: single thread and a
+        # small fixed hash so the fixed-node search budget is deterministic
+        # and recorded with every match (EV-05/EV-01 provenance).
+        self.send("setoption name Threads value 1")
+        self.send("setoption name Hash value 16")
+        self.threads = 1
+        self.hash_mb = 16
         self.send("isready")
-        while True:
-            line = self.readline(timeout=10.0)
-            if line == "readyok" or not line:
-                break
+        self._drain_until("readyok", timeout=10.0)
+
+    def engine_info(self) -> dict:
+        """Opponent provenance: identity, strength limit and its verification status."""
+        return {
+            "engine_name": self.engine_name,
+            "stockfish_elo": getattr(self, "elo", None),
+            "elo_verified": self.elo_verified,
+            "elo_verification": self.elo_verification,
+            "stockfish_nodes": self.nodes,
+            "threads": self.threads,
+            "hash_mb": self.hash_mb,
+        }
 
     def reset_game(self) -> None:
         """Reset internal engine state between games."""
         self.send("ucinewgame")
         self.send("isready")
-        while True:
-            line = self.readline(timeout=10.0)
-            if line == "readyok" or not line:
-                break
+        self._drain_until("readyok", timeout=10.0)
 
     def set_elo(self, elo: int) -> None:
         """Enable UCI_LimitStrength at the given UCI_Elo (e.g. 1320/1500/1700).
 
         Approximate strength levels (Stockfish docs); not a certified rating.
+        Verification: this Stockfish build has no ``getoption`` readback, so
+        the limit is verified by (a) the engine declaring a UCI_Elo option
+        whose range contains the requested value and (b) the setoption being
+        accepted without error before readyok. The verification level is
+        recorded with every match instead of being silently assumed.
         """
         if not 1320 <= elo <= 3190:
             raise ValueError(f"UCI_Elo {elo} outside Stockfish range 1320-3190.")
+        rng = getattr(self, "elo_option_range", None)
+        if rng is None:
+            raise RuntimeError(
+                "Engine does not declare a UCI_Elo option; UCI_LimitStrength is "
+                "unsupported and the opponent would run at full strength."
+            )
+        lo, hi = rng
+        if not (lo <= elo <= hi):
+            raise RuntimeError(
+                f"Requested UCI_Elo {elo} outside the engine's declared range [{lo}, {hi}]."
+            )
         self.send("setoption name UCI_LimitStrength value true")
         self.send(f"setoption name UCI_Elo value {elo}")
         self.send("isready")
-        while True:
-            line = self.readline(timeout=10.0)
-            if line == "readyok" or not line:
-                break
+        self._drain_until("readyok", timeout=10.0)
         self.elo = elo
+        self.elo_verified = True
+        self.elo_verification = (
+            f"declared-range (UCI_Elo option [{lo}, {hi}]; this build has no getoption readback)"
+        )
 
     def send(self, cmd: str) -> None:
         if self.proc and self.proc.stdin:
@@ -332,15 +417,34 @@ class StockfishPlayer:
             except (OSError, BrokenPipeError):
                 logger.warning("Failed to send command %r to Stockfish", cmd)
 
-    def readline(self, timeout: float = 10.0) -> str:
+    def readline(self, timeout: float = 10.0) -> Optional[str]:
+        """Read one engine output line.
+
+        Returns None on timeout or reader shutdown, and may return ``""`` for
+        a genuinely empty output line — callers in handshakes must skip empty
+        lines instead of treating them as termination (Stockfish emits blank
+        lines between its ``id`` block and the option list).
+        """
         if not self.proc:
-            return ""
+            return None
         try:
-            item = self._line_queue.get(timeout=timeout)
-            return item if item is not None else ""
+            return self._line_queue.get(timeout=timeout)
         except queue.Empty:
             logger.warning("Stockfish readline timed out after %.1fs", timeout)
-            return ""
+            return None
+
+    def _drain_until(self, marker: str, timeout: float = 10.0) -> bool:
+        """Consume lines until ``marker`` (e.g. 'uciok'/'readyok') or timeout.
+
+        Returns True when the marker was seen. Empty lines and unrelated
+        output are skipped; None (timeout/dead reader) ends the wait.
+        """
+        while True:
+            line = self.readline(timeout=timeout)
+            if line is None:
+                return False
+            if line == marker:
+                return True
 
     def get_move(self, fen: str) -> str:
         """Query Stockfish for best move from FEN with fixed node limit."""
@@ -350,7 +454,7 @@ class StockfishPlayer:
         best_move = ""
         while True:
             line = self.readline(timeout=30.0)
-            if not line:
+            if line is None:
                 break
             if line.startswith("bestmove"):
                 parts = line.split()
@@ -895,6 +999,7 @@ class MatchRunner:
             "search_mode": self.search_mode,
             "seed": self.seed,
             "stockfish_elo": self.stockfish_elo,
+            "engine": contexts[0].stockfish.engine_info() if contexts else None,
             "interrupted": interrupted,
             "games": games,
             "pgn_path": pgn_saved,
