@@ -33,6 +33,16 @@ def dummy_eval(g):
 # ── 1. Disabled-Mode Baseline Parity Tests (20 positions) ──────────
 
 
+
+
+def _finish_search(engine, timeout=60.0):
+    """go is async under the UCI protocol (stop must stay processable); tests
+    wait for the search thread before reading stdout."""
+    t = getattr(engine, "_search_thread", None)
+    if t is not None and t.is_alive():
+        t.join(timeout=timeout)
+
+
 def test_disabled_mode_parity_20_positions():
     """Verify that with reuse_tree=False, search matches pre-change baseline bit-for-bit."""
     baseline_path = Path("scratch/baseline_20pos_dummy.json")
@@ -307,6 +317,7 @@ def test_uci_reuse_tree_option_and_replay():
         sys.stdout = buf
         engine.handle_line("position startpos")
         engine.handle_line("go nodes 20")
+        _finish_search(engine)
         bestmove_line = [l for l in buf.getvalue().splitlines() if l.startswith("bestmove")]
         assert len(bestmove_line) == 1
         first_engine_move = bestmove_line[0].split()[1]
@@ -391,6 +402,7 @@ def test_uci_weights_reload_invalidation(tmp_path):
     # Perform a search so mcts populates cache and retains tree
     engine.handle_line("position startpos")
     engine.handle_line("go nodes 20")
+    _finish_search(engine)
     assert engine.mcts.cache_size() > 0, "NN cache must have entries after search"
     assert engine.mcts.has_retained_root() is True, "Root must be retained"
     assert engine.last_engine_action is not None
@@ -409,6 +421,7 @@ def test_uci_weights_reload_invalidation(tmp_path):
     # Search after reload succeeds and populates fresh cache with new weights
     engine.handle_line("position startpos")
     engine.handle_line("go nodes 20")
+    _finish_search(engine)
     assert engine.mcts.cache_size() > 0
 
 
@@ -424,6 +437,7 @@ def test_uci_weights_reload_failure_preserves_engine(tmp_path):
 
     engine.handle_line("position startpos")
     engine.handle_line("go nodes 10")
+    _finish_search(engine)
     cache_before = engine.mcts.cache_size()
     assert cache_before > 0
 

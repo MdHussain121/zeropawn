@@ -6,6 +6,16 @@ import sys
 from python.uci.uci_engine import UCIEngine
 
 
+
+
+def _finish_search(engine, timeout=60.0):
+    """go is async under the UCI protocol (stop must stay processable); tests
+    wait for the search thread before reading stdout."""
+    t = getattr(engine, "_search_thread", None)
+    if t is not None and t.is_alive():
+        t.join(timeout=timeout)
+
+
 def test_uci_protocol_handshake():
     """Verify standard UCI handshake (uci -> uciok, isready -> readyok)."""
     engine = UCIEngine()
@@ -47,6 +57,7 @@ def test_uci_position_and_go():
         stdout_buf.truncate(0)
         stdout_buf.seek(0)
         assert engine.handle_line("go nodes 15") is True
+        _finish_search(engine)
         output = stdout_buf.getvalue()
         assert "bestmove" in output
         assert "info depth" in output
@@ -82,6 +93,7 @@ def test_uci_batched_search_options():
         assert engine.handle_line("ucinewgame") is True
         assert engine.handle_line("position startpos") is True
         assert engine.handle_line("go nodes 20") is True
+        _finish_search(engine)
         go_out = stdout_buf.getvalue()
         assert "bestmove" in go_out
         assert "info depth" in go_out

@@ -97,12 +97,17 @@ class SafetyTriggerException(Exception):
     pass
 
 
-def puzzle_decline_trips(history: list[float], band: float = 0.005) -> bool:
+def puzzle_decline_trips(history: list[float], band: float = 0.015) -> bool:
     """True if the last 3 steps each decline by MORE than ``band``.
 
     Same trigger semantics as before, plus a noise band so flat/jittered
     histories (drops within measurement noise) cannot trip a critical stop.
     Needs >= 4 samples; shorter histories never trip.
+
+    Band calibration: the certified 1,000-puzzle set has binomial sampling
+    noise sigma = sqrt(p(1-p)/n) ~= 0.015 at p ~= 0.64, so per-step drops must
+    exceed one standard deviation (~1.5 percentage points) to count as real
+    decline rather than sampling jitter (audit finding F-14).
     """
     if len(history) < 4:
         return False
@@ -136,6 +141,12 @@ class Phase4Orchestrator:
         openings_path: str = "data/openings/eval_openings_50.epd",
         stockfish_path: str = "tools/stockfish.exe",
         stockfish_nodes: int = 1000,
+        # Opponent calibration (audit F-14): full-strength SF at 1000 nodes is
+        # a floor opponent for the promotion match (measured 0/30). Set an
+        # UCI_Elo limit (1320-1700 ladder recommended) so the match score is
+        # discriminating. None keeps the legacy full-strength behavior.
+        stockfish_elo: Optional[int] = None,
+        allow_unverified_warm_start: bool = False,
         is_verify_mode: bool = False,
         skip_baseline_eval: bool = False,
         gpu_cache_capacity: Optional[int] = 160_000,
@@ -343,6 +354,8 @@ class Phase4Orchestrator:
             stockfish_p = _repo_root / stockfish_p
         self.stockfish_path = stockfish_p
         self.stockfish_nodes = stockfish_nodes
+        self.stockfish_elo = stockfish_elo
+        self.allow_unverified_warm_start = allow_unverified_warm_start
 
         self.stop_event = threading.Event()
         self.start_time = time.time()
@@ -351,8 +364,10 @@ class Phase4Orchestrator:
         # Historical evaluation metrics for trend tracking
         self.puzzle_solve_history: list[float] = []
         # Noise band for the puzzle-decline safety trigger: per-step drops at
-        # or below this absolute rate do not count as declines.
-        self.puzzle_noise_band: float = 0.005
+        # or below this absolute rate do not count as declines. Calibrated to
+        # one standard deviation of the certified 1,000-puzzle set
+        # (~1.5 percentage points at p~0.64); see puzzle_decline_trips.
+        self.puzzle_noise_band: float = 0.015
         self.initial_policy_entropy: Optional[float] = None
         self.entropy_history: list[float] = []
         self.low_gpu_util_counter = 0
@@ -370,6 +385,9 @@ class Phase4Orchestrator:
         self._completed_games_seen = 0
         self._last_push_version = 0
         self._known_ckpt_names: set[str] = set()
+        # Identity of the most recently saved eval checkpoint (provenance).
+        self._last_saved_ckpt_name: str = ""
+        self._last_saved_ckpt_path: str = ""
         self._active_checkpoint_path = ""
         self._tb_files_found = 0
         self._tb_enabled = False
@@ -431,6 +449,20 @@ class Phase4Orchestrator:
         self._active_checkpoint_path = (
             str(active_checkpoint) if active_checkpoint else "random_init"
         )
+        # Warm-start provenance gate (audit F-11/F-12): an absent, unreadable,
+        # wrong-architecture, or undesignated checkpoint must never silently
+        # become the RL base. A fresh random init ("cold start") is exempt —
+        # it is not resuming anyone's training lineage.
+        if active_checkpoint and not self.is_verify_mode:
+            from python.model.checkpoint_registry import validate_warm_start
+
+            ws_info = validate_warm_start(
+                active_checkpoint,
+                repo_root=_repo_root,
+                allow_unverified=self.allow_unverified_warm_start,
+            )
+            logger.info("[WARM-START] validated: %s", json.dumps(ws_info, default=str))
+            self._warm_start_info = ws_info
         # Auto-detect Syzygy tablebase if not explicitly disabled
         if self.tablebase_path is None:
             for candidate in ("data/syzygy", "syzygy", "/usr/share/syzygy"):
@@ -585,10 +617,82 @@ class Phase4Orchestrator:
                 "elo_diff",
                 "elo_lo",
                 "elo_hi",
+                # Provenance (F-15): exact weights this eval row certifies, and
+                # whether the match was interrupted before completion.
+                "model_sha256",
+                "match_interrupted",
             ]
             with open(self.eval_csv_path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 writer.writerow(headers)
+        # Per-game durability (F-15): every completed match game is persisted
+        # the moment it finishes, so an interrupted evaluation keeps its
+        # evidence and a resumed run can deduplicate by (step, seed, color).
+        self.match_games_csv_path = self.log_dir / "match_games.csv"
+        if not self.match_games_csv_path.exists():
+            with open(self.match_games_csv_path, "w", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow(
+                    [
+                        "timestamp",
+                        "step",
+                        "model_version",
+                        "checkpoint_file",
+                        "model_sha256",
+                        "opening_idx",
+                        "engine_is_white",
+                        "result",
+                        "seed",
+                        "stockfish_elo",
+                        "stockfish_nodes",
+                        "mcts_sims",
+                        "search_mode",
+                        "plies",
+                    ]
+                )
+
+    def _current_model_sha(self) -> str:
+        """SHA-256 of the exact weights being evaluated (first 16 hex chars)."""
+        try:
+            import hashlib
+
+            sha = hashlib.sha256()
+            with open(self._last_saved_ckpt_path, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 20), b""):
+                    sha.update(chunk)
+            return sha.hexdigest()[:16]
+        except Exception as exc:
+            logger.warning("[EVAL] Could not hash checkpoint for provenance: %s", exc)
+            return "unknown"
+
+    def _append_eval_row(self, row: list) -> None:
+        """Append one eval_history row and fsync so interruption keeps it."""
+        with open(self.eval_csv_path, "a", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(row)
+            f.flush()
+            os.fsync(f.fileno())
+
+    def _persist_match_game(self, game: dict) -> None:
+        """Persist one completed match game (F-15 incremental durability)."""
+        row = [
+            time.time(),
+            self.trainer.step_num,
+            self.server.model_version,
+            self._last_saved_ckpt_name,
+            self._current_model_sha(),
+            game.get("opening_idx"),
+            int(bool(game.get("engine_is_white"))),
+            game.get("result"),
+            game.get("seed"),
+            self.stockfish_elo if self.stockfish_elo else "full",
+            self.stockfish_nodes,
+            self.eval_sims if self.eval_sims is not None else (10 if self.is_verify_mode else 400),
+            "serial",
+            len(game.get("moves", []) or []),
+        ]
+        with open(self.match_games_csv_path, "a", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(row)
+            f.flush()
+            os.fsync(f.fileno())
 
     def _promotion_gate(self, match_res: dict) -> tuple[bool, str]:
         """Strength gate for best_eval.pt promotion (R-07).
@@ -664,6 +768,8 @@ class Phase4Orchestrator:
 
         # Save milestone evaluation checkpoint
         ckpt_name = f"phase4_ckpt_v{self.server.model_version}_step{self.trainer.step_num}.pt"
+        self._last_saved_ckpt_name = ckpt_name
+        self._last_saved_ckpt_path = str(self.checkpoint_dir / ckpt_name)
         ckpt_path = self.checkpoint_dir / ckpt_name
         self.trainer.save_checkpoint(ckpt_path, keep_last_n=self.keep_checkpoints)
         self._known_ckpt_names.add(ckpt_name)
@@ -700,11 +806,17 @@ class Phase4Orchestrator:
         eval_sims = (
             self.eval_sims if self.eval_sims is not None else (10 if self.is_verify_mode else 400)
         )
+        elo_note = f", UCI_Elo {self.stockfish_elo}" if self.stockfish_elo else ", full strength"
+        logger.info(
+            f"[EVAL CYCLE] Running {openings * 2}-game match vs Stockfish "
+            f"({self.stockfish_nodes} nodes{elo_note})..."
+        )
         match_runner = MatchRunner(
             model=self.trainer.model,
             device=self.device,
             stockfish_path=self.stockfish_path,
             stockfish_nodes=self.stockfish_nodes,
+            stockfish_elo=self.stockfish_elo,
             mcts_sims=eval_sims,
             c_puct=2.0,
             openings_path=self.openings_path,
@@ -712,7 +824,9 @@ class Phase4Orchestrator:
             search_mode="serial",
         )
         try:
-            match_res = match_runner.run_match(num_openings=openings)
+            match_res = match_runner.run_match(
+                num_openings=openings, on_game_result=self._persist_match_game
+            )
         finally:
             match_runner.close()
 
@@ -730,6 +844,7 @@ class Phase4Orchestrator:
 
         now = time.time()
         elapsed_hours = (now - self.start_time) / 3600.0
+        model_sha = self._current_model_sha()
 
         # Append to CSV (column order locked; provenance appended, see _init_eval_csv)
         row = [
@@ -769,9 +884,9 @@ class Phase4Orchestrator:
             row.extend([round(elo_diff, 1), round(elo_lo, 1), round(elo_hi, 1)])
         except Exception:
             row.extend(["n/a", "n/a", "n/a"])
-        with open(self.eval_csv_path, "a", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(row)
+        # Provenance columns (append-only): exact model identity of this eval.
+        row.extend([model_sha, int(match_res.get("interrupted", 0))])
+        self._append_eval_row(row)
 
         # Log to TensorBoard
         step = self.trainer.step_num
@@ -1686,6 +1801,25 @@ def main() -> None:
         help="Base warm-start checkpoint path",
     )
     parser.add_argument(
+        "--allow-unverified-warm-start",
+        action="store_true",
+        help=(
+            "Operator override: start RL from a checkpoint that is absent from the "
+            "checkpoint registry or not designated as a warm start. The decision is "
+            "logged loudly; without this flag such starts are rejected (F-11/F-12)."
+        ),
+    )
+    parser.add_argument(
+        "--stockfish-elo",
+        type=int,
+        default=None,
+        help=(
+            "Limit the eval/promotion opponent with UCI_LimitStrength at this UCI_Elo "
+            "(1320-3190). Recommended for a discriminating promotion ladder; default "
+            "keeps legacy full-strength Stockfish at --stockfish-nodes."
+        ),
+    )
+    parser.add_argument(
         "--device", type=str, default=None, help="Execution device (default: auto cuda/cpu)"
     )
     parser.add_argument(
@@ -1820,6 +1954,8 @@ def main() -> None:
             watchdog_free_ram_gb=args.watchdog_free_ram_gb,
             max_wait_ms=args.max_wait_ms,
             stockfish_nodes=args.stockfish_nodes,
+            stockfish_elo=args.stockfish_elo,
+            allow_unverified_warm_start=args.allow_unverified_warm_start,
             base_lr=args.base_lr,
             min_lr=args.min_lr,
             tactical_mix=args.tactical_mix,
@@ -1863,6 +1999,8 @@ def main() -> None:
             watchdog_free_ram_gb=args.watchdog_free_ram_gb,
             max_wait_ms=args.max_wait_ms,
             stockfish_nodes=args.stockfish_nodes,
+            stockfish_elo=args.stockfish_elo,
+            allow_unverified_warm_start=args.allow_unverified_warm_start,
             base_lr=args.base_lr,
             min_lr=args.min_lr,
             tactical_mix=args.tactical_mix,

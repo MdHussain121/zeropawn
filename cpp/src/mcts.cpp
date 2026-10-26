@@ -350,7 +350,7 @@ bool MCTS::advance_root(int action, const Game& new_state) {
     return true;
 }
 
-SearchResult MCTS::search(const Game& root_state, int num_simulations, const Evaluator& evaluator, const BatchEvaluator& batch_evaluator) {
+SearchResult MCTS::search(const Game& root_state, int num_simulations, const Evaluator& evaluator, const BatchEvaluator& batch_evaluator, const AbortFn& abort_fn) {
     SearchResult result;
     result.action_visits.resize(root_state.num_actions(), 0.0f);
     result.batch_size = config_.batch_size;
@@ -388,6 +388,7 @@ SearchResult MCTS::search(const Game& root_state, int num_simulations, const Eva
         return result;
     }
 
+    int sims_performed_total = 0;
     if (config_.batch_size <= 1) {
         // Serial simulation path (exact baseline implementation)
         struct SimulationVirtualLossGuard {
@@ -408,11 +409,24 @@ SearchResult MCTS::search(const Game& root_state, int num_simulations, const Eva
         };
 
         try {
+            int sims_performed = 0;
             for (int sim = 0; sim < num_simulations; ++sim) {
+                // Poll the abort predicate periodically (approximately every 32
+                // simulations) so UCI clock deadlines and stop requests are
+                // honored during the search instead of only after it.
+                if (abort_fn && (sim % 32) == 0 && abort_fn()) {
+                    break;
+                }
                 Node* curr_node = root_.get();
                 auto sim_state = root_state.clone();
                 std::vector<std::pair<Node*, int>> search_path;
                 SimulationVirtualLossGuard vl_guard(search_path, config_.virtual_loss);
+                // Root FPU: parent_q starts at a constant 0.0 at the root, so
+                // unvisited root children score -(fpu_reduction) + U regardless
+                // of the root evaluation. At every deeper level parent_q is the
+                // negated mean action value of the visited child (-Q_child).
+                // (The DEF-01 record's "-root_eval at root" description does not
+                // match this implementation; see docs/LOGIC_CORRECTNESS_AUDIT.md.)
                 float parent_q = 0.0f;
 
                 // Selection
@@ -457,7 +471,9 @@ SearchResult MCTS::search(const Game& root_state, int num_simulations, const Eva
                     node->visit_counts[act_idx] += 1;
                 }
                 vl_guard.committed = true;
+                ++sims_performed;
             }
+            sims_performed_total = sims_performed;
         } catch (...) {
             if (!config_.reuse_tree) {
                 reset_root();
@@ -510,6 +526,11 @@ SearchResult MCTS::search(const Game& root_state, int num_simulations, const Eva
         int sims_done = 0;
         try {
             while (sims_done < num_simulations) {
+                // Abort polling once per batch (batched iteration granularity;
+                // the serial path polls every 32 simulations).
+                if (abort_fn && abort_fn()) {
+                    break;
+                }
                 int target_batch = std::min(config_.batch_size, num_simulations - sims_done);
                 std::vector<Candidate> candidates;
                 candidates.reserve(target_batch);
@@ -659,6 +680,7 @@ SearchResult MCTS::search(const Game& root_state, int num_simulations, const Eva
                 vl_guard.committed = true;
                 sims_done += static_cast<int>(candidates.size());
             }
+            sims_performed_total = sims_done;
         } catch (...) {
             if (!config_.reuse_tree) {
                 reset_root();
@@ -692,7 +714,9 @@ SearchResult MCTS::search(const Game& root_state, int num_simulations, const Eva
     result.best_action = best_act;
     result.root_value = (total_visits > 0) ? (sum_q / total_visits) : 0.0f;
     result.retained_visits = retained_visits;
-    result.new_simulations = num_simulations;
+    // Actual simulations completed; an aborted search returns the best move
+    // from the tree built so far rather than the requested budget.
+    result.new_simulations = sims_performed_total;
     last_retained_visits_ = retained_visits;
 
     // Normalize action visits to distribution
@@ -795,7 +819,8 @@ void MCTS::cache_insert(uint64_t h, std::vector<float> policy, float value) {
         it->second.lru_it = nn_cache_lru_.begin();
         return;
     }
-    if (nn_cache_.size() >= MCTS::NN_CACHE_CAP) {
+    const size_t cap = (config_.nn_cache_cap > 0) ? config_.nn_cache_cap : NN_CACHE_CAP;
+    if (nn_cache_.size() >= cap) {
         cache_evict_lru();
     }
     nn_cache_lru_.push_front(h);
@@ -838,7 +863,8 @@ SearchResult MCTS::aggregate(const Node& root, int num_legal, int num_actions) c
 }
 
 SearchResult MCTS::search_batched(const Game& root_state, int num_simulations,
-                                  const RawBatchEvaluator& batch_eval, int batch_size) {
+                                  const RawBatchEvaluator& batch_eval, int batch_size,
+                                  const AbortFn& abort_fn) {
     const int B = batch_size > 0 ? batch_size : 1;
     const int state_size = root_state.state_size();
     const int num_actions = root_state.num_actions();
@@ -883,6 +909,10 @@ SearchResult MCTS::search_batched(const Game& root_state, int num_simulations,
     flat.reserve(static_cast<size_t>(B) * static_cast<size_t>(state_size));
 
     while (sims_done < num_simulations) {
+        // Abort polling once per batch iteration.
+        if (abort_fn && abort_fn()) {
+            break;
+        }
         std::vector<PendingLeaf> batch;
         batch.reserve(static_cast<size_t>(B));
         std::unordered_map<Node*, size_t> pending_index;
@@ -1010,7 +1040,10 @@ SearchResult MCTS::search_batched(const Game& root_state, int num_simulations,
         }
     }
 
-    return aggregate(*root, num_legal, num_actions);
+    SearchResult result = aggregate(*root, num_legal, num_actions);
+    result.batch_size = B;
+    result.new_simulations = sims_done;
+    return result;
 }
 
 

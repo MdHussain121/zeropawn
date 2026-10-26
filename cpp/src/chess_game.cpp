@@ -1,6 +1,8 @@
 #include "zeropawn/chess_game.hpp"
 #include "zeropawn/encoder.hpp"
 
+#include <stdexcept>
+
 namespace zeropawn {
 
 uint64_t compute_perft(chess::Board& board, int depth) {
@@ -175,9 +177,21 @@ void ChessGame::apply_action(int action) {
     // it directly avoids regenerating the whole legal move list (which make_move_uci
     // would do) on every simulation step.
     std::string uci = index_to_move(*this, action);
-    if (uci.empty()) return;
+    if (uci.empty() || action < 0) {
+        // An undecodable action must never silently leave the game unchanged:
+        // search would continue as if the move had been played and expand child
+        // nodes from a state that diverges from the tree path. Threading the
+        // error out (pybind maps std::invalid_argument to ValueError) lets the
+        // RAII virtual-loss guards unwind the search cleanly.
+        throw std::invalid_argument(
+            "ChessGame::apply_action: cannot decode action index " + std::to_string(action));
+    }
     chess::Move m = chess::uci::uciToMove(board_, uci);
-    if (m == chess::Move::NO_MOVE) return;
+    if (m == chess::Move::NO_MOVE) {
+        throw std::invalid_argument(
+            "ChessGame::apply_action: action index " + std::to_string(action) +
+            " decoded to NO_MOVE");
+    }
     board_.makeMove(m);
     move_history_.push_back(m);
 }
