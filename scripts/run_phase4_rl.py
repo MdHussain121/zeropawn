@@ -558,7 +558,7 @@ class Phase4Orchestrator:
             temp_cutoff_range=(15, 30),
             resign_threshold=-0.95,
             consecutive_resign_moves=4,
-            disable_resign_prob=0.15,
+            disable_resign_prob=0.15,  # also stamped on self for banner/trigger text
             allow_resignation=True,
             min_resign_ply=30,
             tablebase_path=self.tablebase_path,
@@ -566,6 +566,7 @@ class Phase4Orchestrator:
             position_sink=sink,
             seed=self.seed,
         )
+        self.disable_resign_prob = 0.15
 
         # 5. Initialize RL Trainer
         trainer_model = ChessNet(num_blocks=12, num_filters=128).to(self.train_device)
@@ -1231,11 +1232,13 @@ class Phase4Orchestrator:
                 "_warned_false_resign",
                 "TRIGGER",
                 f"false-resign rate {false_resign_rate * 100:.1f}% > 5% threshold "
-                f"(LOG-ONLY, resign stays off)",
+                f"(LOG-ONLY; measured on games where resignation was disabled for calibration)",
             )
             logger.warning(
                 f"SAFETY TRIGGER (LOG-ONLY): False-resign rate exceeded 5% (currently {false_resign_rate * 100:.1f}% "
-                f"over {self.metrics_tracker.total_would_have_resigned} calibration games; resignation is disabled)."
+                f"over {self.metrics_tracker.total_would_have_resigned} calibration games — resignation "
+                f"runs disabled in {int(round(getattr(self, 'disable_resign_prob', 0.15) * 100))}% "
+                "of games for exactly this measurement)."
             )
 
         # Check 3: Policy entropy collapse (> 35% drop from baseline)
@@ -1305,7 +1308,14 @@ class Phase4Orchestrator:
             ("CONC", f"requested={self._requested_concurrency} effective={conc}{conc_mark} (C)"),
             ("TEMP", "cutoff plies 15-30 (C)"),
             ("NOISE", "dirichlet alpha=0.3 weight=0.25 (C, search defaults)"),
-            ("RESIGN", "off (C, passive would_resign logged)"),
+            (
+                "RESIGN",
+                f"on t={self.worker.resign_threshold} k={self.worker.consecutive_resign_moves} "
+                f"ply>={self.worker.min_resign_ply}; "
+                f"{int(round((1 - self.disable_resign_prob) * 100))}% of games resign, "
+                f"{int(round(self.disable_resign_prob * 100))}% run disabled for "
+                "false-resign calibration (RL-02)",
+            ),
             ("TABLEBASE", tb),
             ("REUSE_CAP", f"{self.max_reuse_ratio}{'*' if self.max_reuse_ratio != 16 else ''} (C)"),
             ("MIN_FILL", f"{min_fill}{'*' if self.min_buffer_fill not in (0, 500) else ''} (C)"),

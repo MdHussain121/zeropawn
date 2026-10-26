@@ -113,6 +113,7 @@ class GameSummary:
     cut_ply: Optional[int] = None
     cut_piece_count: Optional[int] = None
     raw_wdl: Optional[int] = None
+    would_have_resigned_side_white: Optional[bool] = None  # side that would have resigned
 
 
 class WorkerBatchAggregator:
@@ -541,10 +542,20 @@ class SelfPlayGame:
         self.resign_threshold = resign_threshold
         self.consecutive_resign_moves = consecutive_resign_moves
         self.min_resign_ply = min_resign_ply
-        if allow_resignation is not None:
-            self.allow_resignation = allow_resignation
-        else:
+        # Resignation semantics (RL-02): `allow_resignation` is the FEATURE
+        # switch; `disable_resign_prob` is the per-game calibration fraction
+        # that must keep working when the feature is ON — otherwise the
+        # false-resign instrumentation is dead code (the Oct 26 audit
+        # finding). Per game:
+        #   feature off  -> resignation never fires; every game logs
+        #                   would-have-resigned (diagnostic mode),
+        #   feature on   -> this game resigns unless sampled into the
+        #                   calibration fraction (disable_resign_prob).
+        self.resign_feature_enabled = bool(allow_resignation)
+        if self.resign_feature_enabled:
             self.allow_resignation = self._rng.random() >= disable_resign_prob
+        else:
+            self.allow_resignation = False
         self.max_plies = max_plies
         self.ply_hook = ply_hook
         self.tablebase_path = tablebase_path
@@ -948,6 +959,7 @@ class SelfPlayGame:
             resigned=resigned,
             resigned_side_white=resigned_side_white,
             would_have_resigned=self.would_have_resigned,
+            would_have_resigned_side_white=self.would_have_resigned_side_white,
             is_false_resign=is_false_resign,
             duration_sec=duration,
             total_simulations=self.total_simulations,
