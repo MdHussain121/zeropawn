@@ -167,6 +167,19 @@ def _parse_elo_option_range(option_line: str) -> Optional[tuple[int, int]]:
     return int(min_m.group(1)), int(max_m.group(1))
 
 
+def _engine_info_from_contexts(contexts: list) -> Optional[dict]:
+    """Opponent provenance from the first match context, when it exposes one.
+
+    Test doubles and degenerate matches may provide contexts without a live
+    Stockfish player; provenance is then simply absent rather than fatal.
+    """
+    for ctx in contexts or []:
+        player = getattr(ctx, "stockfish", None)
+        if player is not None and hasattr(player, "engine_info"):
+            return player.engine_info()
+    return None
+
+
 def write_match_pgn(games: list[dict], pgn_path: Union[str, Path]) -> str:
     """Append match games as PGN (board-relative results). Returns path str.
 
@@ -999,7 +1012,7 @@ class MatchRunner:
             "search_mode": self.search_mode,
             "seed": self.seed,
             "stockfish_elo": self.stockfish_elo,
-            "engine": contexts[0].stockfish.engine_info() if contexts else None,
+            "engine": _engine_info_from_contexts(contexts),
             "interrupted": interrupted,
             "games": games,
             "pgn_path": pgn_saved,
