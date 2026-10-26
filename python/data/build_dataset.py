@@ -22,7 +22,7 @@ import logging
 import sys
 import time
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any, Optional, TextIO
 import numpy as np
 import chess.pgn
 
@@ -85,7 +85,11 @@ VALID_OUTCOMES: tuple[int, ...] = (0, 1, 2, OUTCOME_UNAVAILABLE)
 
 
 class PositionData:
-    __slots__ = ("planes", "move_idx", "outcome", "game_id", "ply", "pos_hash")
+    __slots__ = ("planes", "move_idx", "outcome", "game_id", "ply", "pos_hash", "legal_mask")
+
+    # 4672 actions packed into bits: ceil(4672/8) bytes per position.
+    MASK_NUM_ACTIONS = 4672
+    MASK_PACKED_BYTES = (4672 + 7) // 8
 
     def __init__(
         self,
@@ -95,6 +99,7 @@ class PositionData:
         game_id: int,
         ply: int,
         pos_hash: int,
+        legal_mask: Optional[np.ndarray] = None,
     ) -> None:
         if outcome not in VALID_OUTCOMES:
             raise ValueError(f"Invalid outcome {outcome}: must be one of {VALID_OUTCOMES}")
@@ -104,6 +109,18 @@ class PositionData:
         self.game_id = game_id
         self.ply = ply
         self.pos_hash = pos_hash
+        self.legal_mask = legal_mask
+
+
+def compute_legal_mask(cpp_game) -> np.ndarray:
+    """Packed bit mask of legal action indices from a live C++ ChessGame."""
+    legal = np.zeros(4672, dtype=np.bool_)
+    actions = cpp_game.legal_actions()
+    idx = np.asarray(actions, dtype=np.int64)
+    if idx.size and (idx.min() < 0 or idx.max() >= 4672):
+        raise ValueError(f"legal_actions returned out-of-range indices: {idx.min()}..{idx.max()}")
+    legal[idx] = True
+    return np.packbits(legal)  # uint8, 584 bytes
 
 
 def process_pgn_game(game: chess.pgn.Game) -> tuple[int, bool, list[PositionData]]:
@@ -134,6 +151,19 @@ def process_pgn_game(game: chess.pgn.Game) -> tuple[int, bool, list[PositionData
             # Move could not be mapped (e.g. malformed), stop game replay
             break
 
+        legal_mask = compute_legal_mask(cpp_game)
+
+        # Data-integrity gate (SL-01): the training label must be a legal
+        # action of the position it is stored with. A violation means the
+        # replay or the action mapping is broken — fail loudly instead of
+        # training on (or smoothing away) an impossible move.
+        unpacked = np.unpackbits(legal_mask)
+        if not unpacked[move_idx]:
+            raise ValueError(
+                f"Illegal training label in game {game_id_str} at ply {ply_num}: "
+                f"action {move_idx} ({uci_move}) is not legal in the stored position."
+            )
+
         # Side to move's perspective outcome:
         # 0 = Win, 1 = Draw, 2 = Loss
         is_white = cpp_game.side_to_move()
@@ -154,6 +184,7 @@ def process_pgn_game(game: chess.pgn.Game) -> tuple[int, bool, list[PositionData
                 game_id=game_id,
                 ply=ply_num,
                 pos_hash=pos_hash,
+                legal_mask=legal_mask,
             )
         )
 
@@ -177,12 +208,24 @@ def save_dataset_split(
     outcomes_path = data_dir / "outcomes.bin"
     game_ids_path = data_dir / "game_ids.bin"
     plies_path = data_dir / "plies.bin"
+    masks_path = data_dir / "masks.bin"
+    has_masks = all(p.legal_mask is not None for p in positions)
 
     planes_mm = np.memmap(planes_path, dtype=np.float32, mode="w+", shape=(num_samples, 19, 8, 8))
     moves_mm = np.memmap(moves_path, dtype=np.int16, mode="w+", shape=(num_samples,))
     outcomes_mm = np.memmap(outcomes_path, dtype=np.uint8, mode="w+", shape=(num_samples,))
     game_ids_mm = np.memmap(game_ids_path, dtype=np.uint64, mode="w+", shape=(num_samples,))
     plies_mm = np.memmap(plies_path, dtype=np.int16, mode="w+", shape=(num_samples,))
+    masks_mm = (
+        np.memmap(
+            masks_path,
+            dtype=np.uint8,
+            mode="w+",
+            shape=(num_samples, PositionData.MASK_PACKED_BYTES),
+        )
+        if has_masks
+        else None
+    )
 
     try:
         for i, pos in enumerate(positions):
@@ -191,14 +234,20 @@ def save_dataset_split(
             outcomes_mm[i] = pos.outcome
             game_ids_mm[i] = pos.game_id
             plies_mm[i] = pos.ply
+            if masks_mm is not None:
+                masks_mm[i] = pos.legal_mask
 
         planes_mm.flush()
         moves_mm.flush()
         outcomes_mm.flush()
         game_ids_mm.flush()
         plies_mm.flush()
+        if masks_mm is not None:
+            masks_mm.flush()
     finally:
-        for mm in (planes_mm, moves_mm, outcomes_mm, game_ids_mm, plies_mm):
+        for mm in (planes_mm, moves_mm, outcomes_mm, game_ids_mm, plies_mm, masks_mm):
+            if mm is None:
+                continue
             try:
                 mm._mmap.close()  # type: ignore[attr-defined]
             except (AttributeError, ValueError, OSError):
@@ -213,7 +262,11 @@ def save_dataset_split(
         "dtype_outcomes": "uint8",
         "dtype_game_ids": "uint64",
         "dtype_plies": "int16",
+        "schema_version": 2,
     }
+    if has_masks:
+        metadata["dtype_masks"] = "uint8-bitpacked-4672"
+        metadata["masks_shape"] = [num_samples, PositionData.MASK_PACKED_BYTES]
     if extra_metadata:
         metadata.update(extra_metadata)
 
@@ -230,6 +283,7 @@ def _flush_positions_chunk(
     f_outcomes: Any,
     f_game_ids: Any,
     f_plies: Any,
+    f_masks: Any = None,
 ) -> None:
     """Pack and flush a chunk of PositionData to binary file handles."""
     n = len(positions)
@@ -240,6 +294,9 @@ def _flush_positions_chunk(
     outcomes_arr = np.empty(n, dtype=np.uint8)
     game_ids_arr = np.empty(n, dtype=np.uint64)
     plies_arr = np.empty(n, dtype=np.int16)
+    masks_arr = (
+        np.empty((n, PositionData.MASK_PACKED_BYTES), dtype=np.uint8) if f_masks is not None else None
+    )
 
     for i, p in enumerate(positions):
         planes_arr[i] = p.planes
@@ -247,12 +304,18 @@ def _flush_positions_chunk(
         outcomes_arr[i] = p.outcome
         game_ids_arr[i] = p.game_id
         plies_arr[i] = p.ply
+        if masks_arr is not None:
+            if p.legal_mask is None:
+                raise ValueError("masks stream provided but a position lacks a legal mask")
+            masks_arr[i] = p.legal_mask
 
     f_planes.write(planes_arr.tobytes())
     f_moves.write(moves_arr.tobytes())
     f_outcomes.write(outcomes_arr.tobytes())
     f_game_ids.write(game_ids_arr.tobytes())
     f_plies.write(plies_arr.tobytes())
+    if f_masks is not None:
+        f_masks.write(masks_arr.tobytes())
 
 
 def build_binary_dataset(
@@ -293,6 +356,7 @@ def build_binary_dataset(
         "outcomes": train_dir / "outcomes.bin.part",
         "game_ids": train_dir / "game_ids.bin.part",
         "plies": train_dir / "plies.bin.part",
+        "masks": train_dir / "masks.bin.part",
     }
 
     train_chunk: list[PositionData] = []
@@ -311,6 +375,7 @@ def build_binary_dataset(
             open(train_part_paths["outcomes"], "wb") as f_tr_outcomes,
             open(train_part_paths["game_ids"], "wb") as f_tr_game_ids,
             open(train_part_paths["plies"], "wb") as f_tr_plies,
+            open(train_part_paths["masks"], "wb") as f_tr_masks,
         ):
             with contextlib.ExitStack() as stack:
                 if isinstance(pgn_path_or_stream, (str, Path)):
@@ -348,6 +413,7 @@ def build_binary_dataset(
                                 f_tr_outcomes,
                                 f_tr_game_ids,
                                 f_tr_plies,
+                                f_masks=f_tr_masks,
                             )
                             train_chunk.clear()
 
@@ -375,6 +441,7 @@ def build_binary_dataset(
                     f_tr_outcomes,
                     f_tr_game_ids,
                     f_tr_plies,
+                    f_masks=f_tr_masks,
                 )
                 train_chunk.clear()
 
@@ -414,6 +481,7 @@ def build_binary_dataset(
             "outcomes": val_dir / "outcomes.bin.part",
             "game_ids": val_dir / "game_ids.bin.part",
             "plies": val_dir / "plies.bin.part",
+            "masks": val_dir / "masks.bin.part",
         }
 
         with (
@@ -422,6 +490,7 @@ def build_binary_dataset(
             open(val_part_paths["outcomes"], "wb") as f_val_outcomes,
             open(val_part_paths["game_ids"], "wb") as f_val_game_ids,
             open(val_part_paths["plies"], "wb") as f_val_plies,
+            open(val_part_paths["masks"], "wb") as f_val_masks,
         ):
             for start_idx in range(0, n_val_final, chunk_size):
                 end_idx = min(start_idx + chunk_size, n_val_final)
@@ -432,6 +501,7 @@ def build_binary_dataset(
                     f_val_outcomes,
                     f_val_game_ids,
                     f_val_plies,
+                    f_masks=f_val_masks,
                 )
 
         # Atomically rename val part files to final .bin files
