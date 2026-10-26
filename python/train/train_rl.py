@@ -16,6 +16,7 @@ import contextlib
 import logging
 import math
 import os
+import pickle
 import queue
 import random
 import shutil
@@ -142,6 +143,78 @@ def _validate_arch(ckpt: Dict[str, Any], model: nn.Module, path: Union[str, Path
                     )
             except (ValueError, TypeError, IndexError) as e:
                 logger.debug("Skipping stem width validation for '%s': %s", path, e)
+
+
+def classify_optimizer_state(ckpt: Dict[str, Any]) -> str:
+    """Classify a checkpoint's optimizer state without loading it into an optimizer.
+
+    Returns one of ``"SGD"``, ``"AdamW"`` (any Adam-family state), ``"empty"``
+    (optimizer present but no per-parameter state yet — always safe), or
+    ``"unknown"``. A stamped ``_optimizer_type`` wins; otherwise the per-param
+    state keys decide (``exp_avg``/``exp_avg_sq`` are Adam-family,
+    ``momentum_buffer`` is SGD). ``None``/absent optimizer state is ``"empty"``.
+    """
+    opt_state = ckpt.get("optimizer")
+    if opt_state is None:
+        return "empty"
+    stamped = ckpt.get("_optimizer_type")
+    if isinstance(stamped, str) and stamped:
+        return stamped
+    state = opt_state.get("state") if isinstance(opt_state, dict) else None
+    if not isinstance(state, dict) or not state:
+        return "empty"
+    saw_any_keys = False
+    for per_param in state.values():
+        if isinstance(per_param, dict):
+            keys = set(per_param.keys())
+            if keys & {"exp_avg", "exp_avg_sq", "max_exp_avg_sq"}:
+                return "AdamW"
+            if "momentum_buffer" in keys:
+                return "SGD"
+            saw_any_keys = saw_any_keys or bool(keys)
+    return "unknown" if saw_any_keys else "empty"
+
+
+def inspect_rl_checkpoint(path: Union[str, Path]) -> Optional[Dict[str, Any]]:
+    """Read an RL checkpoint's metadata cheaply, or return None if unusable.
+
+    Used by auto-resume selection: a file that cannot be opened, lacks model
+    weights, or fails the architecture header is never a resume candidate.
+    The heavy state is memory-mapped so only metadata tensors are materialized.
+    """
+    p = Path(path)
+    if not p.is_file():
+        return None
+    try:
+        try:
+            ckpt = torch.load(p, map_location="cpu", weights_only=True, mmap=True)
+        except TypeError:  # older torch without mmap
+            ckpt = torch.load(p, map_location="cpu", weights_only=True)
+    except (OSError, RuntimeError, KeyError, ValueError, EOFError, pickle.UnpicklingError) as e:
+        logger.warning("Skipping unreadable checkpoint %s: %s", p, e)
+        return None
+    if not isinstance(ckpt, dict) or "model" not in ckpt:
+        logger.warning("Skipping checkpoint %s: no 'model' weights", p)
+        return None
+    blocks = ckpt.get("num_blocks")
+    filters = ckpt.get("num_filters")
+    if blocks is not None and filters is not None and (int(blocks), int(filters)) != (12, 128):
+        logger.warning(
+            "Skipping checkpoint %s: architecture %sx%s does not match the project 12x128",
+            p,
+            blocks,
+            filters,
+        )
+        return None
+    return {
+        "path": str(p),
+        "step": int(ckpt.get("step", 0) or 0),
+        "optimizer_class": classify_optimizer_state(ckpt),
+        "model_version": ckpt.get("model_version"),
+        "buffer_write_head": ckpt.get("buffer_write_head"),
+        "last_push_step": ckpt.get("last_push_step"),
+        "mtime": p.stat().st_mtime,
+    }
 
 
 class WarmupCosineDecayScheduler:
@@ -286,6 +359,14 @@ class RLTrainer:
         self.step_num = 0
         self.last_checkpoint_time = time.time()
         self.last_push_step = 0
+        # Provenance for warm starts (set by the orchestrator / reset_step load):
+        # the supervised checkpoint this run started from is metadata, NOT RL
+        # progress — step_num must only ever count this run's own SGD updates.
+        self.inherited_step_num = 0
+        self.warm_start_path: Optional[str] = None
+        self.warm_start_step: Optional[int] = None
+        # Extra provenance merged verbatim into every checkpoint save.
+        self.run_metadata: Dict[str, Any] = {}
 
         # Dedicated non-default CUDA stream for training pipeline
         if self.device.type == "cuda":
@@ -595,6 +676,17 @@ class RLTrainer:
             "numpy_rng_state": _safe_numpy_rng_state(),
             "python_rng_state": random.getstate(),
         }
+        if self.run_metadata:
+            # Provenance keys are namespaced so they can never collide with the
+            # resume-critical fields above.
+            for k, v in self.run_metadata.items():
+                ckpt[f"meta_{k}"] = v
+        if self.inherited_step_num:
+            ckpt["inherited_supervised_step"] = self.inherited_step_num
+        if self.warm_start_path:
+            ckpt["warm_start_path"] = self.warm_start_path
+            if self.warm_start_step is not None:
+                ckpt["warm_start_step"] = self.warm_start_step
 
         # Single write, then copy to latest via replace (not 2x torch.save).
         _atomic_torch_save(ckpt, path)
@@ -692,8 +784,16 @@ class RLTrainer:
         self,
         path: Union[str, Path],
         scheduler_override: bool = True,
+        reset_step: bool = False,
     ) -> int:
-        """Resume training from a checkpoint."""
+        """Resume training from a checkpoint.
+
+        ``reset_step=True`` marks a *warm start*: model weights are adopted but
+        the checkpoint's step counter, push counter, and LR-schedule position
+        belong to a foreign (supervised) run, so RL progress restarts at 0 and
+        the inherited counter is kept only as provenance metadata. Resuming
+        this run's own checkpoint uses ``reset_step=False`` (the default).
+        """
         try:
             ckpt = torch.load(path, map_location=self.device, weights_only=True)
         except (OSError, RuntimeError, KeyError) as e:
@@ -765,6 +865,19 @@ class RLTrainer:
                 )
         if scheduler_override:
             self.scheduler.step(self.step_num)
+        if reset_step:
+            self.inherited_step_num = self.step_num
+            self.warm_start_path = str(path)
+            self.warm_start_step = self.step_num
+            self.step_num = 0
+            self.last_push_step = 0
+            self.scheduler.step(0)
+            logger.warning(
+                "Warm start from %s: model weights adopted, RL counters reset "
+                "(inherited supervised step %s kept as provenance only)",
+                path,
+                self.inherited_step_num,
+            )
         if "model_version" in ckpt and self.direct_server is not None:
             try:
                 self.direct_server.model_version = int(ckpt["model_version"])

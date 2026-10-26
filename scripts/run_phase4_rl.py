@@ -29,7 +29,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Optional, Union
+from typing import Any, Dict, List, Optional, Union
 import psutil
 import torch
 
@@ -95,6 +95,18 @@ class SafetyTriggerException(Exception):
     """Raised when an automated safety guardrail is breached."""
 
     pass
+
+
+def pacing_target_step(total_added: int, batch_size: int, max_reuse_ratio: int) -> int:
+    """Maximum RL training steps the buffer's production supports (pacing gate).
+
+    Each full-search position may be reused at most ``max_reuse_ratio`` times,
+    giving ``total_added * max_reuse_ratio / batch_size`` supported steps, with
+    a floor of 500 so a fresh run can take its first steps before much data
+    exists. Compared against run-local RL steps only (never an inherited
+    supervised counter).
+    """
+    return max(500, int((total_added * max_reuse_ratio) / batch_size))
 
 
 def puzzle_decline_trips(history: list[float], band: float = 0.015) -> bool:
@@ -432,28 +444,30 @@ class Phase4Orchestrator:
             tactical_mix=self.tactical_mix,
         )
 
-        # Detect resumable checkpoint if explicitly provided, else auto-resume from existing RL checkpoint if present
+        # Detect resumable checkpoint if explicitly provided, else auto-resume from
+        # the best SGD-compatible RL checkpoint (never by filename ordering — the
+        # poisoned final/latest artifacts of failed runs must not win).
         if resume_checkpoint is None and not self.reset_buffer and not self.is_verify_mode:
-            for candidate in [
-                self.checkpoint_dir / "phase4_final_checkpoint.pt",
-                self.checkpoint_dir / "latest_checkpoint.pt",
-            ]:
-                if candidate.exists():
-                    resume_checkpoint = str(candidate)
-                    logger.info(
-                        f"[RESUME] Found existing RL checkpoint at {candidate}; auto-resuming training."
-                    )
-                    break
+            resume_checkpoint = self._select_resume_checkpoint()
 
-        active_checkpoint = resume_checkpoint if resume_checkpoint else base_checkpoint
+        is_resuming = resume_checkpoint is not None
+        active_checkpoint = resume_checkpoint if is_resuming else base_checkpoint
         self._active_checkpoint_path = (
             str(active_checkpoint) if active_checkpoint else "random_init"
         )
-        # Warm-start provenance gate (audit F-11/F-12): an absent, unreadable,
-        # wrong-architecture, or undesignated checkpoint must never silently
-        # become the RL base. A fresh random init ("cold start") is exempt —
-        # it is not resuming anyone's training lineage.
-        if active_checkpoint and not self.is_verify_mode:
+        self._warm_start_info: Optional[Dict[str, Any]] = None
+        if is_resuming:
+            # A genuine RL resume continues this run's own lineage (run-local
+            # counters included); the warm-start registry gate does not apply.
+            logger.info(
+                "[RESUME] continuing RL run from %s (RL step counter restored)",
+                resume_checkpoint,
+            )
+        elif active_checkpoint and not self.is_verify_mode:
+            # Warm-start provenance gate (audit F-11/F-12): an absent, unreadable,
+            # wrong-architecture, or undesignated checkpoint must never silently
+            # become the RL base. A fresh random init ("cold start") is exempt —
+            # it is not resuming anyone's training lineage.
             from python.model.checkpoint_registry import validate_warm_start
 
             ws_info = validate_warm_start(
@@ -579,17 +593,89 @@ class Phase4Orchestrator:
             entropy_bonus=self.entropy_bonus,
         )
 
-        if resume_checkpoint is not None:
+        if is_resuming:
             self.trainer.load_checkpoint(resume_checkpoint)
             if hasattr(self.trainer, "direct_server") and self.trainer.direct_server is not None:
                 self.server.model_version = self.trainer.direct_server.model_version
             logger.info(
                 f"Resumed RL training from {resume_checkpoint} at step {self.trainer.step_num} (model_version={self.server.model_version})"
             )
+        else:
+            # Warm start (or cold start): the weights already came in via the
+            # inference server and RL counters are fresh at 0. The warm-start
+            # checkpoint's own step counter is inherited supervised progress —
+            # provenance metadata, never RL pacing progress (PR-03).
+            ws = self._warm_start_info or {}
+            self.trainer.run_metadata = {
+                "warm_start": str(base_checkpoint) if base_checkpoint else "random_init",
+                "warm_start_sha256": ws.get("sha256", "unverified"),
+                "warm_start_step": ws.get("step", 0),
+            }
+            if ws.get("step"):
+                self.trainer.inherited_step_num = int(ws["step"])
+                self.trainer.warm_start_path = str(base_checkpoint)
+                self.trainer.warm_start_step = int(ws["step"])
+            logger.info(
+                "[WARM-START] RL counters start at 0 (inherited supervised step=%s as provenance)",
+                ws.get("step", 0),
+            )
 
         # Load puzzles
         self.puzzles = load_puzzles(self.puzzle_csv_path)
         logger.info(f"Loaded {len(self.puzzles)} fixed Lichess puzzles for 6-hour evaluation.")
+
+    def _select_resume_checkpoint(self) -> Optional[str]:
+        """Pick the best RL-resumable checkpoint in ``checkpoint_dir``, or None.
+
+        A candidate is resumable only when it is readable, carries model weights
+        with the project architecture, and its optimizer state is SGD-compatible
+        (or has no per-parameter state yet). Poisoned checkpoints — supervised
+        AdamW state saved by a failed run's exception cleanup — are skipped with
+        a loud warning: filename ordering (``phase4_final``/``latest``) must
+        never decide what a relaunch resumes from.
+        """
+        from python.train.train_rl import inspect_rl_checkpoint
+
+        rejected: List[str] = []
+        candidates: List[Dict[str, Any]] = []
+        try:
+            files = sorted(self.checkpoint_dir.glob("*.pt"))
+        except OSError:
+            return None
+        for f in files:
+            if not f.is_file():
+                continue
+            info = inspect_rl_checkpoint(f)
+            if info is None:
+                rejected.append(f"{f.name}: unreadable or invalid")
+                continue
+            if info["optimizer_class"] not in ("SGD", "empty"):
+                rejected.append(
+                    f"{f.name}: optimizer state is {info['optimizer_class']} "
+                    "(foreign/poisoned — not resumable by an SGD trainer)"
+                )
+                continue
+            candidates.append(info)
+        for line in rejected:
+            logger.warning("[RESUME] excluded checkpoint: %s", line)
+        if not candidates:
+            if files:
+                logger.warning(
+                    "[RESUME] no SGD-compatible RL checkpoint in %s (%d file(s) rejected); "
+                    "starting from the warm-start base instead",
+                    self.checkpoint_dir,
+                    len(rejected),
+                )
+            return None
+        best = max(candidates, key=lambda c: (c["step"], c["mtime"]))
+        logger.info(
+            "[RESUME] selected %s (step=%s, optimizer=%s) — %d compatible candidate(s)",
+            best["path"],
+            best["step"],
+            best["optimizer_class"],
+            len(candidates),
+        )
+        return best["path"]
 
     def _init_eval_csv(self) -> None:
         if not self.eval_csv_path.exists():
@@ -1522,10 +1608,13 @@ class Phase4Orchestrator:
                         self.run_eval_cycle(max_puzzles=1000, match_openings=self.eval_openings)
                     self.last_eval_time = time.time()
 
-                # Pacing: Avoid runaway training steps that starve self-play workers
-                target_max_step = max(
-                    500,
-                    int((self.buffer.total_added * self.max_reuse_ratio) / self.trainer.batch_size),
+                # Pacing: Avoid runaway training steps that starve self-play workers.
+                # The gate compares THIS RUN's RL steps (trainer.step_num, reset to 0
+                # on warm start) against buffer production of THIS RUN — an inherited
+                # supervised counter must never hold the gate closed (PR-03: the Oct 26
+                # run idled ~100 minutes before its first step on exactly this bug).
+                target_max_step = pacing_target_step(
+                    self.buffer.total_added, self.trainer.batch_size, self.max_reuse_ratio
                 )
                 if self.trainer.step_num > target_max_step:
                     self._maybe_status()
@@ -1582,6 +1671,7 @@ class Phase4Orchestrator:
                 time.sleep(0.001)
 
         except SafetyTriggerException as ste:
+            self._status_for_checkpoint = "SAFETY_STOP"
             self.stop()
             emit_error(
                 error_block(
@@ -1597,6 +1687,7 @@ class Phase4Orchestrator:
         except KeyboardInterrupt:
             logger.info("KeyboardInterrupt received. Stopping run cleanly...")
             self._event("SHUTDOWN", "Ctrl+C received; stopping cleanly")
+            self._status_for_checkpoint = "INTERRUPTED"
             self.stop()
             self._print_summary("INTERRUPTED")
             self._exit_reason = "interrupted"
@@ -1604,6 +1695,7 @@ class Phase4Orchestrator:
         except Exception as e:
             return self._handle_unexpected_error(e)
         else:
+            self._status_for_checkpoint = "SUCCESS"
             self.stop()
             self._print_summary("SUCCESS")
             self._exit_reason = "ok"
@@ -1614,6 +1706,7 @@ class Phase4Orchestrator:
     def _handle_unexpected_error(self, e: Exception) -> int:
         """Clean up after an unhandled exception and report it (always logs the traceback)."""
         logger.exception("Phase 4 run failed: %s", e)
+        self._status_for_checkpoint = "FAILED"
         self.stop()
         emit_error(
             error_block(
@@ -1631,17 +1724,20 @@ class Phase4Orchestrator:
         """Exit/SIGINT summary: totals from counters + standard footer."""
         elapsed = time.time() - self.start_time
         games = self.metrics_tracker.total_games
-        self._emit(
-            status_line(
-                [
-                    ("games", games),
-                    ("positions", self.buffer.total_added),
-                    ("steps", self.trainer.step_num),
-                    ("model_v", self.server.model_version),
-                    ("evals", len(self.puzzle_solve_history)),
-                ]
-            )
-        )
+        # Counters are labeled explicitly (PR-04): "steps" alone was ambiguous
+        # after a warm start (Run B logged steps=6000 — an inherited supervised
+        # counter — and looked like progress).
+        fields = [
+            ("games", games),
+            ("positions", self.buffer.total_added),
+            ("rl_steps", self.trainer.step_num),
+            ("run_steps", self._steps_this_run),
+            ("model_v", self.server.model_version),
+            ("evals", len(self.puzzle_solve_history)),
+        ]
+        if getattr(self.trainer, "inherited_step_num", 0):
+            fields.append(("inherited_supervised_steps", self.trainer.inherited_step_num))
+        self._emit(status_line(fields))
         exit_code = 0 if status in ("SUCCESS", "INTERRUPTED") else 1
         self._emit(summary_block(status, elapsed, self._warnings, exit_code))
 
@@ -1653,6 +1749,16 @@ class Phase4Orchestrator:
         self._event("SHUTDOWN", "stopping workers and saving final checkpoint")
         logger.info("Shutting down Phase 4 orchestrator...")
         self.stop_event.set()
+        # Stamp the termination status into the final checkpoint so a structurally
+        # valid checkpoint from a failed run can never masquerade as a completed
+        # training run (the Oct 26 Run B failure mode).
+        try:
+            self.trainer.run_metadata["run_status"] = getattr(
+                self, "_status_for_checkpoint", "unknown"
+            )
+            self.trainer.run_metadata["terminated_at_unix"] = time.time()
+        except AttributeError:
+            pass
         try:
             self.worker.stop()
             final_ckpt = self.trainer.save_checkpoint(
