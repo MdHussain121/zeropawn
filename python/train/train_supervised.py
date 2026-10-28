@@ -176,6 +176,15 @@ class WarmupCosineScheduler:
             "current_step": self.current_step,
         }
 
+    def get_lr(self, step: int) -> float:
+        """Return the learning rate at a given step without advancing the scheduler."""
+        if step < self.warmup_steps:
+            return self.min_lr + (self.base_lr - self.min_lr) * (step / max(1, self.warmup_steps))
+        progress = (step - self.warmup_steps) / max(1, self.total_steps - self.warmup_steps)
+        progress = min(1.0, max(0.0, progress))
+        cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return self.min_lr + (self.base_lr - self.min_lr) * cosine_decay
+
     def load_state_dict(self, state: dict) -> None:
         self.warmup_steps = state["warmup_steps"]
         self.total_steps = state["total_steps"]

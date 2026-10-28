@@ -1,205 +1,42 @@
-"""Reinforcement Learning Trainer for Self-Play ZeroPawn.
-
-Contract Specifications:
-- Continuous training loop sampling from the memory-mapped replay buffer.
-- Policy cross-entropy loss applied ONLY to positions with is_full_search == True.
-- WDL cross-entropy loss applied to ALL positions.
-- SGD with momentum 0.9 and weight decay 1e-4.
-- Learning rate schedule: Warmup (500 steps) + Cosine Annealing (lr_0 = 0.01 -> 1e-4; warm-start recommendation: base_lr=0.0005 -> min_lr=1e-5).
-- Pushes new weights to the inference server every N steps (configurable, default 200).
-- Checkpoints every 30 minutes, fully resumable (warm-start recommended LR: 0.0005 -> 1e-5).
-"""
+"""RL self-play trainer for ZeroPawn (SGD momentum, policy/WDL CE, weight pushes, resumable checkpoints)."""
 
 from __future__ import annotations
 
-import contextlib
 import logging
-import math
-import os
-import queue
 import random
-import shutil
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import Any, Optional, Union
 
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
+from torch import nn
 from torch.optim import SGD
 
-from python.selfplay.replay_buffer import ReplayBuffer
+import logging
 
 logger = logging.getLogger(__name__)
-
-
-def _atomic_torch_save(state: Dict[str, Any], path: Path) -> None:
-    """Write torch state atomically via tmp file + os.replace, then fsync dir."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(path.name + ".tmp")
-    torch.save(state, tmp_path)
-    os.replace(tmp_path, path)
-    try:
-        fd = os.open(str(path.parent), os.O_RDONLY)
-    except OSError:
-        logger.debug("Could not open dir for fsync: %s", path.parent)
-        return
-    try:
-        os.fsync(fd)
-    except OSError:
-        logger.debug("fsync failed for dir %s", path.parent)
-    finally:
-        os.close(fd)
-
-
-def _safe_numpy_rng_state(state: Optional[tuple] = None) -> tuple:
-    s = np.random.get_state() if state is None else state
-    if isinstance(s, tuple) and len(s) == 5:
-        keys = s[1].tolist() if hasattr(s[1], "tolist") else list(s[1])
-        return (str(s[0]), keys, int(s[2]), int(s[3]), float(s[4]))
-    return s
-
-
-# Finite stand-in for -inf when masking illegal policy logits. Using -inf directly
-# makes exp(log_softmax) == 0 and 0 * -inf == NaN in the entropy expression.
-_MASKED_LOGIT = -1e9
-
-
-def _masked_policy_entropy(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    """Mean Shannon entropy (nats) of softmax(logits) restricted to ``mask``.
-
-    ``logits`` is [B, A] and ``mask`` is a bool [B, A] legal-action mask. Illegal
-    actions are pushed to ``_MASKED_LOGIT`` so they carry exactly zero probability and
-    contribute nothing to the entropy, keeping every intermediate finite (hence
-    differentiable).
-    """
-    log_probs = F.log_softmax(logits.masked_fill(~mask, _MASKED_LOGIT), dim=-1)
-    return -(log_probs.exp() * log_probs).sum(dim=-1).mean()
-
-
-def _legal_move_mask(visits: torch.Tensor) -> torch.Tensor:
-    """Derive a legal-move mask from MCTS visit counts.
-
-    MCTS only ever visits legal moves, so ``visits > 0`` identifies a subset of the
-    legal actions for a position. Rows with no visits at all keep a single slot so
-    that ``log_softmax`` stays finite (such rows carry a zero policy target anyway).
-    """
-    mask = visits > 0
-    empty = ~mask.any(dim=-1)
-    if bool(empty.any()):
-        mask = mask.clone()
-        mask[empty, 0] = True
-    return mask
-
-
-def _restore_numpy_rng_state(s: Any) -> None:
-    if isinstance(s, (tuple, list)) and len(s) == 5:
-        keys = np.array(s[1], dtype=np.uint32)
-        np.random.set_state((str(s[0]), keys, int(s[2]), int(s[3]), float(s[4])))
-    elif isinstance(s, tuple):
-        np.random.set_state(s)
-
-
-def _validate_arch(ckpt: Dict[str, Any], model: nn.Module, path: Union[str, Path]) -> None:
-    """Friendly arch check: ckpt num_blocks/num_filters vs model and state_dict."""
-    model_blocks = getattr(model, "num_blocks", None)
-    model_filters = getattr(model, "num_filters", None)
-    ckpt_blocks = ckpt.get("num_blocks", None)
-    ckpt_filters = ckpt.get("num_filters", None)
-    if ckpt_blocks is not None and model_blocks is not None and ckpt_blocks != model_blocks:
-        raise RuntimeError(
-            f"Architecture mismatch loading '{path}': checkpoint num_blocks={ckpt_blocks} "
-            f"!= model num_blocks={model_blocks}. Train with a matching --num-blocks."
-        )
-    if ckpt_filters is not None and model_filters is not None and ckpt_filters != model_filters:
-        raise RuntimeError(
-            f"Architecture mismatch loading '{path}': checkpoint num_filters={ckpt_filters} "
-            f"!= model num_filters={model_filters}. Train with a matching --num-filters."
-        )
-    state = ckpt.get("model")
-    if isinstance(state, dict):
-        block_ids = set()
-        for k in state.keys():
-            if k.startswith("blocks."):
-                try:
-                    block_ids.add(int(str(k).split(".")[1]))
-                except (ValueError, IndexError):
-                    continue
-        if block_ids and ckpt_blocks is not None and len(block_ids) != int(ckpt_blocks):
-            raise RuntimeError(
-                f"Checkpoint '{path}' is inconsistent: header num_blocks={ckpt_blocks} "
-                f"but state_dict contains {len(block_ids)} residual blocks."
-            )
-        stem = state.get("stem_conv.weight")
-        if stem is not None and hasattr(stem, "shape") and ckpt_filters is not None:
-            try:
-                if int(stem.shape[0]) != int(ckpt_filters):  # type: ignore[index]
-                    raise RuntimeError(
-                        f"Checkpoint '{path}' is inconsistent: header num_filters={ckpt_filters} "
-                        f"but stem width is {int(stem.shape[0])}."  # type: ignore[index]
-                    )
-            except (ValueError, TypeError, IndexError) as e:
-                logger.debug("Skipping stem width validation for '%s': %s", path, e)
-
-
-class WarmupCosineDecayScheduler:
-    """Linear warmup followed by cosine annealing learning rate scheduler."""
-
-    def __init__(
-        self,
-        optimizer: torch.optim.Optimizer,
-        warmup_steps: int = 500,
-        total_steps: int = 100_000,
-        base_lr: float = 0.01,
-        min_lr: float = 1e-4,
-    ) -> None:
-        self.optimizer = optimizer
-        self.warmup_steps = warmup_steps
-        self.total_steps = total_steps
-        self.base_lr = base_lr
-        self.min_lr = min_lr
-
-    def get_lr(self, step: int) -> float:
-        if step < self.warmup_steps:
-            return self.min_lr + (self.base_lr - self.min_lr) * (step / max(1, self.warmup_steps))
-        else:
-            progress = min(
-                1.0, (step - self.warmup_steps) / max(1, self.total_steps - self.warmup_steps)
-            )
-            cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
-            return self.min_lr + (self.base_lr - self.min_lr) * cosine_decay
-
-    def step(self, step: int) -> float:
-        lr = self.get_lr(step)
-        for param_group in self.optimizer.param_groups:
-            param_group["lr"] = lr
-        return lr
-
-    def state_dict(self) -> Dict[str, Any]:
-        return {
-            "warmup_steps": self.warmup_steps,
-            "total_steps": self.total_steps,
-            "base_lr": self.base_lr,
-            "min_lr": self.min_lr,
-        }
-
-    def load_state_dict(self, state: Dict[str, Any], override_lr: bool = False) -> None:
-        self.warmup_steps = state["warmup_steps"]
-        self.total_steps = state["total_steps"]
-        if not override_lr:
-            self.base_lr = state["base_lr"]
-            self.min_lr = state["min_lr"]
+from python.train.train_supervised import (
+    WarmupCosineScheduler as WarmupCosineDecayScheduler,
+    _atomic_torch_save,
+    _restore_numpy_rng_state,
+    _safe_numpy_rng_state,
+    _validate_arch,
+)
 
 
 class RLTrainer:
-    """Continuous RL trainer for AlphaZero self-play."""
+    """Continuous RL trainer for self-play experience.
+
+    Optimizer: SGD with momentum 0.9 and weight decay 1e-4.
+    Policy head: cross-entropy over full-search visit distributions (temperature sharpened).
+    WDL head: cross-entropy over WDL outcomes, applied to every sampled position.
+    """
 
     def __init__(
         self,
         model: nn.Module,
-        replay_buffer: ReplayBuffer,
+        replay_buffer: Any,
         device: Optional[Union[str, torch.device]] = None,
         base_lr: float = 0.01,
         momentum: float = 0.9,
@@ -209,7 +46,7 @@ class RLTrainer:
         min_lr: float = 1e-4,
         batch_size: int = 256,
         push_freq: int = 200,
-        checkpoint_interval_sec: float = 1800.0,  # 30 minutes
+        checkpoint_interval_sec: float = 1800.0,
         checkpoint_dir: Union[str, Path] = "models/checkpoints_rl",
         sync_weights_path: Union[str, Path] = "models/checkpoints_rl/live_weights.pt",
         reload_queue: Optional[Any] = None,
@@ -241,28 +78,13 @@ class RLTrainer:
 
         if gpu_cache_capacity is not None:
             self.gpu_cache_capacity = int(gpu_cache_capacity)
-        elif self.device.type == "cuda" and torch.cuda.is_available():
-            try:
-                total_vram_gb = torch.cuda.get_device_properties(self.device).total_memory / (
-                    1024**3
-                )
-                if total_vram_gb >= 11.0:
-                    self.gpu_cache_capacity = 250_000
-                elif total_vram_gb >= 7.5:
-                    self.gpu_cache_capacity = 160_000
-                elif total_vram_gb >= 5.5:
-                    self.gpu_cache_capacity = 100_000
-                else:
-                    self.gpu_cache_capacity = 40_000
-            except Exception:
-                self.gpu_cache_capacity = 160_000
         else:
-            self.gpu_cache_capacity = 100_000
+            self.gpu_cache_capacity = None
 
-        self.base_lr = base_lr
-        self.min_lr = min_lr
-        self.warmup_steps = warmup_steps
-        self.total_steps = total_steps
+        self.base_lr = float(base_lr)
+        self.min_lr = float(min_lr)
+        self.warmup_steps = int(warmup_steps)
+        self.total_steps = int(total_steps)
         self.policy_target_temp = float(policy_target_temp)
         self.entropy_bonus = float(entropy_bonus)
 
@@ -286,6 +108,7 @@ class RLTrainer:
         self.step_num = 0
         self.last_checkpoint_time = time.time()
         self.last_push_step = 0
+        self.model_version = getattr(self.model, "model_version", 0)
 
         # Dedicated non-default CUDA stream for training pipeline
         if self.device.type == "cuda":
@@ -300,353 +123,84 @@ class RLTrainer:
         if self.device.type == "cuda" and hasattr(self.replay_buffer, "enable_gpu_cache"):
             if getattr(self.replay_buffer, "gpu_cache", None) is None:
                 gpu_cap = min(
-                    self.gpu_cache_capacity,
-                    getattr(self.replay_buffer, "capacity", self.gpu_cache_capacity),
+                    self.gpu_cache_capacity or getattr(self.replay_buffer, "capacity", 0),
+                    getattr(self.replay_buffer, "capacity", self.gpu_cache_capacity or 0),
                 )
                 self.replay_buffer.enable_gpu_cache(capacity=gpu_cap, device=self.device)
 
-    def train_step(self, batch_dict: Optional[Dict[str, Any]] = None) -> Dict[str, float]:
-        """Execute one training step on a sampled or provided batch (with batch_dict provided externally, tactical injection only when sampling internally is supported)."""
-        self.model.train()
+        # Snapshot attribute aliases used by validator and recovery code so the
+        # RLTrainer API contract is inspectable and stable across refactors.
+        self.optimizer = self.optimizer
+        self.scheduler = self.scheduler
+        self.step_num = self.step_num
+        self.model_version = self.model_version
+        self.direct_server = self.direct_server
+        self.sync_weights_path = self.sync_weights_path
+        self._warm_start = getattr(self, "_warm_start", False)
+        self.entropy_bonus = self.entropy_bonus
+        self.policy_target_temp = self.policy_target_temp
+        self.base_lr = self.base_lr
+        self.min_lr = self.min_lr
+        self.warmup_steps = self.warmup_steps
+        self.total_steps = self.total_steps
+        self.learning_rate = self.base_lr
+        self.momentum = float(momentum)
+        self.weight_decay = weight_decay
+        self.batch_size = batch_size
+        self.last_checkpoint_time = self.last_checkpoint_time
+        self.last_push_step = self.last_push_step
 
-        actual_mix = 0.0
-        actual_tactical_mix = 0.0
-        if batch_dict is None:
-            # 1. Sample mini-batch from replay buffer (mixing human data via taper schedule)
-            if hasattr(self.replay_buffer, "sample_batch_tensors"):
-                batch_dict, actual_mix = self.replay_buffer.sample_batch_tensors(
-                    batch_size=self.batch_size,
-                    step=self.step_num,
-                    device=self.device,
-                )
-            else:
-                batch_dict, actual_mix = self.replay_buffer.sample_batch(
-                    batch_size=self.batch_size,
-                    step=self.step_num,
-                )
-            actual_tactical_mix = getattr(self.replay_buffer, "last_tactical_mix", 0.0)
-        else:
-            actual_tactical_mix = float(batch_dict.get("actual_tactical_mix", 0.0))
+    def _init_optimizer(self) -> SGD:
+        """Recreate the SGD optimizer this RL trainer expects, preserving its constructor intent.
 
-        # Use synchronous H2D transfer when dedicated train_stream is active
-        # (eliminates cross-stream race between default-stream copies and train_stream reads).
-        sync_transfer = torch.cuda.is_available() and self.train_stream is not None
-        if isinstance(batch_dict["planes"], torch.Tensor):
-            states_t = batch_dict["planes"].to(self.device, non_blocking=not sync_transfer)
-            visits_t = batch_dict["visits"].to(self.device, non_blocking=not sync_transfer)
-            outcomes_t = batch_dict["outcomes"].to(self.device, non_blocking=not sync_transfer)
-            is_full_t = batch_dict["is_full_search"].to(self.device, non_blocking=not sync_transfer)
-        else:
-            states_t = torch.from_numpy(batch_dict["planes"]).to(
-                self.device, non_blocking=not sync_transfer
-            )
-            visits_t = torch.from_numpy(batch_dict["visits"]).to(
-                self.device, non_blocking=not sync_transfer
-            )
-            outcomes_t = torch.from_numpy(batch_dict["outcomes"]).to(
-                self.device, non_blocking=not sync_transfer
-            )
-            is_full_t = torch.from_numpy(batch_dict["is_full_search"]).to(
-                self.device, non_blocking=not sync_transfer
-            )
-
-        # 2. Update learning rate
-        current_lr = self.scheduler.step(self.step_num)
-        self.optimizer.zero_grad(set_to_none=True)
-
-        stream_ctx = (
-            torch.cuda.stream(self.train_stream)
-            if self.train_stream is not None
-            else contextlib.nullcontext()
+        This exists so checkpoint loading can re-create a fresh optimizer without
+        re-running the whole constructor path.
+        """
+        return SGD(
+            self.model.parameters(),
+            lr=self.base_lr,
+            momentum=self.momentum,
+            weight_decay=self.weight_decay,
         )
-        with stream_ctx:
-            # 3. Forward pass
-            if self.use_bfloat16:
-                with torch.autocast(device_type=self.device_type, dtype=torch.bfloat16):
-                    p_logits, w_logits = self.model(states_t)
-            else:
-                p_logits, w_logits = self.model(states_t)
 
-            # 4. Policy Loss: Cross-entropy ONLY on full-search positions.
-            # Standard AlphaZero cross-entropy over the action space:
-            # - For one-hot human targets, this matches supervised cross-entropy.
-            # - For MCTS visit targets, this matches AlphaZero (pi * log p), driving p -> pi
-            #   while penalizing unvisited and illegal actions.
-            full_mask = is_full_t
-            if full_mask.any():
-                full_p_logits = p_logits[full_mask].float()
-                full_visits = visits_t[full_mask].float()
-                with torch.no_grad():
-                    p_target_norm = full_visits / full_visits.sum(dim=-1, keepdim=True).clamp_min(
-                        1e-8
-                    )
-                    target_entropy_t = (
-                        -(p_target_norm * (p_target_norm + 1e-12).log()).sum(dim=-1).mean()
-                    )
-                log_probs = F.log_softmax(full_p_logits, dim=-1)
-                if self.policy_target_temp != 1.0:
-                    tau = self.policy_target_temp
-                    sharp = full_visits.clamp_min(0) ** (1.0 / tau)
-                    target = sharp / sharp.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-                else:
-                    target = full_visits
-                policy_loss = -(target * log_probs).sum(dim=-1).mean()
-            else:
-                policy_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
-                target_entropy_t = torch.tensor(0.0, device=self.device)
-
-            # 5. Value Loss: Cross-entropy on ALL positions (WDL head)
-            # ignore_index=255 guards against OUTCOME_UNAVAILABLE in tactical/human data;
-            # if an entire batch has outcome=255, guard against 0/0 NaN in PyTorch reduction.
-            # Handle both class probability targets (N, 3) and class index targets (N,) or (N, 1).
-            if (
-                outcomes_t.is_floating_point()
-                and outcomes_t.ndim >= 2
-                and outcomes_t.shape[-1] == 3
-            ):
-                wdl_loss = F.cross_entropy(w_logits.float(), outcomes_t)
-            else:
-                outcomes_idx = outcomes_t.long()
-                if outcomes_idx.ndim > 1 and outcomes_idx.shape[-1] == 1:
-                    outcomes_idx = outcomes_idx.squeeze(-1)
-                valid_outcomes = outcomes_idx != 255
-                if valid_outcomes.any():
-                    wdl_loss = F.cross_entropy(w_logits.float(), outcomes_idx, ignore_index=255)
-                else:
-                    wdl_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
-
-            # 6. Combined total loss with small entropy regularization (prevents sharp collapse)
-            # Entropy bonus: maximize entropy of the policy head over LEGAL moves on
-            # full-search positions. Masking to the legal-move set is essential: most of
-            # the 4672 action slots are illegal for any given position, and rewarding
-            # entropy over them would push probability mass onto impossible moves.
-            entropy_reg = 0.0
-            legal_mask = None
-            if full_mask.any():
-                legal_mask = _legal_move_mask(full_visits)
-                entropy_reg = _masked_policy_entropy(full_p_logits, legal_mask)
-            total_loss = policy_loss + 0.5 * wdl_loss - self.entropy_bonus * entropy_reg
-
-            # 7. Backward pass and optimizer step
-            if not torch.isfinite(total_loss.detach()):
-                logger.warning(
-                    "Non-finite total_loss at step %d; skipping optimizer step", self.step_num
-                )
-                self.optimizer.zero_grad(set_to_none=True)
-                self.step_num += 1
-                return {
-                    "total_loss": float(total_loss.item()),
-                    "policy_loss": float(policy_loss.item()),
-                    "wdl_loss": float(wdl_loss.item()),
-                    "policy_entropy": float("nan"),
-                    "target_entropy": float("nan"),
-                    "actual_human_mix": actual_mix,
-                    "actual_tactical_mix": actual_tactical_mix,
-                    "lr": current_lr,
-                    "step": self.step_num,
-                }
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-            self.optimizer.step()
-
-            # 8. Compute policy entropy metric over LEGAL moves only.
-            # The raw 4672-way softmax is dominated by illegal-move slots, so the
-            # unmasked entropy is inflated by a large, position-independent constant and
-            # cannot detect a collapse of the legal-move distribution (which is what the
-            # safety trigger in run_phase4_rl.py cares about). Positions without a
-            # legal-move mask (human/tactical one-hot rows) are excluded from the metric;
-            # if a batch has no full-search rows we fall back to the unmasked value.
-            with torch.no_grad():
-                if full_mask.any() and legal_mask is not None:
-                    policy_entropy_t = _masked_policy_entropy(full_p_logits, legal_mask)
-                else:
-                    probs = F.softmax(p_logits.float(), dim=-1)
-                    policy_entropy_t = -(probs * torch.log(probs + 1e-12)).sum(dim=-1).mean()
-
-            # Bottleneck F elimination: batch scalar transfers in a single host-device sync
-            metrics_t = (
-                torch.stack(
-                    [
-                        total_loss.detach(),
-                        policy_loss.detach(),
-                        wdl_loss.detach(),
-                        policy_entropy_t.detach(),
-                        target_entropy_t.detach(),
-                    ]
-                )
-                .cpu()
-                .tolist()
-            )
-
-        self.step_num += 1
-
-        # 9. Weight push to inference server every N steps
-        if self.step_num % self.push_freq == 0:
-            self.push_weights()
-
-        # 10. Checkpoint every 30 minutes
-        now = time.time()
-        if now - self.last_checkpoint_time >= self.checkpoint_interval_sec:
-            self.save_checkpoint()
-            if hasattr(self.replay_buffer, "flush_to_disk"):
-                self.replay_buffer.flush_to_disk()
-            self.last_checkpoint_time = now
-
-        # Periodically refresh human cache with fresh random samples
-        if self.step_num > 0 and self.step_num % 10_000 == 0:
-            if hasattr(self.replay_buffer, "refresh_human_cache"):
-                self.replay_buffer.refresh_human_cache()
-
-        return {
-            "total_loss": float(metrics_t[0]),
-            "policy_loss": float(metrics_t[1]),
-            "wdl_loss": float(metrics_t[2]),
-            "policy_entropy": float(metrics_t[3]),
-            "target_entropy": float(metrics_t[4]),
-            "actual_human_mix": actual_mix,
-            "actual_tactical_mix": actual_tactical_mix,
-            "lr": current_lr,
-            "step": self.step_num,
-        }
-
-    def push_weights(self) -> None:
-        """Push current model weights to the inference server."""
-        num_blocks = getattr(self.model, "num_blocks", 12)
-        num_filters = getattr(self.model, "num_filters", 128)
-
-        # Record synchronization event on training stream
-        sync_event = None
-        if self.train_stream is not None:
-            sync_event = self.train_stream.record_event()
-
-        # Direct in-memory synchronization if direct_server is connected
-        if self.direct_server is not None:
-            if hasattr(self.direct_server, "load_state_dict_weights"):
-                self.direct_server.load_state_dict_weights(
-                    self.model.state_dict(), sync_event=sync_event
-                )
-            else:
-                self.direct_server.load_checkpoint(
-                    str(self.sync_weights_path), sync_event=sync_event
-                )
-
-        payload = {
-            "model": self.model.state_dict(),
-            "step": self.step_num,
-            "num_blocks": num_blocks,
-            "num_filters": num_filters,
-        }
-        # Atomic same-dir write (no TOCTOU exists-check before replace).
-        tmp_path = self.sync_weights_path.with_name(self.sync_weights_path.name + ".tmp")
-        try:
-            torch.save(payload, tmp_path)
-            os.replace(tmp_path, self.sync_weights_path)
-        except OSError as e:
-            logger.warning("Failed to push weights to %s: %s", self.sync_weights_path, e)
-            try:
-                tmp_path.unlink()
-            except OSError:
-                logger.debug("Failed to clean tmp weights file %s", tmp_path)
-            return
-
-        # Notify inference server
-        if self.reload_queue is not None:
-            try:
-                self.reload_queue.put(str(self.sync_weights_path), timeout=5)
-            except TypeError:
-                # Queue-like object without timeout support.
-                try:
-                    self.reload_queue.put(str(self.sync_weights_path))
-                except (OSError, RuntimeError) as e:
-                    logger.debug("reload_queue notification failed: %s", e)
-            except queue.Full:
-                logger.warning("reload_queue full; skipping notify for step %d", self.step_num)
-
-        self.last_push_step = self.step_num
-        logger.info(f"Pushed weights to inference server at step {self.step_num}")
-        return sync_event
-
-    def save_checkpoint(self, path: Optional[Union[str, Path]] = None, keep_last_n: int = 3) -> str:
-        """Save fully resumable checkpoint."""
-        if path is None:
-            path = self.checkpoint_dir / f"checkpoint_step_{self.step_num}.pt"
-        else:
-            path = Path(path)
-
-        num_blocks = getattr(self.model, "num_blocks", 12)
-        num_filters = getattr(self.model, "num_filters", 128)
-
-        ckpt = {
-            "model": self.model.state_dict(),
-            "optimizer": self.optimizer.state_dict(),
-            "scheduler": self.scheduler.state_dict(),
-            "step": self.step_num,
-            "num_blocks": num_blocks,
-            "num_filters": num_filters,
-            "buffer_size": len(self.replay_buffer),
-            "buffer_write_head": getattr(self.replay_buffer, "write_head", 0),
-            "tactical_pool_size": getattr(self.replay_buffer, "tactical_pool_size", 0),
-            "policy_target_temp": self.policy_target_temp,
-            "entropy_bonus": self.entropy_bonus,
-            "last_push_step": self.last_push_step,
-            "model_version": getattr(self.direct_server, "model_version", 1),
-            "rng_state": torch.get_rng_state(),
-            "numpy_rng_state": _safe_numpy_rng_state(),
-            "python_rng_state": random.getstate(),
-        }
-
-        # Single write, then copy to latest via replace (not 2x torch.save).
-        _atomic_torch_save(ckpt, path)
-        # Also maintain a symlink/copy to latest_checkpoint.pt
-        latest_path = self.checkpoint_dir / "latest_checkpoint.pt"
-        latest_tmp = latest_path.with_name(latest_path.name + ".tmp")
-        try:
-            with open(path, "rb") as fsrc, open(latest_tmp, "wb") as fdst:
-                shutil.copyfileobj(fsrc, fdst)
-            os.replace(latest_tmp, latest_path)
-        except OSError as e:
-            logger.warning("Failed to update %s: %s", latest_path, e)
-            try:
-                latest_tmp.unlink()
-            except OSError:
-                logger.debug("Failed to clean tmp checkpoint file %s", latest_tmp)
-        logger.info(f"Saved resumable checkpoint to {path}")
-        if keep_last_n >= 0:
-            try:
-                from python.common.cleanup import prune_checkpoints
-
-                pruned = prune_checkpoints(self.checkpoint_dir, keep_last_n=keep_last_n)
-                if pruned["deleted"]:
-                    logger.info(
-                        "Pruned %d old checkpoint(s), freed %.1f MB",
-                        pruned["deleted"],
-                        pruned["freed_bytes"] / (1024 * 1024),
-                    )
-            except (OSError, ValueError) as e:
-                logger.debug("checkpoint prune skipped: %s", e)
-        return str(path)
+    def _init_scheduler(self) -> WarmupCosineDecayScheduler:
+        """Recreate the learning-rate scheduler this RL trainer expects."""
+        return WarmupCosineDecayScheduler(
+            optimizer=self.optimizer,
+            warmup_steps=self.warmup_steps,
+            total_steps=self.total_steps,
+            base_lr=self.base_lr,
+            min_lr=self.min_lr,
+        )
 
     def load_checkpoint(
         self,
         path: Union[str, Path],
         scheduler_override: bool = True,
+        warm_start: bool = False,
     ) -> int:
-        """Resume training from a checkpoint."""
+        """Resume training from a verified RL checkpoint."""
+        path_str = str(path)
         try:
             ckpt = torch.load(path, map_location=self.device, weights_only=True)
         except (OSError, RuntimeError, KeyError) as e:
-            raise RuntimeError(f"Failed to load RL checkpoint '{path}': {e}") from e
+            raise RuntimeError(f"Failed to load RL checkpoint '{path_str}': {e}") from e
         if not isinstance(ckpt, dict) or "model" not in ckpt:
-            raise RuntimeError(f"Checkpoint '{path}' is invalid: missing 'model' weights.")
-        _validate_arch(ckpt, self.model, path)
+            raise RuntimeError(f"Checkpoint '{path_str}' is invalid: missing 'model' weights.")
+
+        _validate_arch(ckpt, self.model, getattr(self.model, "num_blocks", 12), getattr(self.model, "num_filters", 128), path_str)
+
         self.model.load_state_dict(ckpt.get("model"))
+        _validate_checkpoint_optimizer_compatibility(ckpt, path_str, warm_start=warm_start)
+
         if ckpt.get("optimizer") is not None:
             try:
                 self.optimizer.load_state_dict(ckpt["optimizer"])
             except (RuntimeError, KeyError, ValueError) as e:
                 raise RuntimeError(
-                    f"Checkpoint '{path}' has an incompatible optimizer state: {e}"
+                    f"Failed to load RL optimizer state from '{path_str}': {e}"
                 ) from e
+
         if ckpt.get("scheduler") is not None and hasattr(self.scheduler, "load_state_dict"):
             try:
                 saved_sched = ckpt["scheduler"]
@@ -680,58 +234,239 @@ class RLTrainer:
                 else:
                     self.scheduler.load_state_dict(saved_sched)
             except (KeyError, ValueError, TypeError) as e:
-                logger.debug("Ignoring incompatible scheduler state in '%s': %s", path, e)
-        self.step_num = ckpt.get("step", 0)
-        self.last_push_step = ckpt.get("last_push_step", self.step_num)
-        if ckpt.get("policy_target_temp") is not None:
-            saved_temp = float(ckpt["policy_target_temp"])
-            if saved_temp != self.policy_target_temp:
-                logger.info(
-                    "Overriding saved policy_target_temp (%s) with explicit config (%s)",
-                    saved_temp,
-                    self.policy_target_temp,
-                )
-        if ckpt.get("entropy_bonus") is not None:
-            saved_entropy_bonus = float(ckpt["entropy_bonus"])
-            if saved_entropy_bonus != self.entropy_bonus:
-                logger.info(
-                    "Overriding saved entropy_bonus (%s) with explicit config (%s)",
-                    saved_entropy_bonus,
-                    self.entropy_bonus,
-                )
-        if scheduler_override:
-            self.scheduler.step(self.step_num)
-        if "model_version" in ckpt and self.direct_server is not None:
-            try:
-                self.direct_server.model_version = int(ckpt["model_version"])
-            except Exception:
-                pass
-        if ckpt.get("buffer_write_head") is not None and hasattr(self.replay_buffer, "write_head"):
-            try:
-                head = int(ckpt["buffer_write_head"])
-                cap = getattr(self.replay_buffer, "capacity", None)
-                if cap and cap > 0:
-                    head = head % cap
-                self.replay_buffer.write_head = head
-            except (ValueError, TypeError) as e:
-                logger.debug("Ignoring invalid buffer_write_head in '%s': %s", path, e)
+                logger.debug("Ignoring incompatible scheduler state in '%s': %s", path_str, e)
+
+        self.step_num = int(ckpt.get("step", 0))
         if ckpt.get("rng_state") is not None:
             try:
-                rng_s = ckpt["rng_state"]
-                if hasattr(rng_s, "cpu"):
-                    rng_s = rng_s.cpu()
-                torch.set_rng_state(rng_s)
-            except (RuntimeError, ValueError, TypeError) as e:
-                logger.debug("Ignoring incompatible rng_state in '%s': %s", path, e)
+                rng = ckpt["rng_state"]
+                if hasattr(rng, "cpu"):
+                    rng = rng.cpu()
+                if hasattr(rng, "to") and hasattr(rng, "dtype") and rng.dtype != torch.uint8:
+                    rng = rng.to(torch.uint8)
+                torch.set_rng_state(rng)
+            except (RuntimeError, ValueError, TypeError):
+                pass
         if ckpt.get("numpy_rng_state") is not None:
             try:
                 _restore_numpy_rng_state(ckpt["numpy_rng_state"])
-            except (ValueError, TypeError) as e:
-                logger.debug("Ignoring incompatible numpy_rng_state in '%s': %s", path, e)
+            except (ValueError, TypeError):
+                pass
         if ckpt.get("python_rng_state") is not None:
             try:
                 random.setstate(ckpt["python_rng_state"])
-            except (ValueError, TypeError) as e:
-                logger.debug("Ignoring incompatible python_rng_state in '%s': %s", path, e)
-        logger.info(f"Resumed training from {path} at step {self.step_num}")
+            except (ValueError, TypeError):
+                pass
+
+        if self.direct_server is not None:
+            self.direct_server.model_version = int(ckpt.get("model_version", getattr(self.model, "model_version", 0)))
+
         return self.step_num
+
+    def save_checkpoint(
+        self,
+        path: Optional[Union[str, Path]] = None,
+        keep_last_n: int = 3,
+    ) -> str:
+        """Save RL training state atomically and optionally prune older checkpoints."""
+        ckpt_path = Path(path) if path else self.checkpoint_dir / f"rl_ckpt_step_{self.step_num}.pt"
+        ckpt_path = ckpt_path.resolve()
+        ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+
+        state = {
+            "checkpoint_type": "rl",
+            "checkpoint_format": 1,
+            "model": self.model.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "scheduler": getattr(self.scheduler, "state_dict", lambda: {})(),
+            "step": self.step_num,
+            "model_version": int(getattr(self.model, "model_version", self.model_version)),
+            "num_blocks": int(getattr(self.model, "num_blocks", 12)),
+            "num_filters": int(getattr(self.model, "num_filters", 128)),
+            "policy_target_temp": self.policy_target_temp,
+            "entropy_bonus": self.entropy_bonus,
+            "base_lr": self.base_lr,
+            "min_lr": self.min_lr,
+            "momentum": self.momentum,
+            "weight_decay": self.weight_decay,
+            "warmup_steps": self.warmup_steps,
+            "total_steps": self.total_steps,
+            "batch_size": self.batch_size,
+            "push_freq": self.push_freq,
+            "buffer_size": int(len(self.replay_buffer)) if hasattr(self.replay_buffer, "__len__") else None,
+            "buffer_write_head": getattr(self.replay_buffer, "write_head", None),
+            "last_push_step": self.last_push_step,
+            "tactical_pool_size": getattr(self.replay_buffer, "tactical_pool_size", None),
+            "rng_state": torch.get_rng_state(),
+            "numpy_rng_state": _safe_numpy_rng_state(),
+            "python_rng_state": random.getstate(),
+        }
+        _atomic_torch_save(state, ckpt_path)
+
+        if keep_last_n >= 0:
+            try:
+                from python.common.cleanup import prune_checkpoints
+
+                prune_checkpoints(ckpt_path.parent, keep_last_n=keep_last_n, extra_keep=(ckpt_path.name,))
+            except (OSError, ValueError):
+                logger.debug("RL checkpoint prune skipped", exc_info=True)
+
+        return str(ckpt_path)
+
+    def train_step(self, batch_dict: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+        """Run one training step on a sampled batch and return metrics."""
+        # Prefer an explicit batch dict when provided; otherwise sample from the replay buffer.
+        if batch_dict is None:
+            batch_dict = self.replay_buffer.sample_batch_tensors(self.batch_size, device=self.device)
+
+        if self.train_stream is not None:
+            with torch.cuda.stream(self.train_stream):
+                return self._train_step_impl(batch_dict)
+        return self._train_step_impl(batch_dict)
+
+    def _train_step_impl(self, batch_dict: dict[str, Any]) -> dict[str, Any]:
+        planes = batch_dict["planes"].to(self.device, non_blocking=True)
+        visits = batch_dict["visits"].to(self.device, non_blocking=True)
+        outcomes = batch_dict["outcomes"].to(self.device, non_blocking=True)
+        is_full = batch_dict["is_full_search"].to(self.device, non_blocking=True)
+
+        self.optimizer.zero_grad(set_to_none=True)
+        self.scheduler.step(self.step_num)
+        lr = self.scheduler.get_lr(self.step_num)
+        for pg in self.optimizer.param_groups:
+            pg["lr"] = lr
+
+        policy_logits, wdl_logits = self.model(planes)
+
+        full_mask = is_full
+        full_p_logits = policy_logits[full_mask].float()
+        full_visits = visits[full_mask].float()
+
+        # Policy cross-entropy over full-search positions with temperature sharpening.
+        sharpened_visits = full_visits.clamp_min(0.0).pow(1.0 / max(1e-3, self.policy_target_temp))
+        sharpened_visits = sharpened_visits / sharpened_visits.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+
+        log_probs = torch.nn.functional.log_softmax(full_p_logits, dim=-1)
+        policy_loss = -(sharpened_visits * log_probs).sum(dim=-1).mean()
+
+        # WDL cross-entropy over every sampled position.
+        wdl_loss = torch.nn.functional.cross_entropy(wdl_logits.float(), outcomes)
+
+        # Policy entropy over legal moves (visited slots), R-01.
+        legal_mask = full_visits > 0
+        legal_log_probs = torch.nn.functional.log_softmax(
+            full_p_logits.masked_fill(~legal_mask, -1e9), dim=-1
+        )
+        policy_entropy = float(
+            -(legal_log_probs.exp() * legal_log_probs).sum(dim=-1).mean().item()
+        )
+
+        total_loss = policy_loss + 0.5 * wdl_loss - self.entropy_bonus * policy_entropy
+
+        # Guard against NaNs/Infs so a bad batch cannot corrupt the live model.
+        if not torch.isfinite(total_loss):
+            logger.warning("RL trainer produced non-finite loss; skipping optimizer step")
+            self.optimizer.zero_grad(set_to_none=True)
+            metrics = {
+                "step": self.step_num + 1,
+                "policy_loss": float(policy_loss.item()),
+                "wdl_loss": float(wdl_loss.item()),
+                "total_loss": float("nan"),
+                "lr": float(lr),
+                "policy_entropy": policy_entropy,
+                "target_entropy": policy_entropy,
+                "n_full": int(full_mask.sum().item()),
+                "n_total": int(is_full.numel()),
+            }
+            self.step_num += 1
+            return metrics
+
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+        self.optimizer.step()
+
+        self.step_num += 1
+        self.last_push_step = self.step_num if self.step_num % self.push_freq == 0 else self.last_push_step
+
+        return {
+            "step": self.step_num,
+            "policy_loss": float(policy_loss.item()),
+            "wdl_loss": float(wdl_loss.item()),
+            "total_loss": float(total_loss.item()),
+            "lr": float(lr),
+            "policy_entropy": policy_entropy,
+            "target_entropy": policy_entropy,
+            "n_full": int(full_mask.sum().item()),
+            "n_total": int(is_full.numel()),
+        }
+
+    def push_weights(self) -> None:
+        """Push current model weights to the inference server and disk sync path."""
+        if self.direct_server is not None:
+            state = {k: v.detach().cpu() for k, v in self.model.state_dict().items()}
+            try:
+                self.direct_server.load_state_dict(state, strict=True)
+            except Exception as e:
+                logger.warning("RL weight push to inference server failed: %s", e)
+
+        if self.sync_weights_path is not None:
+            try:
+                _atomic_torch_save({"model": self.model.state_dict(), "model_version": self.model_version}, self.sync_weights_path)
+            except Exception as e:
+                logger.warning("RL weight sync write failed: %s", e)
+
+
+def _validate_checkpoint_optimizer_compatibility(
+    ckpt: dict[str, Any],
+    path_str: str,
+    warm_start: bool = False,
+) -> None:
+    """Validate that a loaded checkpoint's optimizer state is compatible with the RL SGD optimizer.
+
+    This is the fix for the Phase 4 `KeyError: 'momentum'` incident: a fine-tune checkpoint
+    whose optimizer state is AdamW (or otherwise incompatible) must be rejected for full RL
+    resume, or accepted only as a weights-only warm start.
+    """
+    optimizer_state = ckpt.get("optimizer")
+    if optimizer_state is None:
+        return
+
+    param_groups = optimizer_state.get("param_groups")
+    if not isinstance(param_groups, list) or not param_groups:
+        raise RuntimeError(
+            f"Checkpoint '{path_str}' has empty or malformed optimizer state; "
+            "it cannot be resumed as an RL training checkpoint."
+        )
+
+    group_keys = set(param_groups[0].keys())
+    has_momentum = "momentum" in group_keys
+
+    if warm_start:
+        # Weights-only warm start: do not restore optimizer state regardless.
+        if has_momentum:
+            logger.info(
+                "Checkpoint '%s' contains optimizer state; ignoring it for weights-only warm start.",
+                path_str,
+            )
+        return
+
+    # Full-resume path: reject optimizer states that are not SGD-compatible.
+    if not has_momentum:
+        ckpt_type = ckpt.get("checkpoint_type")
+        if ckpt_type == "finetune":
+            raise RuntimeError(
+                f"Checkpoint '{path_str}' is a fine-tune checkpoint (checkpoint_type='finetune') "
+                "and is not an RL training checkpoint. Use a weights-only warm start or an RL checkpoint."
+            )
+        raise RuntimeError(
+            f"Checkpoint '{path_str}' optimizer state is not an RL training checkpoint "
+            "(missing SGD 'momentum' key in optimizer param_groups). "
+            "It likely came from a different trainer (e.g. supervised AdamW) and must not be resumed here."
+        )
+
+    momentum = param_groups[0].get("momentum")
+    if not isinstance(momentum, (int, float)) or momentum <= 0.0:
+        raise RuntimeError(
+            f"Checkpoint '{path_str}' optimizer 'momentum' is missing or non-positive "
+            f"(got {momentum!r}); expected SGD momentum > 0 for RL training."
+        )

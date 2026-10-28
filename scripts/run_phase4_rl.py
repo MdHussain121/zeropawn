@@ -414,13 +414,23 @@ class Phase4Orchestrator:
             tactical_mix=self.tactical_mix,
         )
 
-        # Detect resumable checkpoint if explicitly provided, else auto-resume from existing RL checkpoint if present
+        # Detect resumable checkpoint if explicitly provided, else auto-resume from existing RL checkpoint if present.
+        # Candidate selection is restricted to the active RL checkpoint location and excludes quarantine
+        # directories and fine-tune checkpoint locations. Candidates are then validated for RL provenance
+        # by RLTrainer.load_checkpoint before training begins.
         if resume_checkpoint is None and not self.reset_buffer and not self.is_verify_mode:
             for candidate in [
                 self.checkpoint_dir / "phase4_final_checkpoint.pt",
                 self.checkpoint_dir / "latest_checkpoint.pt",
             ]:
                 if candidate.exists():
+                    # Only consider candidates that live inside the configured checkpoint_dir so that
+                    # stale fine-tune checkpoints or quarantined files elsewhere are never selected automatically.
+                    try:
+                        candidate.resolve().relative_to(self.checkpoint_dir.resolve())
+                    except ValueError:
+                        logger.debug("Skipping auto-resume candidate outside checkpoint_dir: %s", candidate)
+                        continue
                     resume_checkpoint = str(candidate)
                     logger.info(
                         f"[RESUME] Found existing RL checkpoint at {candidate}; auto-resuming training."
@@ -1487,6 +1497,7 @@ class Phase4Orchestrator:
             self._exit_reason = "interrupted"
             return 0
         except Exception as e:
+            logger.exception("Unhandled exception in Phase 4 training loop")
             self.stop()
             emit_error(
                 error_block(

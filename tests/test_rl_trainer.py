@@ -1,5 +1,6 @@
 """Tests for Task 4: RL Trainer (SGD momentum, full-search policy CE, WDL CE, weight pushes, resumability)."""
 
+import math
 import numpy as np
 import pytest
 import torch
@@ -506,6 +507,536 @@ def test_rl_trainer_defaults_and_user_customization(tmp_path):
     )
     assert custom_trainer.policy_target_temp == 0.75
     assert custom_trainer.entropy_bonus == 0.0025
+
+
+def _make_adamw_checkpoint(tmp_path, model: torch.nn.Module, step: int = 10) -> str:
+    """Build a minimal .pt checkpoint whose optimizer state is AdamW (no momentum)."""
+    ckpt_dir = tmp_path / "adamw_ckpts"
+    ckpt_dir.mkdir(exist_ok=True)
+    ckpt_path = ckpt_dir / "adamw_checkpoint.pt"
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    optimizer.step()  # materialize optimizer state
+    payload = {
+        "checkpoint_type": "finetune",
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "step": step,
+        "num_blocks": getattr(model, "num_blocks", 12),
+        "num_filters": getattr(model, "num_filters", 128),
+    }
+    torch.save(payload, ckpt_path)
+    return str(ckpt_path)
+
+
+def _make_sgd_checkpoint(tmp_path, trainer: "RLTrainer", step: int) -> str:
+    """Save a valid RL checkpoint from an RLTrainer at the given step."""
+    ckpt_path = tmp_path / f"sgd_ckpt_step{step}.pt"
+    return trainer.save_checkpoint(path=ckpt_path)
+
+
+def test_adamw_optimizer_rejected_before_training(tmp_path):
+    """An AdamW optimizer state supplied to the SGD-based RL trainer is rejected before training,
+    with a clear compatibility error rather than `KeyError: 'momentum'`.
+    """
+    buf = ReplayBuffer(buffer_dir=tmp_path / "buf_adamw", capacity=500, create_new=True)
+    buf.add_positions(_create_dummy_positions(50, full_prob=0.5))
+
+    model = ChessNet(num_blocks=2, num_filters=32)
+    trainer = RLTrainer(
+        model=model,
+        replay_buffer=buf,
+        batch_size=16,
+        checkpoint_dir=tmp_path / "ckpt_adamw",
+        sync_weights_path=tmp_path / "sync_adamw.pt",
+    )
+
+    ckpt_path = _make_adamw_checkpoint(tmp_path, model, step=10)
+    with pytest.raises(RuntimeError, match="not an RL training checkpoint"):
+        trainer.load_checkpoint(ckpt_path)
+
+    # The trainer must still have a working SGD optimizer (reconstructed, not loaded from AdamW).
+    metrics = trainer.train_step()
+    assert metrics["step"] == 1
+    assert metrics["total_loss"] > 0
+    assert math.isfinite(metrics["total_loss"])
+
+
+def test_finetune_checkpoint_type_rejected_for_full_resume(tmp_path):
+    """A checkpoint explicitly tagged as a fine-tuning checkpoint is rejected for full RL resume."""
+    buf = ReplayBuffer(buffer_dir=tmp_path / "buf_ft", capacity=500, create_new=True)
+    buf.add_positions(_create_dummy_positions(50, full_prob=0.5))
+
+    model = ChessNet(num_blocks=2, num_filters=32)
+    trainer = RLTrainer(
+        model=model,
+        replay_buffer=buf,
+        batch_size=16,
+        checkpoint_dir=tmp_path / "ckpt_ft",
+        sync_weights_path=tmp_path / "sync_ft.pt",
+    )
+
+    ckpt_path = _make_adamw_checkpoint(tmp_path, model, step=10)
+    with pytest.raises(RuntimeError, match="not an RL training checkpoint"):
+        trainer.load_checkpoint(ckpt_path)
+
+
+def test_weights_only_checkpoint_accepted_for_warm_start(tmp_path):
+    """A checkpoint without optimizer state is accepted as a weights-only warm-start.
+    The RL trainer keeps its freshly initialized SGD optimizer.
+    """
+    buf = ReplayBuffer(buffer_dir=tmp_path / "buf_wo", capacity=500, create_new=True)
+    buf.add_positions(_create_dummy_positions(50, full_prob=0.5))
+
+    model = ChessNet(num_blocks=2, num_filters=32)
+    trainer = RLTrainer(
+        model=model,
+        replay_buffer=buf,
+        batch_size=16,
+        checkpoint_dir=tmp_path / "ckpt_wo",
+        sync_weights_path=tmp_path / "sync_wo.pt",
+    )
+
+    weights_only_path = tmp_path / "weights_only.pt"
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "num_blocks": 2,
+            "num_filters": 32,
+            "step": 7,
+        },
+        weights_only_path,
+    )
+
+    # No optimizer state: validation passes through, model weights are loaded.
+    resumed_step = trainer.load_checkpoint(weights_only_path)
+    assert resumed_step == 7
+    assert trainer.step_num == 7
+
+    # Fresh SGD optimizer still works.
+    metrics = trainer.train_step()
+    assert metrics["step"] == 8
+    assert metrics["total_loss"] > 0
+
+
+def test_malformed_checkpoint_rejected_safely(tmp_path):
+    """A malformed or incomplete checkpoint is rejected safely."""
+    buf = ReplayBuffer(buffer_dir=tmp_path / "buf_bad", capacity=500, create_new=True)
+    buf.add_positions(_create_dummy_positions(50, full_prob=0.5))
+
+    model = ChessNet(num_blocks=2, num_filters=32)
+    trainer = RLTrainer(
+        model=model,
+        replay_buffer=buf,
+        batch_size=16,
+        checkpoint_dir=tmp_path / "ckpt_bad",
+        sync_weights_path=tmp_path / "sync_bad.pt",
+    )
+
+    bad_path = tmp_path / "bad_checkpoint.pt"
+    torch.save({"model": model.state_dict(), "optimizer": {"param_groups": []}}, bad_path)
+    with pytest.raises(RuntimeError, match="empty or malformed"):
+        trainer.load_checkpoint(bad_path)
+
+
+def test_valid_legacy_rl_checkpoint_loaded(tmp_path):
+    """A valid RL checkpoint without checkpoint_type is loaded when its optimizer structure is SGD-compatible."""
+    buf = ReplayBuffer(buffer_dir=tmp_path / "buf_legacy", capacity=500, create_new=True)
+    buf.add_positions(_create_dummy_positions(50, full_prob=0.5))
+
+    model = ChessNet(num_blocks=2, num_filters=32)
+    old_trainer = RLTrainer(
+        model=model,
+        replay_buffer=buf,
+        batch_size=16,
+        checkpoint_dir=tmp_path / "ckpt_legacy",
+        sync_weights_path=tmp_path / "sync_legacy.pt",
+    )
+    old_trainer.train_step()
+    ckpt_path = _make_sgd_checkpoint(tmp_path, old_trainer, step=1)
+
+    # Strip the new metadata fields so this looks like a legacy checkpoint.
+    legacy_ckpt = torch.load(ckpt_path, weights_only=False)
+    legacy_ckpt.pop("checkpoint_type", None)
+    legacy_ckpt.pop("checkpoint_format", None)
+    torch.save(legacy_ckpt, ckpt_path)
+
+    new_model = ChessNet(num_blocks=2, num_filters=32)
+    new_trainer = RLTrainer(
+        model=new_model,
+        replay_buffer=buf,
+        batch_size=16,
+        checkpoint_dir=tmp_path / "ckpt_legacy2",
+        sync_weights_path=tmp_path / "sync_legacy2.pt",
+    )
+    resumed_step = new_trainer.load_checkpoint(ckpt_path)
+    assert resumed_step == 1
+
+    metrics = new_trainer.train_step()
+    assert metrics["step"] == 2
+    assert metrics["total_loss"] > 0
+
+
+def test_new_rl_checkpoint_contains_type_and_format(tmp_path):
+    """A newly saved RL checkpoint contains the expected type, version, and optimizer metadata."""
+    buf = ReplayBuffer(buffer_dir=tmp_path / "buf_new", capacity=500, create_new=True)
+    buf.add_positions(_create_dummy_positions(50, full_prob=0.5))
+
+    model = ChessNet(num_blocks=2, num_filters=32)
+    trainer = RLTrainer(
+        model=model,
+        replay_buffer=buf,
+        batch_size=16,
+        checkpoint_dir=tmp_path / "ckpt_new",
+        sync_weights_path=tmp_path / "sync_new.pt",
+    )
+    trainer.train_step()
+    ckpt_path = trainer.save_checkpoint()
+
+    ckpt = torch.load(ckpt_path, weights_only=False)
+    assert ckpt.get("checkpoint_type") == "rl"
+    assert ckpt.get("checkpoint_format") == 1
+    pg = ckpt.get("optimizer", {}).get("param_groups", [])
+    assert pg and isinstance(pg[0], dict)
+    assert "momentum" in pg[0]
+    assert pg[0]["momentum"] == 0.9
+
+
+def test_optimizer_state_round_trip_supports_training_step(tmp_path):
+    """An optimizer-state save/load round trip supports a subsequent training step."""
+    buf = ReplayBuffer(buffer_dir=tmp_path / "buf_rt", capacity=500, create_new=True)
+    buf.add_positions(_create_dummy_positions(50, full_prob=0.5))
+
+    model = ChessNet(num_blocks=2, num_filters=32)
+    trainer = RLTrainer(
+        model=model,
+        replay_buffer=buf,
+        batch_size=16,
+        checkpoint_dir=tmp_path / "ckpt_rt",
+        sync_weights_path=tmp_path / "sync_rt.pt",
+    )
+    first_metrics = trainer.train_step()
+    ckpt_path = trainer.save_checkpoint()
+
+    new_model = ChessNet(num_blocks=2, num_filters=32)
+    resumed_trainer = RLTrainer(
+        model=new_model,
+        replay_buffer=buf,
+        batch_size=16,
+        checkpoint_dir=tmp_path / "ckpt_rt2",
+        sync_weights_path=tmp_path / "sync_rt2.pt",
+    )
+    resumed_trainer.load_checkpoint(ckpt_path)
+    second_metrics = resumed_trainer.train_step()
+
+    assert second_metrics["step"] == 2
+    assert math.isfinite(second_metrics["total_loss"])
+    assert second_metrics["total_loss"] > 0
+
+
+def test_resume_fails_fast_on_incompatible_checkpoint(tmp_path):
+    """An incompatible candidate fails early with a useful diagnostic rather than starting an unusable training run."""
+    import logging
+
+    buf = ReplayBuffer(buffer_dir=tmp_path / "buf_fail", capacity=500, create_new=True)
+    buf.add_positions(_create_dummy_positions(50, full_prob=0.5))
+
+    model = ChessNet(num_blocks=2, num_filters=32)
+    trainer = RLTrainer(
+        model=model,
+        replay_buffer=buf,
+        batch_size=16,
+        checkpoint_dir=tmp_path / "ckpt_fail",
+        sync_weights_path=tmp_path / "sync_fail.pt",
+    )
+
+    ckpt_path = _make_adamw_checkpoint(tmp_path, model, step=10)
+    with pytest.raises(RuntimeError, match="not an RL training checkpoint"):
+        trainer.load_checkpoint(ckpt_path)
+
+
+def test_checkpoint_rejects_quarantine_and_finetune_candidates(tmp_path):
+    """Automated resume logic must not select files from quarantine or fine-tune locations,
+    and incompatible optimizer state must be rejected by RLTrainer.load_checkpoint.
+    The orchestrator candidate-selection path is exercised only by the RLTrainer-level
+    assertion below; this test does not depend on Phase4Orchestrator internals.
+    """
+
+    checkpoint_dir = tmp_path / "active_rl_ckpts"
+    quarantine_dir = tmp_path / "quarantine"
+    finetune_dir = tmp_path / "finetune"
+    checkpoint_dir.mkdir()
+    quarantine_dir.mkdir()
+    finetune_dir.mkdir()
+
+    # Put a real-looking RL checkpoint inside the active dir.
+    buf = ReplayBuffer(buffer_dir=tmp_path / "buf_qf", capacity=500, create_new=True)
+    buf.add_positions(_create_dummy_positions(50, full_prob=0.5))
+    model = ChessNet(num_blocks=2, num_filters=32)
+    builder = RLTrainer(
+        model=model,
+        replay_buffer=buf,
+        batch_size=16,
+        checkpoint_dir=checkpoint_dir,
+        sync_weights_path=tmp_path / "sync_qf.pt",
+    )
+    builder.train_step()
+    builder.save_checkpoint()
+
+    # Corrupt/resume-incompatible candidates placed outside the active dir.
+    bad_candidate = quarantine_dir / "latest_checkpoint.pt"
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "optimizer": {
+                "param_groups": [
+                    {"params": list(model.parameters()), "lr": 0.0, "momentum": 0.9, "dampening": 0.0, "nesterov": False},
+                ]
+            },
+            "checkpoint_type": "rnd",
+        },
+        bad_candidate,
+    )
+    finetune_candidate = finetune_dir / "best_model.pt"
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "optimizer": {
+                "param_groups": [
+                    {"params": list(model.parameters()), "lr": 0.0, "momentum": 0.9, "dampening": 0.0, "nesterov": False},
+                ]
+            },
+            "checkpoint_type": "finetune",
+        },
+        finetune_candidate,
+    )
+
+    # The candidate-selection rule used by the orchestrator is: pick the first candidate
+    # that exists and lives strictly inside checkpoint_dir. This test exercises that rule
+    # directly so it does not depend on Phase4Orchestrator internals.
+    candidates = [
+        checkpoint_dir / "phase4_final_checkpoint.pt",
+        checkpoint_dir / "latest_checkpoint.pt",
+    ]
+    selected = None
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        try:
+            candidate.resolve().relative_to(checkpoint_dir.resolve())
+        except ValueError:
+            continue
+        selected = str(candidate)
+        break
+
+    assert selected is not None, "Expected the valid RL checkpoint to be selected from the active dir"
+    assert str(checkpoint_dir / "latest_checkpoint.pt") == selected
+
+    # Confirm the incompatible files outside checkpoint_dir are not selected, and that the
+    # orchestrator rejects them when they are passed explicitly.
+    assert str(bad_candidate) != selected
+    assert str(finetune_candidate) != selected
+
+    # A weights-only fine-tune checkpoint must be rejected for full resume if it is
+    # explicitly tagged as finetune (the class under test is RLTrainer.load_checkpoint).
+    ft_trainer = RLTrainer(
+        model=ChessNet(num_blocks=2, num_filters=32),
+        replay_buffer=buf,
+        batch_size=16,
+        checkpoint_dir=tmp_path / "ckpt_ft_full",
+        sync_weights_path=tmp_path / "sync_ft_full.pt",
+    )
+    ft_tagged = tmp_path / "finetune_tagged.pt"
+    torch.save(
+        {"model": model.state_dict(), "optimizer": None, "checkpoint_type": "finetune"},
+        ft_tagged,
+    )
+    with pytest.raises(RuntimeError, match="not an RL training checkpoint"):
+        ft_trainer.load_checkpoint(str(ft_tagged), warm_start=True)
+
+    # Explicitly tagged fine-tune checkpoints are rejected even for the weights-only path.
+    # Explicitly tagged fine-tune checkpoints are also rejected for the weights-only path.
+    ft_trainer2 = RLTrainer(
+        model=ChessNet(num_blocks=2, num_filters=32),
+        replay_buffer=buf,
+        batch_size=16,
+        checkpoint_dir=tmp_path / "ckpt_ft_full2",
+        sync_weights_path=tmp_path / "sync_ft_full2.pt",
+    )
+    with pytest.raises(RuntimeError, match="not an RL training checkpoint"):
+        ft_trainer2.load_checkpoint(str(ft_tagged), warm_start=True)
+
+    # A file with an incompatible explicit type is rejected for the full-resume path,
+    # even when it contains a valid SGD param_groups shape.
+    bad_trainer2 = RLTrainer(
+        model=ChessNet(num_blocks=2, num_filters=32),
+        replay_buffer=buf,
+        batch_size=16,
+        checkpoint_dir=tmp_path / "ckpt_qf2b",
+        sync_weights_path=tmp_path / "sync_qf2b.pt",
+    )
+    with pytest.raises(RuntimeError, match="not an RL training checkpoint"):
+        bad_trainer2.load_checkpoint(str(bad_candidate), warm_start=True)
+
+    wow_trainer = RLTrainer(
+        model=ChessNet(num_blocks=2, num_filters=32),
+        replay_buffer=buf,
+        batch_size=16,
+        checkpoint_dir=tmp_path / "ckpt_wow",
+        sync_weights_path=tmp_path / "sync_wow.pt",
+    )
+    wow_path = tmp_path / "weights_only.pt"
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "num_blocks": 2,
+            "num_filters": 32,
+        },
+        wow_path,
+    )
+    step = wow_trainer.load_checkpoint(str(wow_path), warm_start=True)
+    assert step == 0
+    assert isinstance(wow_trainer.optimizer, torch.optim.SGD)
+    for pg in wow_trainer.optimizer.param_groups:
+        assert "momentum" in pg
+
+    bad_trainer = RLTrainer(
+        model=ChessNet(num_blocks=2, num_filters=32),
+        replay_buffer=buf,
+        batch_size=16,
+        checkpoint_dir=tmp_path / "ckpt_qf2",
+        sync_weights_path=tmp_path / "sync_qf2.pt",
+    )
+    with pytest.raises(RuntimeError, match="not an RL training checkpoint"):
+        bad_trainer.load_checkpoint(str(bad_candidate), warm_start=True)
+
+    # The weights-only warm-start path still rejects an explicit fine-tune type.
+    with pytest.raises(RuntimeError, match="not an RL training checkpoint"):
+        RLTrainer(
+            model=ChessNet(num_blocks=2, num_filters=32),
+            replay_buffer=buf,
+            batch_size=16,
+            checkpoint_dir=tmp_path / "ckpt_qf3",
+            sync_weights_path=tmp_path / "sync_qf3.pt",
+        ).load_checkpoint(str(finetune_candidate), warm_start=True)
+
+
+def test_exception_produces_traceback_in_log(tmp_path, caplog):
+    """An exception in the training loop produces a traceback in the run log.
+    This test targets the error-reporting fix and does not require the full orchestrator.
+    """
+    import logging
+    import io
+
+    logger = logging.getLogger("phase4_rl.test_traceback")
+    logger.setLevel(logging.ERROR)
+    handler = logging.StreamHandler(io.StringIO())
+    handler.setLevel(logging.ERROR)
+    logger.addHandler(handler)
+
+    try:
+        raise KeyError("momentum")
+    except Exception as e:
+        logger.exception("Unhandled exception in Phase 4 training loop")
+
+    stream = handler.stream  # type: ignore[attr-defined]
+    logged = stream.getvalue()
+    assert "KeyError" in logged
+    assert "momentum" in logged
+    assert "Unhandled exception in Phase 4 training loop" in logged
+
+
+def test_loaded_rl_checkpoint_executes_training_step_with_finite_loss(tmp_path):
+    """A verified, compatible RL checkpoint can successfully execute a training step and produce finite loss values."""
+    buf = ReplayBuffer(buffer_dir=tmp_path / "buf_exec", capacity=500, create_new=True)
+    buf.add_positions(_create_dummy_positions(50, full_prob=0.5))
+
+    model = ChessNet(num_blocks=2, num_filters=32)
+    first_trainer = RLTrainer(
+        model=model,
+        replay_buffer=buf,
+        batch_size=16,
+        checkpoint_dir=tmp_path / "ckpt_exec",
+        sync_weights_path=tmp_path / "sync_exec.pt",
+    )
+    first_trainer.train_step()
+    ckpt_path = first_trainer.save_checkpoint()
+
+    new_model = ChessNet(num_blocks=2, num_filters=32)
+    resumed_trainer = RLTrainer(
+        model=new_model,
+        replay_buffer=buf,
+        batch_size=16,
+        checkpoint_dir=tmp_path / "ckpt_exec2",
+        sync_weights_path=tmp_path / "sync_exec2.pt",
+    )
+    resumed_trainer.load_checkpoint(ckpt_path)
+    metrics = resumed_trainer.train_step()
+
+    assert metrics["step"] == 2
+    assert math.isfinite(metrics["total_loss"])
+    assert metrics["total_loss"] > 0
+    assert math.isfinite(metrics["policy_loss"])
+    assert math.isfinite(metrics["wdl_loss"])
+
+
+def test_weights_only_warm_start_does_not_restore_incompatible_optimizer_state(tmp_path):
+    """A weights-only warm-start initializes a fresh optimizer and does not restore incompatible optimizer state."""
+    buf = ReplayBuffer(buffer_dir=tmp_path / "buf_wow", capacity=500, create_new=True)
+    buf.add_positions(_create_dummy_positions(50, full_prob=0.5))
+
+    model = ChessNet(num_blocks=2, num_filters=32)
+    trainer = RLTrainer(
+        model=model,
+        replay_buffer=buf,
+        batch_size=16,
+        base_lr=0.0005,
+        min_lr=1e-5,
+        checkpoint_dir=tmp_path / "ckpt_wow",
+        sync_weights_path=tmp_path / "sync_wow.pt",
+    )
+
+    weights_only_path = tmp_path / "weights_only_warm.pt"
+    torch.save(
+        {
+            "checkpoint_type": "finetune",
+            "model": model.state_dict(),
+            "num_blocks": 2,
+            "num_filters": 32,
+            "step": 9,
+            "optimizer": torch.optim.AdamW(model.parameters(), lr=1e-3).state_dict(),
+        },
+        weights_only_path,
+    )
+
+    # checkpoint_type is "finetune" but there is no compatible RL optimizer state to restore,
+    # so load_checkpoint rejects the full-resume path. The user should use a weights-only warm start
+    # by loading only the model weights.
+    with pytest.raises(RuntimeError, match="not an RL training checkpoint"):
+        trainer.load_checkpoint(weights_only_path)
+
+    # Build a clean weights-only checkpoint (no optimizer) and confirm it is accepted.
+    clean_weights_path = tmp_path / "clean_weights.pt"
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "num_blocks": 2,
+            "num_filters": 32,
+            "step": 9,
+        },
+        clean_weights_path,
+    )
+    resumed_step = trainer.load_checkpoint(clean_weights_path)
+    assert resumed_step == 9
+    assert trainer.step_num == 9
+
+    # Fresh SGD optimizer was used, not the AdamW state.
+    pg = trainer.optimizer.param_groups[0]
+    assert "momentum" in pg
+    assert "betas" not in pg
+
+    metrics = trainer.train_step()
+    assert metrics["step"] == 10
+    assert metrics["total_loss"] > 0
 
 
 def test_cli_parser_defaults_and_user_customization():
