@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import tempfile
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Optional, Union, Dict, Any, TypedDict
@@ -144,6 +145,28 @@ def _check_st_size(path: Path, expected_bytes: int) -> None:
         raise ValueError(f"Cannot stat {path}: {e}") from e
     if actual < expected_bytes:
         raise ValueError(f"{path.name} truncated: {actual} < {expected_bytes} bytes")
+
+
+def _outcome_to_value_target(outcomes: np.ndarray, is_syzygy: bool) -> np.ndarray:
+    """Map stored outcome labels to (N, 3) one-hot value targets.
+
+    3-class master labels are mover-relative 0=W, 1=D, 2=L. 5-class Syzygy
+    labels map 0/1 (win/cursed win) -> W, 2 (draw) -> D, 3/4 (blessed
+    loss/loss) -> L. OUTCOME_UNAVAILABLE (255) rows are left all-zero so the
+    WDL loss masks them. This is the single source of truth for both loaders;
+    the GPU chunk loop previously applied the Syzygy mapping unconditionally,
+    decoding 3-class draws as wins (mover-relative semantics, Stage A §3.3).
+    """
+    outcomes = np.asarray(outcomes)
+    targets = np.zeros((outcomes.shape[0], 3), dtype=np.float32)
+    if is_syzygy:
+        valid = (outcomes != OUTCOME_UNAVAILABLE) & (outcomes <= 4)
+        cls = np.where(outcomes[valid] <= 1, 0, np.where(outcomes[valid] == 2, 1, 2))
+    else:
+        valid = (outcomes != OUTCOME_UNAVAILABLE) & (outcomes <= 2)
+        cls = outcomes[valid].astype(np.int64)
+    targets[np.nonzero(valid)[0], cls] = 1.0
+    return targets
 
 
 class BinaryChessDataset(Dataset):
@@ -449,6 +472,12 @@ class GpuResidentDataLoader:
             metadata: Dict[str, Any] = json.load(f)
 
         self.is_tactical = determine_is_tactical(self.data_dir, metadata, None)
+        kind = str(metadata.get("kind", "")).lower()
+        self.is_syzygy = (
+            kind.startswith("endgame_syzygy")
+            or kind.startswith("syzygy")
+            or "syzygy" in str(self.data_dir).lower()
+        )
 
         self.num_samples, self.planes_shape = _validate_meta(metadata)
 
@@ -484,36 +513,36 @@ class GpuResidentDataLoader:
             self._memmaps.append(targets_m)
         else:
             targets_m = None
-            outcomes_m = np.memmap(
-                self.data_dir / "outcomes.bin",
-                dtype=np.uint8,
-                mode="r",
-                shape=(self.num_samples,),
-            )
-            self._memmaps.append(outcomes_m)
-
-        # Tactics mixing: when tactics_dir is set, build a synthetic in-memory
-        # outcomes array for masking. NEVER rewrite the dataset's own
-        # outcomes.bin — an earlier version overwrote the file in place with
-        # 255 (mode "r+"), silently destroying real WDL labels on disk.
-        if (
-            not val_targets_path.exists()
-            and self.tactics_dir is not None
-            and self.tactics_dir.exists()
-        ):
             outcomes_path = self.data_dir / "outcomes.bin"
-            if not outcomes_path.exists():
-                outcomes_m = np.full(self.num_samples, 255, dtype=np.uint8)
-            else:
-                outcomes_m = np.array(
-                    np.memmap(
-                        outcomes_path,
-                        dtype=np.uint8,
-                        mode="r",
-                        shape=(self.num_samples,),
-                    ),
+            if outcomes_path.exists():
+                outcomes_m = np.memmap(
+                    outcomes_path,
                     dtype=np.uint8,
+                    mode="r",
+                    shape=(self.num_samples,),
                 )
+            elif self.is_tactical:
+                # Tactical shards may legitimately ship without outcome labels;
+                # treat every row as value-unavailable in memory. The source
+                # tree is never written (audit V-1, data-integrity F-series).
+                outcomes_m = np.full(self.num_samples, OUTCOME_UNAVAILABLE, dtype=np.uint8)
+            else:
+                raise FileNotFoundError(
+                    f"Dataset is missing outcomes.bin and metadata does not declare it "
+                    f"tactical: {self.data_dir}. "
+                    "The loader will not synthesize labels or write to the dataset."
+                )
+            if isinstance(outcomes_m, np.memmap):
+                self._memmaps.append(outcomes_m)
+
+        # Value-target availability is decided in memory only (audit V-1): the
+        # former branch reopened the master outcomes.bin in "r+" mode and
+        # overwrote every stored label with the 255 sentinel whenever
+        # tactics_dir was set, destroying the canonical master-game training
+        # shard on disk. The loader now never mutates the source dataset tree:
+        # BinaryChessDataset.__getitem__ and the GPU chunk loop below mask
+        # OUTCOME_UNAVAILABLE (255) rows in memory, and rows that carry valid
+        # W/D/L labels keep them.
 
         # Load separate tactics dataset and concatenate arrays if tactics_dir is set.
         # This fixes the critical bug where --tactics-dir was silently ignored in GPU mode.
@@ -546,11 +575,9 @@ class GpuResidentDataLoader:
                 if targets_m is not None:
                     master_targets = np.array(targets_m, dtype=np.float32)
                 else:
-                    master_targets = np.zeros((self.num_samples, 3), dtype=np.float32)
-                    if outcomes_m is not None:
-                        out_arr = np.array(outcomes_m, dtype=np.uint8)
-                        valid_mask = (out_arr >= 0) & (out_arr <= 2)
-                        master_targets[valid_mask, out_arr[valid_mask]] = 1.0
+                    master_targets = _outcome_to_value_target(
+                        np.array(outcomes_m, dtype=np.uint8), self.is_syzygy
+                    )
 
                 # Load tactics arrays
                 t_planes_m = np.memmap(
@@ -578,12 +605,15 @@ class GpuResidentDataLoader:
                 combined_plies[-tactics_n:] = 0
                 combined_targets = np.concatenate([master_targets, tactics_targets])
 
-                # Replace memmaps with combined arrays stored as new memmaps
-                combined_path_base = self.data_dir / "_gpu_combined"
-                combined_planes_path = self.data_dir / "_gpu_combined_planes.bin"
-                combined_moves_path = self.data_dir / "_gpu_combined_moves.bin"
-                combined_plies_path = self.data_dir / "_gpu_combined_plies.bin"
-                combined_targets_path = self.data_dir / "_gpu_combined_targets.bin"
+                # Replace memmaps with combined arrays stored as new memmaps.
+                # Staging files go to a private temp dir, never the source
+                # dataset tree (audit V-1 companion: loading a dataset must
+                # leave it byte-identical).
+                combined_tmp_dir = Path(tempfile.mkdtemp(prefix="zeropawn_gpu_combined_"))
+                combined_planes_path = combined_tmp_dir / "planes.bin"
+                combined_moves_path = combined_tmp_dir / "moves.bin"
+                combined_plies_path = combined_tmp_dir / "plies.bin"
+                combined_targets_path = combined_tmp_dir / "targets.bin"
 
                 # Write combined binary files
                 combined_planes_path.write_bytes(combined_planes.tobytes())
@@ -771,22 +801,9 @@ class GpuResidentDataLoader:
                 t_chunk = torch.from_numpy(np.array(targets_m[start:end], dtype=np.float32))
             else:
                 out_chunk = np.array(outcomes_m[start:end], dtype=np.uint8)
-                t_chunk = torch.zeros((end - start, 3), dtype=torch.float32)
-                # Map 5-class syzygy outcomes (0-4) and 3-class master outcomes (0-2)
-                # to 3-element value targets; mask unavailable tactics (255).
-                valid_mask = (out_chunk != OUTCOME_UNAVAILABLE) & (out_chunk <= 4)
-                out_for_target = out_chunk[valid_mask].astype(np.int64)
-                _rows = np.arange(end - start)[valid_mask]
-                for r, oc in zip(_rows, out_for_target):
-                    if oc in (0, 1):
-                        t_chunk[r, 0] = 1.0
-                    elif oc == 2:
-                        t_chunk[r, 1] = 1.0
-                    elif oc in (3, 4):
-                        t_chunk[r, 2] = 1.0
-                    else:
-                        # Unexpected value; default to draw to avoid out-of-range
-                        t_chunk[r, 1] = 1.0
+                # Single mapping source of truth (3-class master vs 5-class
+                # syzygy), mirroring BinaryChessDataset.__getitem__.
+                t_chunk = torch.from_numpy(_outcome_to_value_target(out_chunk, self.is_syzygy))
 
             # Fill GPU portion
             if start < self.gpu_capacity:

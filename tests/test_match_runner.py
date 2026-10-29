@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import inspect
+import threading
+import time
 from pathlib import Path
 import pytest
 import torch
@@ -372,3 +374,217 @@ def test_match_runner_batched_mode(tmp_path):
     results = runner.run_match(num_openings=1)
     assert results["total_games"] == 2
     assert results["search_mode"] == "batched"
+
+
+# ---------------------------------------------------------------------------
+# Stage A: Elo argument order (P0-5) and interruption-safe match persistence
+# ---------------------------------------------------------------------------
+
+
+def test_elo_interval_w5_d10_l85_is_minus_382_not_minus_17():
+    """The audit's regression case: W=5, D=10, L=85 -> ~-382 Elo, not ~-17.
+
+    -382 is the correct logistic score for s = 0.10; -17 is what the swapped
+    (wins, losses, draws) call produced (s = 0.475)."""
+    from python.eval.match_runner import elo_interval
+
+    result = elo_interval(5, 10, 85)
+    assert result["elo_diff"] == pytest.approx(-381.7, abs=2.0)
+    assert result["elo_diff"] < -300.0  # never the sign-flipped ~-17 value
+    assert result["score"] == pytest.approx(0.10)
+    assert result["lo"] < result["elo_diff"] < result["hi"]
+    # And the mirrored result flips the sign exactly.
+    mirrored = elo_interval(85, 10, 5)
+    assert mirrored["elo_diff"] == pytest.approx(-result["elo_diff"])
+
+
+def test_eval_elo_columns_from_orchestrator():
+    """The orchestrator's Elo CSV helper yields real numbers in signature order."""
+    from scripts.run_phase4_rl import eval_elo_columns
+
+    cols = eval_elo_columns(5, 10, 85)
+    assert cols[0] == pytest.approx(-381.7, abs=2.0)
+    assert cols[1] < cols[0] < cols[2]  # lo < diff < hi
+    assert all(isinstance(c, float) for c in cols)  # never "n/a"
+
+    # Zero completed games (e.g. interrupted before any game): unbounded -> n/a.
+    assert eval_elo_columns(0, 0, 0) == ["n/a", "n/a", "n/a"]
+    # Shutout: point estimate exists but the Wald interval is unbounded.
+    shutout = eval_elo_columns(0, 0, 100)
+    assert shutout[0] is not None and shutout[1] == "n/a" and shutout[2] == "n/a"
+
+
+def test_run_match_interrupt_preserves_completed_games(tmp_path, monkeypatch):
+    """Interrupting a match keeps every finished game (PGN + callback), marks the
+    result partial, and never fabricates a full-match tally (Stage A §7)."""
+    import python.eval.match_runner as mr
+
+    class FakeContext:
+        def __init__(self, *args, **kwargs):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(mr, "MatchWorkerContext", FakeContext)
+
+    openings_file = tmp_path / "openings.epd"
+    fens = [
+        "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1",
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        "rnbqkbnr/pppppppp/8/8/3P4/8/PPP1PPPP/RNBQKBNR b KQkq d3 0 1",
+    ]
+    openings_file.write_text("\n".join(fens) + "\n", encoding="utf-8")
+
+    model = ChessNet(num_blocks=1, num_filters=8)
+    runner = MatchRunner(
+        model=model,
+        device="cpu",
+        stockfish_path="nonexistent_stockfish.exe",
+        stockfish_nodes=1,
+        mcts_sims=1,
+        openings_path=str(openings_file),
+        num_workers=2,
+        search_mode="serial",
+    )
+    # Patch out the instance bound method (workers call self._play_game_worker).
+    slow = threading.Event()
+
+    def fake_play(opening_fen, engine_is_white, ctx, max_plies=150, game_seed=None, move_log=None):
+        if opening_fen == fens[1]:
+            # Deterministic interrupt: openings 0 and 2 finish well before this
+            # one raises.
+            slow.wait(timeout=2.0)
+            raise KeyboardInterrupt("simulated user interrupt")
+        time.sleep(0.05)
+        if move_log is not None:
+            move_log.extend(["e2e4", "e7e5"])
+        return "1-0" if engine_is_white else "1/2-1/2"
+
+    monkeypatch.setattr(runner, "_play_game_worker", fake_play)
+
+    persisted: list[dict] = []
+    pgn_path = tmp_path / "match.pgn"
+    result = runner.run_match(
+        num_openings=3, pgn_path=pgn_path, on_game_result=persisted.append
+    )
+    slow.set()
+
+    assert result["interrupted"] is True
+    assert "KeyboardInterrupt" in (result["error"] or "")
+    assert result["completed_games"] == 4
+    # No fabricated full-match tally: total_games reflects only played games.
+    assert result["total_games"] == 4
+    assert (
+        result["engine_wins"] + result["engine_draws"] + result["engine_losses"] == 4
+    )
+    assert len(persisted) == 4
+    # Incremental PGN survived the interruption.
+    pgn_text = pgn_path.read_text(encoding="utf-8")
+    assert pgn_text.count("[Event ") == 4
+    # Engine identity is recorded (hash unavailable for a nonexistent binary).
+    assert result["engine"]["path"] == "nonexistent_stockfish.exe"
+    assert result["engine"]["sha256"] is None
+
+
+def test_orchestrator_eval_persistence_helpers(tmp_path):
+    """_init_eval_csv/_persist_* build durable artifacts without a live orchestrator."""
+    from types import SimpleNamespace
+
+    from scripts.run_phase4_rl import Phase4Orchestrator
+
+    orch = object.__new__(Phase4Orchestrator)
+    orch.log_dir = tmp_path
+    orch.eval_csv_path = tmp_path / "eval_history.csv"
+    orch.match_games_csv_path = tmp_path / "match_games.csv"
+    orch.puzzle_eval_jsonl_path = tmp_path / "eval_puzzle_history.jsonl"
+    orch._run_commit = "testcommit"
+    orch.trainer = SimpleNamespace(step_num=7)
+    orch.server = SimpleNamespace(model_version=3)
+    orch.stockfish_elo = None
+    orch.stockfish_nodes = 1000
+    orch.eval_sims = None
+    orch.is_verify_mode = True
+    dummy_ckpt = tmp_path / "phase4_ckpt_v3_step7.pt"
+    dummy_ckpt.write_bytes(b"dummy")
+    orch._last_saved_ckpt_name = dummy_ckpt.name
+    orch._last_saved_ckpt_path = str(dummy_ckpt)
+
+    orch._init_eval_csv()
+    orch._persist_puzzle_result(0.5, 5, 10)
+    orch._persist_match_game(
+        {
+            "opening_idx": 1,
+            "engine_is_white": True,
+            "result": "1-0",
+            "seed": 42,
+            "moves": ["e2e4"],
+        }
+    )
+    orch._append_eval_row(
+        [1.0, 0.1, 7, 3, dummy_ckpt.name, 0.5, 5, 10, 0.75, 3, 1, 0, 0.25, 4, 0,
+         "cfg", "serial", 0, -381.7, -500.0, -250.0, "abc123", "sf123", "testcommit", 0]
+    )
+
+    # eval_history: header + one row, with the partial/provenance columns.
+    lines = orch.eval_csv_path.read_text(encoding="utf-8").strip().splitlines()
+    assert lines[0].endswith(",model_sha256,stockfish_sha256_16,commit,partial")
+    assert len(lines) == 2
+    # match_games ledger: header + one per-game row.
+    mg_lines = orch.match_games_csv_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(mg_lines) == 2 and "1-0" in mg_lines[1]
+    # Puzzle JSONL written before the match with commit provenance.
+    import json as _json
+
+    record = _json.loads(orch.puzzle_eval_jsonl_path.read_text(encoding="utf-8").strip())
+    assert record["type"] == "puzzle_policy" and record["commit"] == "testcommit"
+    assert record["solve_rate"] == 0.5
+
+    # A header-only file with the old schema is upgraded in place.
+    old_csv = tmp_path / "old.csv"
+    old_csv.write_text("timestamp,step\n", encoding="utf-8")
+    orch.eval_csv_path = old_csv
+    orch._init_eval_csv()
+    assert old_csv.read_text(encoding="utf-8").startswith("timestamp,elapsed_hours")
+
+    # A file WITH data rows and an old schema must fail closed, not mix schemas.
+    old_csv.write_text("timestamp,step\n1,2\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="archive"):
+        orch._init_eval_csv()
+
+
+def test_match_runner_eval_callback_array_contract():
+    """MatchRunner serial eval callbacks return contiguous float32 ndarrays with
+    finite, probability-like outputs (Stage A §8; the native binding fast-paths
+    arrays — .tolist() returns are the historical 9-10% overhead)."""
+    import numpy as np
+    from types import SimpleNamespace
+
+    import zeropawn_cpp
+
+    runner = object.__new__(MatchRunner)
+    runner.model = ChessNet(num_blocks=1, num_filters=8)
+    runner.device = "cpu"
+    runner._lock = threading.Lock()
+
+    game = zeropawn_cpp.ChessGame()
+    policy, value = runner._eval_callback(game)
+    assert isinstance(policy, np.ndarray)
+    assert policy.dtype == np.float32
+    assert policy.shape == (4672,)
+    assert policy.flags["C_CONTIGUOUS"]
+    assert np.isfinite(policy).all()
+    assert isinstance(value, float) and -1.0 <= value <= 1.0
+
+    batch_policy, batch_values = runner._batched_eval_callback(
+        np.stack([zeropawn_cpp.encode_state(game)] * 3)
+    )
+    assert batch_policy.dtype == np.float32 and batch_policy.shape == (3, 4672)
+    assert batch_values.dtype == np.float32 and batch_values.shape == (3,)
+    assert np.isfinite(batch_policy).all() and np.isfinite(batch_values).all()
+
+    list_based = runner._eval_batch_callback([game, game])
+    assert len(list_based) == 2
+    for policy_item, _ in list_based:
+        assert isinstance(policy_item, np.ndarray)
+        assert policy_item.dtype == np.float32

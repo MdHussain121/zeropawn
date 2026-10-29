@@ -149,19 +149,31 @@ class WarmupCosineScheduler:
         self.min_lr = min_lr
         self.current_step = 0
 
-    def step(self) -> float:
-        self.current_step += 1
-        if self.current_step <= self.warmup_steps:
-            # Linear warmup
-            lr = self.base_lr * (self.current_step / self.warmup_steps)
+    def step(self, step_num: Optional[int] = None) -> float:
+        """Advance the schedule one step and apply the resulting LR.
+
+        With ``step_num`` the LR is computed as a pure function of that step
+        (identical to :meth:`get_lr`) and the internal counter jumps there. The
+        RL trainer uses this to drive the schedule from its own checkpointed
+        step counter; callers without an argument keep the legacy advance-by-one
+        warmup semantics.
+        """
+        if step_num is not None:
+            self.current_step = int(step_num)
+            lr = self.get_lr(self.current_step)
         else:
-            # Cosine decay
-            progress = (self.current_step - self.warmup_steps) / (
-                self.total_steps - self.warmup_steps
-            )
-            progress = min(1.0, max(0.0, progress))
-            cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
-            lr = self.min_lr + (self.base_lr - self.min_lr) * cosine_decay
+            self.current_step += 1
+            if self.current_step <= self.warmup_steps:
+                # Linear warmup
+                lr = self.base_lr * (self.current_step / self.warmup_steps)
+            else:
+                # Cosine decay
+                progress = (self.current_step - self.warmup_steps) / (
+                    self.total_steps - self.warmup_steps
+                )
+                progress = min(1.0, max(0.0, progress))
+                cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+                lr = self.min_lr + (self.base_lr - self.min_lr) * cosine_decay
 
         for param_group in self.optimizer.param_groups:
             param_group["lr"] = lr
@@ -185,12 +197,14 @@ class WarmupCosineScheduler:
         cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
         return self.min_lr + (self.base_lr - self.min_lr) * cosine_decay
 
-    def load_state_dict(self, state: dict) -> None:
+    def load_state_dict(self, state: dict, override_lr: bool = False) -> None:
         self.warmup_steps = state["warmup_steps"]
         self.total_steps = state["total_steps"]
-        self.base_lr = state["base_lr"]
-        self.min_lr = state["min_lr"]
-        self.current_step = state["current_step"]
+        if not override_lr:
+            self.base_lr = state["base_lr"]
+            self.min_lr = state["min_lr"]
+        # Legacy checkpoints (pre shared-scheduler) may not carry current_step.
+        self.current_step = state.get("current_step", self.current_step)
 
 
 def compute_accuracy_topk(

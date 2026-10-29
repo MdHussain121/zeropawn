@@ -73,11 +73,15 @@ class InferenceServer:
         # Load or create model
         if model is not None:
             self.model = model.to(self.device)
-        elif checkpoint_path is not None:
+        elif checkpoint_path:
+            # An empty-string path means "no checkpoint requested" (same as
+            # None); a REAL path that fails to load raises — see
+            # _create_model_from_checkpoint's fail-closed contract.
             self.model = self._create_model_from_checkpoint(checkpoint_path).to(self.device)
             self.load_checkpoint(checkpoint_path)
         else:
-            # Default ChessNet with 12 blocks
+            # Explicit no-weights construction: caller opted into an (untrained)
+            # random-init ChessNet.
             self.model = ChessNet(num_blocks=12, num_filters=128).to(self.device)
 
         if self.channels_last and self.device.type == "cuda":
@@ -103,12 +107,20 @@ class InferenceServer:
         self._window_time_sec = 0.0
 
     def _create_model_from_checkpoint(self, path: str) -> nn.Module:
-        """Inspect checkpoint and construct appropriate network."""
+        """Inspect checkpoint and construct appropriate network.
+
+        Fails closed (Stage A §5): an unreadable or structurally invalid
+        checkpoint raises instead of silently constructing a random-init
+        ChessNet — a silent fallback here previously let runs proceed with
+        random weights while logging only an exception.
+        """
         try:
             ckpt = torch.load(path, map_location="cpu", weights_only=True)
-        except Exception:
-            logger.exception("Failed to load checkpoint %s; using default arch", path)
-            return ChessNet(num_blocks=12, num_filters=128)
+        except Exception as e:
+            raise RuntimeError(
+                f"Checkpoint '{path}' is unreadable or invalid: {e}. "
+                "Refusing to construct a random-init model (fail-closed)."
+            ) from e
         state_dict = (
             ckpt.get("model", ckpt.get("state_dict", ckpt)) if isinstance(ckpt, dict) else ckpt
         )
