@@ -18,6 +18,7 @@ Optimizations:
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import logging
 from pathlib import Path
 from contextlib import nullcontext
@@ -26,7 +27,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Any, Optional, Union
+from typing import Any, Callable, Optional, Union
 import numpy as np
 import torch
 
@@ -143,6 +144,25 @@ def elo_interval(wins: int, draws: int, losses: int) -> dict[str, Optional[float
     lo_s = max(s - 1.96 * se, 0.001)
     hi_s = min(s + 1.96 * se, 0.999)
     return {"elo_diff": _to_elo(s), "lo": _to_elo(lo_s), "hi": _to_elo(hi_s), "score": s}
+
+
+def engine_identity(stockfish_path: Union[str, Path]) -> dict:
+    """Binary identity of the reference engine used for a match (provenance).
+
+    Every persisted eval result should be able to name the exact opponent
+    binary it was produced against (Stage A §7); hashing is done once per
+    match, not per game.
+    """
+    p = Path(stockfish_path)
+    try:
+        h = hashlib.sha256()
+        with open(p, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        return {"path": str(p), "sha256": h.hexdigest(), "size_bytes": p.stat().st_size}
+    except OSError as e:
+        logger.warning("Could not hash reference engine binary %s: %s", p, e)
+        return {"path": str(p), "sha256": None, "size_bytes": None}
 
 
 def write_match_pgn(games: list[dict], pgn_path: Union[str, Path]) -> str:
@@ -720,13 +740,21 @@ class MatchRunner:
         self,
         num_openings: int = 50,
         pgn_path: Optional[Union[str, Path]] = None,
+        on_game_result: Optional[Callable[[dict], None]] = None,
     ) -> dict[str, Union[int, float]]:
         """Run 2 * num_openings games in parallel across opening pairs with persistent workers.
 
         Game ``i`` (opening index ``idx``, engine-white first) uses MCTS seed
         ``self.seed + 2*idx`` / ``+ 2*idx+1`` — deterministic per game. If
-        ``pgn_path`` is given, all games are appended as PGN (board-relative).
-        Returns the tally plus a ``games`` detail list and ``pgn_path``.
+        ``pgn_path`` is given, every game is appended to it the moment it
+        completes (interrupted matches keep their finished games). If
+        ``on_game_result`` is given it is invoked with each game dict as soon
+        as that game completes, so callers can persist results incrementally.
+
+        Returns the tally plus a ``games`` detail list and ``pgn_path``. On
+        interruption (including worker failures) the tally covers exactly the
+        completed games, ``interrupted`` is True with the error recorded, and
+        ``total_games`` never pretends unplayed games were played.
         """
         selected_openings = self.openings[:num_openings]
         engine_wins = 0
@@ -734,6 +762,7 @@ class MatchRunner:
         engine_losses = 0
         total_games = len(selected_openings) * 2
         elo_str = f"UCI_Elo {self.stockfish_elo}" if self.stockfish_elo else "full strength"
+        engine_info = engine_identity(self.stockfish_path)
 
         logger.info(
             f"Starting {total_games}-game match vs Stockfish ({self.stockfish_nodes} nodes, {elo_str}, "
@@ -800,6 +829,12 @@ class MatchRunner:
             finally:
                 ctx_queue.put(worker_ctx)
 
+        completed_pairs = 0
+        results_as_white: list[str] = []
+        results_as_black: list[str] = []
+        games: list[dict] = []
+        interrupted = False
+        interrupt_error: Optional[str] = None
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=self.num_workers) as executor:
                 futures = [
@@ -807,47 +842,81 @@ class MatchRunner:
                     for idx, fen in enumerate(selected_openings)
                 ]
 
-                completed_pairs = 0
-                results_as_white: list[str] = []
-                results_as_black: list[str] = []
-                games: list[dict] = []
-                for future in concurrent.futures.as_completed(futures):
-                    game_w, game_b = future.result()
-                    games.extend([game_w, game_b])
-                    # Board-relative strings tallied per engine color.
-                    results_as_white.append(game_w["result"])
-                    results_as_black.append(game_b["result"])
-                    tally = score_board_results(results_as_white, results_as_black)
-                    engine_wins, engine_draws, engine_losses = (
-                        tally["engine_wins"],
-                        tally["engine_draws"],
-                        tally["engine_losses"],
-                    )
+                try:
+                    for future in concurrent.futures.as_completed(futures):
+                        game_w, game_b = future.result()
+                        games.extend([game_w, game_b])
+                        # Persist each game the moment it completes (Stage A §7):
+                        # an interrupted match must not lose finished games.
+                        if pgn_path is not None:
+                            try:
+                                write_match_pgn([game_w], pgn_path)
+                                write_match_pgn([game_b], pgn_path)
+                            except OSError:
+                                logger.exception(
+                                    "Incremental PGN write to %s failed; continuing match",
+                                    pgn_path,
+                                )
+                        if on_game_result is not None:
+                            for completed_game in (game_w, game_b):
+                                try:
+                                    on_game_result(completed_game)
+                                except Exception:
+                                    logger.exception(
+                                        "on_game_result callback failed; continuing match"
+                                    )
+                        # Board-relative strings tallied per engine color.
+                        results_as_white.append(game_w["result"])
+                        results_as_black.append(game_b["result"])
+                        tally = score_board_results(results_as_white, results_as_black)
+                        engine_wins, engine_draws, engine_losses = (
+                            tally["engine_wins"],
+                            tally["engine_draws"],
+                            tally["engine_losses"],
+                        )
 
-                    completed_pairs += 1
-                    games_done = completed_pairs * 2
-                    score = (engine_wins + 0.5 * engine_draws) / games_done
-                    elapsed = time.time() - start_time
-                    logger.info(
-                        f"Match Progress: {games_done:3d}/{total_games} games | "
-                        f"W: {engine_wins:2d} D: {engine_draws:2d} L: {engine_losses:2d} | "
-                        f"Score: {score * 100:5.1f}% | Elapsed: {elapsed:5.1f}s "
-                        f"({elapsed / games_done:.1f}s/game)"
+                        completed_pairs += 1
+                        games_done = completed_pairs * 2
+                        score = (engine_wins + 0.5 * engine_draws) / games_done
+                        elapsed = time.time() - start_time
+                        logger.info(
+                            f"Match Progress: {games_done:3d}/{total_games} games | "
+                            f"W: {engine_wins:2d} D: {engine_draws:2d} L: {engine_losses:2d} | "
+                            f"Score: {score * 100:5.1f}% | Elapsed: {elapsed:5.1f}s "
+                            f"({elapsed / games_done:.1f}s/game)"
+                        )
+                except (KeyboardInterrupt, Exception) as exc:
+                    # Interruption or worker failure: keep every completed game
+                    # and never fabricate a full-match result from a partial
+                    # sample. The traceback stays in the log; the error text
+                    # travels with the result.
+                    interrupted = True
+                    interrupt_error = f"{type(exc).__name__}: {exc}"
+                    logger.warning(
+                        "Match interrupted after %d/%d games; preserving completed results",
+                        completed_pairs * 2,
+                        total_games,
                     )
+                    logger.exception("Match interruption diagnostics")
+                    for pending in futures:
+                        pending.cancel()
         finally:
             for ctx in contexts:
                 ctx.close()
 
-        score_pct = (engine_wins + 0.5 * engine_draws) / total_games if total_games > 0 else 0.0
-        draw_rate = engine_draws / total_games if total_games > 0 else 0.0
+        # Rates cover exactly the completed games when interrupted so the tally
+        # never counts unplayed games as losses.
+        completed_total = len(results_as_white) + len(results_as_black)
+        denominator = completed_total if interrupted else total_games
+        score_pct = (engine_wins + 0.5 * engine_draws) / denominator if denominator > 0 else 0.0
+        draw_rate = engine_draws / denominator if denominator > 0 else 0.0
         games.sort(key=lambda g: (g["opening_idx"], not g["engine_is_white"]))
 
-        pgn_saved: Optional[str] = None
-        if pgn_path is not None:
-            pgn_saved = write_match_pgn(games, pgn_path)
+        pgn_saved: Optional[str] = str(pgn_path) if (pgn_path is not None and games) else None
 
         return {
-            "total_games": total_games,
+            "total_games": denominator if interrupted else total_games,
+            "completed_games": completed_total,
             "engine_wins": engine_wins,
             "engine_draws": engine_draws,
             "engine_losses": engine_losses,
@@ -856,6 +925,9 @@ class MatchRunner:
             "search_mode": self.search_mode,
             "seed": self.seed,
             "stockfish_elo": self.stockfish_elo,
+            "engine": engine_info,
+            "interrupted": interrupted,
+            "error": interrupt_error,
             "games": games,
             "pgn_path": pgn_saved,
             "elapsed_sec": round(time.time() - start_time, 2),

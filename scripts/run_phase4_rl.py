@@ -91,6 +91,28 @@ from python.cli.common import setup_logging
 logger = logging.getLogger("phase4_rl")
 
 
+def eval_elo_columns(engine_wins: int, engine_draws: int, engine_losses: int) -> list:
+    """Elo CSV columns ``[elo_diff, elo_lo, elo_hi]`` from W/D/L.
+
+    P0-5 (Stage A §6): the signature order is (wins, draws, losses) and
+    :func:`elo_interval` returns a dict. The historical call site passed
+    ``(wins, losses, draws)`` — inverting the sign of every recorded Elo —
+    AND unpacked the dict as a 3-tuple, which raised and made the surrounding
+    ``except`` write "n/a" into every row. A W5/D10/L85 result must yield the
+    correct ≈ −382 Elo, not the sign-flipped ≈ −17, and never "n/a".
+    """
+    from python.eval.match_runner import elo_interval
+
+    interval = elo_interval(engine_wins, engine_draws, engine_losses)
+    diff = interval["elo_diff"]
+    if diff is None:
+        # Zero completed games, or an exactly 0/1 score: unbounded interval.
+        return ["n/a", "n/a", "n/a"]
+    lo = round(interval["lo"], 1) if interval["lo"] is not None else "n/a"
+    hi = round(interval["hi"], 1) if interval["hi"] is not None else "n/a"
+    return [round(diff, 1), lo, hi]
+
+
 class SafetyTriggerException(Exception):
     """Raised when an automated safety guardrail is breached."""
 
@@ -313,6 +335,12 @@ class Phase4Orchestrator:
         self.log_dir.mkdir(parents=True, exist_ok=True)
         setup_logging(log_dir=self.log_dir, log_filename="phase4_rl.log")
         self.eval_csv_path = self.log_dir / "eval_history.csv"
+        # Durable eval artifacts (Stage A §7): per-game match rows and the
+        # puzzle-phase result are persisted incrementally with fsync so an
+        # interrupted evaluation keeps everything completed so far.
+        self.match_games_csv_path = self.log_dir / "match_games.csv"
+        self.puzzle_eval_jsonl_path = self.log_dir / "eval_puzzle_history.jsonl"
+        self._run_commit = self._git_commit()
 
         p_cand = [
             Path(puzzle_csv_path) if puzzle_csv_path else None,
@@ -616,35 +644,163 @@ class Phase4Orchestrator:
         logger.info(f"Loaded {len(self.puzzles)} fixed Lichess puzzles for 6-hour evaluation.")
 
     def _init_eval_csv(self) -> None:
-        if not self.eval_csv_path.exists():
-            # NOTE: columns are append-only. Never reorder or rename existing
-            # columns; new provenance columns go at the end.
-            headers = [
-                "timestamp",
-                "elapsed_hours",
-                "step",
-                "model_version",
-                "checkpoint_file",
-                "puzzle_solve_rate",
-                "puzzle_solved_count",
-                "puzzle_total_count",
-                "match_score",
-                "match_engine_wins",
-                "match_engine_draws",
-                "match_engine_losses",
-                "match_draw_rate",
-                "match_total_games",
-                "seed",
-                "config_hash",
-                "search_mode",
-                "invalid",
-                "elo_diff",
-                "elo_lo",
-                "elo_hi",
-            ]
+        # NOTE: columns are append-only. Never reorder or rename existing
+        # columns; new provenance columns go at the end.
+        headers = [
+            "timestamp",
+            "elapsed_hours",
+            "step",
+            "model_version",
+            "checkpoint_file",
+            "puzzle_solve_rate",
+            "puzzle_solved_count",
+            "puzzle_total_count",
+            "match_score",
+            "match_engine_wins",
+            "match_engine_draws",
+            "match_engine_losses",
+            "match_draw_rate",
+            "match_total_games",
+            "seed",
+            "config_hash",
+            "search_mode",
+            "invalid",
+            "elo_diff",
+            "elo_lo",
+            "elo_hi",
+            # Stage A §7 provenance columns (appended; older files keep theirs).
+            "model_sha256",
+            "stockfish_sha256_16",
+            "commit",
+            "partial",
+        ]
+        need_write = True
+        if self.eval_csv_path.exists():
+            with open(self.eval_csv_path, "r", newline="", encoding="utf-8") as f:
+                first_line = f.readline().strip()
+                has_data_rows = bool(f.readline().strip())
+            if first_line == ",".join(headers):
+                need_write = False
+            elif has_data_rows:
+                raise RuntimeError(
+                    f"{self.eval_csv_path} has data rows with an older column "
+                    "schema; archive it (or point --log-dir elsewhere) so "
+                    "incompatible eval schemas are not mixed silently."
+                )
+            else:
+                logger.info(
+                    "[EVAL] Upgrading header-only %s with new provenance columns",
+                    self.eval_csv_path,
+                )
+        if need_write:
             with open(self.eval_csv_path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 writer.writerow(headers)
+
+        # Per-game durability ledger: one row per completed match game.
+        if not self.match_games_csv_path.exists():
+            with open(self.match_games_csv_path, "w", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow(
+                    [
+                        "timestamp",
+                        "step",
+                        "model_version",
+                        "checkpoint_file",
+                        "model_sha256",
+                        "opening_idx",
+                        "engine_is_white",
+                        "result",
+                        "seed",
+                        "stockfish_elo",
+                        "stockfish_nodes",
+                        "mcts_sims",
+                        "search_mode",
+                        "plies",
+                        "commit",
+                        "partial",
+                    ]
+                )
+
+    @staticmethod
+    def _git_commit() -> str:
+        """Short commit hash of the running tree ('unknown' outside a repo)."""
+        import subprocess
+
+        try:
+            out = subprocess.run(
+                ["git", "rev-parse", "--short", "HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=True,
+            )
+            return out.stdout.strip() or "unknown"
+        except (OSError, subprocess.SubprocessError):
+            return "unknown"
+
+    def _current_model_sha(self) -> str:
+        """SHA-256 of the exact weights being evaluated (first 16 hex chars)."""
+        path = getattr(self, "_last_saved_ckpt_path", None)
+        if not path:
+            return "unknown"
+        try:
+            from python.model.checkpoint_registry import compute_sha256
+
+            return compute_sha256(path)[:16]
+        except Exception as exc:
+            logger.warning("[EVAL] Could not hash checkpoint for provenance: %s", exc)
+            return "unknown"
+
+    def _append_eval_row(self, row: list) -> None:
+        """Append one eval_history row and fsync so interruption keeps it."""
+        with open(self.eval_csv_path, "a", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(row)
+            f.flush()
+            os.fsync(f.fileno())
+
+    def _persist_puzzle_result(self, solve_rate: float, solved: int, total: int) -> None:
+        """Persist the completed puzzle-phase result before the engine match starts."""
+        record = {
+            "type": "puzzle_policy",
+            "timestamp": time.time(),
+            "step": self.trainer.step_num,
+            "model_version": self.server.model_version,
+            "checkpoint_file": getattr(self, "_last_saved_ckpt_name", None),
+            "model_sha256": self._current_model_sha(),
+            "solve_rate": solve_rate,
+            "solved": solved,
+            "total": total,
+            "commit": self._run_commit,
+        }
+        with open(self.puzzle_eval_jsonl_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+
+    def _persist_match_game(self, game: dict, partial: bool = False) -> None:
+        """Persist one completed match game (Stage A §7 incremental durability)."""
+        row = [
+            time.time(),
+            self.trainer.step_num,
+            self.server.model_version,
+            getattr(self, "_last_saved_ckpt_name", None),
+            self._current_model_sha(),
+            game.get("opening_idx"),
+            int(bool(game.get("engine_is_white"))),
+            game.get("result"),
+            game.get("seed"),
+            self.stockfish_elo if self.stockfish_elo else "full",
+            self.stockfish_nodes,
+            self.eval_sims if self.eval_sims is not None else (10 if self.is_verify_mode else 400),
+            "serial",
+            len(game.get("moves", []) or []),
+            self._run_commit,
+            int(partial),
+        ]
+        with open(self.match_games_csv_path, "a", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(row)
+            f.flush()
+            os.fsync(f.fileno())
 
     def _promotion_gate(self, match_res: dict) -> tuple[bool, str]:
         """Strength gate for best_eval.pt promotion (R-07).
@@ -652,7 +808,14 @@ class Phase4Orchestrator:
         A 100-game match has an Elo confidence interval of roughly ±90-140 Elo, and the
         composite score weights it at 0.7, so a purely luckier match can out-score a
         stronger engine. Require both a real sample and a real score before promoting.
+        An interrupted/partial match must never read as a promotion signal (Stage A §7).
         """
+        if match_res.get("interrupted"):
+            return (
+                False,
+                f"match interrupted after {match_res.get('completed_games', 0)} games "
+                "(partial record is never a promotion signal)",
+            )
         games = int(match_res.get("total_games", 0) or 0)
         score = float(match_res.get("engine_score", 0.0) or 0.0)
         if games < self.promotion_min_games:
@@ -720,6 +883,8 @@ class Phase4Orchestrator:
 
         # Save milestone evaluation checkpoint
         ckpt_name = f"phase4_ckpt_v{self.server.model_version}_step{self.trainer.step_num}.pt"
+        self._last_saved_ckpt_name = ckpt_name
+        self._last_saved_ckpt_path = str(self.checkpoint_dir / ckpt_name)
         ckpt_path = self.checkpoint_dir / ckpt_name
         self.trainer.save_checkpoint(ckpt_path, keep_last_n=self.keep_checkpoints)
         self._known_ckpt_names.add(ckpt_name)
@@ -743,6 +908,13 @@ class Phase4Orchestrator:
         logger.info(
             f"[EVAL CYCLE] Puzzle solve rate: {solve_rate * 100:.2f}% ({puzzle_res['solved']}/{puzzle_res['total']})"
         )
+
+        # Persist the completed puzzle phase BEFORE the potentially long engine
+        # match (Stage A §7): an interrupted match must not lose the puzzle row.
+        try:
+            self._persist_puzzle_result(solve_rate, puzzle_res["solved"], puzzle_res["total"])
+        except OSError:
+            logger.exception("Failed to persist puzzle eval result; continuing eval cycle")
 
         self.puzzle_solve_history.append(solve_rate)
 
@@ -768,9 +940,29 @@ class Phase4Orchestrator:
             search_mode="serial",
         )
         try:
-            match_res = match_runner.run_match(num_openings=openings)
+            match_pgn_dir = self.log_dir / "matches"
+            match_pgn_dir.mkdir(parents=True, exist_ok=True)
+            match_res = match_runner.run_match(
+                num_openings=openings,
+                pgn_path=match_pgn_dir / f"eval_step{self.trainer.step_num}.pgn",
+                on_game_result=self._persist_match_game,
+            )
         finally:
             match_runner.close()
+
+        if match_res.get("interrupted"):
+            logger.error(
+                "[EVAL CYCLE] Match was INTERRUPTED after %d/%s games (%s); the eval row "
+                "below is marked partial and the promotion gate will refuse it.",
+                match_res.get("completed_games"),
+                openings * 2,
+                match_res.get("error"),
+            )
+            self._event(
+                "EVAL_INTERRUPTED",
+                f"match partial: {match_res.get('completed_games')} games; "
+                f"error={match_res.get('error')}",
+            )
 
         logger.info(
             f"[EVAL CYCLE] Match Result: W: {match_res['engine_wins']} "
@@ -786,6 +978,10 @@ class Phase4Orchestrator:
 
         now = time.time()
         elapsed_hours = (now - self.start_time) / 3600.0
+        model_sha = self._current_model_sha()
+        partial = bool(match_res.get("interrupted"))
+        engine_info = match_res.get("engine") or {}
+        stockfish_sha16 = (engine_info.get("sha256") or "unknown")[:16]
 
         # Append to CSV (column order locked; provenance appended, see _init_eval_csv)
         row = [
@@ -816,18 +1012,19 @@ class Phase4Orchestrator:
             match_res.get("search_mode", "serial"),
             0,
         ]
-        try:
-            from python.eval.match_runner import elo_interval
-
-            elo_diff, elo_lo, elo_hi = elo_interval(
-                match_res["engine_wins"], match_res["engine_losses"], match_res["engine_draws"]
+        # P0-5: signature is (wins, draws, losses) and the return is a dict —
+        # the previous call passed (wins, losses, draws), inverting the sign of
+        # every recorded Elo, and the 3-tuple unpacking of the dict raised, so
+        # the except wrote "n/a" into every row. On an interrupted match the
+        # tally covers exactly the completed games, so the interval is computed
+        # from actual games only.
+        row.extend(
+            eval_elo_columns(
+                match_res["engine_wins"], match_res["engine_draws"], match_res["engine_losses"]
             )
-            row.extend([round(elo_diff, 1), round(elo_lo, 1), round(elo_hi, 1)])
-        except Exception:
-            row.extend(["n/a", "n/a", "n/a"])
-        with open(self.eval_csv_path, "a", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(row)
+        )
+        row.extend([model_sha, stockfish_sha16, self._run_commit, int(partial)])
+        self._append_eval_row(row)
 
         # Log to TensorBoard
         step = self.trainer.step_num
