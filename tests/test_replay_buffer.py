@@ -17,6 +17,11 @@ def synthetic_human_dir(tmp_path):
         "num_samples": num_samples,
         "planes_shape": [19, 8, 8],
         "split": "train",
+        # Synthetic fixture data has no build/validation provenance; the
+        # explicit role declaration keeps the consumption gate informed and
+        # the buffers are constructed with allow_uncertified_data=True below.
+        "role": "games_wdl",
+        "label_semantics": {"role": "games_wdl", "wdl_supervised": True},
     }
     with open(target_dir / "metadata.json", "w", encoding="utf-8") as f:
         json.dump(metadata, f)
@@ -89,6 +94,7 @@ def test_human_data_taper_schedule(tmp_path, synthetic_human_dir):
         final_human_mix=0.05,
         taper_steps=50_000,
         human_data_dir=human_dir,
+        allow_uncertified_data=True,
         create_new=True,
     )
 
@@ -109,6 +115,7 @@ def test_sampling_and_mix_ratio_logging(tmp_path, synthetic_human_dir):
         final_human_mix=0.05,
         taper_steps=10_000,
         human_data_dir=human_dir,
+        allow_uncertified_data=True,
         create_new=True,
     )
 
@@ -299,6 +306,7 @@ def test_gpu_resident_human_cache_sampling(tmp_path, synthetic_human_dir):
         gpu_cache_capacity=100,
         gpu_device=device,
         human_data_dir=human_dir,
+        allow_uncertified_data=True,
         human_cache_size=200,
         create_new=True,
     )
