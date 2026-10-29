@@ -1050,3 +1050,174 @@ def test_cli_parser_defaults_and_user_customization():
     sig = inspect.signature(Phase4Orchestrator.__init__)
     assert sig.parameters["policy_target_temp"].default == 0.5
     assert sig.parameters["entropy_bonus"].default == 0.001
+
+
+def test_scheduler_explicit_step_pins_counter_and_lr():
+    """N-01 regression: step(step_num) is valid and pins the schedule to that step.
+
+    The explicit-step form computes LR as a pure function of the given step
+    (matching get_lr) so the RL trainer can drive the schedule from its own
+    checkpointed counter; the no-arg form keeps the legacy advance-by-one
+    warmup semantics used by supervised training.
+    """
+    model = ChessNet(num_blocks=2, num_filters=32)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    sched = WarmupCosineDecayScheduler(
+        optimizer=optimizer,
+        warmup_steps=100,
+        total_steps=1000,
+        base_lr=0.01,
+        min_lr=1e-4,
+    )
+
+    lr50 = sched.step(50)
+    assert sched.current_step == 50
+    assert abs(lr50 - sched.get_lr(50)) < 1e-12
+    assert abs(optimizer.param_groups[0]["lr"] - sched.get_lr(50)) < 1e-12
+
+    # No-arg step still advances by one and applies the legacy warmup formula.
+    sched.step()
+    assert sched.current_step == 51
+    expected_warmup_lr = 0.01 * (51 / 100)
+    assert abs(optimizer.param_groups[0]["lr"] - expected_warmup_lr) < 1e-12
+
+    # Jumping forward into the cosine region matches get_lr there too.
+    lr800 = sched.step(800)
+    assert abs(lr800 - sched.get_lr(800)) < 1e-12
+
+
+def test_entropy_term_contributes_gradient(tmp_path):
+    """N-03 regression: the entropy bonus must be differentiable through total_loss.
+
+    The momentum-fix rewrite converted policy entropy to a Python float via a
+    mid-step .item(), turning the entropy bonus into a constant with zero
+    gradient. This test proves the loss gradient w.r.t. a model parameter
+    changes when the entropy coefficient changes.
+    """
+    torch.manual_seed(7)
+    buf = ReplayBuffer(buffer_dir=tmp_path / "buf_entgrad", capacity=500, create_new=True)
+    buf.add_positions(_create_dummy_positions(50, full_prob=1.0))
+
+    planes = torch.randn(8, 19, 8, 8, dtype=torch.float32)
+    visits = torch.zeros(8, 4672, dtype=torch.float32)
+    for i in range(8):
+        # Several visited (legal) moves per row so d(entropy) is non-zero.
+        visits[i, 1] = 10.0
+        visits[i, 2] = 5.0
+        visits[i, 3] = 2.0
+    outcomes = torch.tensor([1] * 8, dtype=torch.long)
+    is_full = torch.tensor([True] * 8, dtype=torch.bool)
+    batch_dict = {
+        "planes": planes,
+        "visits": visits,
+        "outcomes": outcomes,
+        "is_full_search": is_full,
+    }
+
+    base_state = ChessNet(num_blocks=2, num_filters=32).state_dict()
+
+    def _grad_signature(entropy_bonus: float) -> torch.Tensor:
+        torch.manual_seed(7)
+        model = ChessNet(num_blocks=2, num_filters=32)
+        model.load_state_dict(base_state)
+        trainer = RLTrainer(
+            model=model,
+            replay_buffer=buf,
+            batch_size=8,
+            device="cpu",
+            entropy_bonus=entropy_bonus,
+            checkpoint_dir=tmp_path / f"ckpt_entgrad_{entropy_bonus}",
+            sync_weights_path=tmp_path / f"sync_entgrad_{entropy_bonus}.pt",
+        )
+        captured = {}
+        handle = model.stem_conv.weight.register_hook(lambda g: captured.update(grad=g.clone()))
+        trainer.train_step(batch_dict=batch_dict)
+        handle.remove()
+        grad = captured["grad"]
+        assert torch.isfinite(grad).all()
+        return grad
+
+    g_baseline = _grad_signature(0.0)
+    g_with_bonus = _grad_signature(0.05)
+    # Same data and init: the only difference is the entropy term's gradient
+    # contribution. If the entropy gradient is broken, these are identical.
+    assert not torch.allclose(g_baseline, g_with_bonus, atol=1e-9)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA GPU")
+def test_bf16_autocast_applied_on_cuda(tmp_path):
+    """N-02 regression: the forward pass runs under bf16 autocast when use_bfloat16 is set.
+
+    The momentum-fix rewrite stored use_bfloat16 but never applied it, silently
+    regressing training throughput ~1.7x. This test pins the autocast scope.
+    """
+    buf = ReplayBuffer(buffer_dir=tmp_path / "buf_autocast", capacity=64, create_new=True)
+    model = ChessNet(num_blocks=2, num_filters=32)
+    trainer = RLTrainer(
+        model=model,
+        replay_buffer=buf,
+        batch_size=8,
+        device="cuda",
+        use_bfloat16=True,
+        checkpoint_dir=tmp_path / "ckpt_autocast",
+        sync_weights_path=tmp_path / "sync_autocast.pt",
+    )
+    assert trainer.use_bfloat16 is True
+
+    observed = {}
+    orig_forward = model.forward
+
+    def _spy(x):
+        observed["autocast"] = torch.is_autocast_enabled("cuda")
+        observed["dtype"] = torch.get_autocast_dtype("cuda")
+        return orig_forward(x)
+
+    model.forward = _spy
+    batch = {
+        "planes": torch.randn(4, 19, 8, 8, device="cuda"),
+        "visits": torch.zeros(4, 4672, device="cuda"),
+        "outcomes": torch.zeros(4, dtype=torch.long, device="cuda"),
+        "is_full_search": torch.ones(4, dtype=torch.bool, device="cuda"),
+    }
+    metrics = trainer.train_step(batch_dict=batch)
+    model.forward = orig_forward
+
+    assert observed["autocast"] is True
+    assert observed["dtype"] == torch.bfloat16
+    assert math.isfinite(metrics["total_loss"])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA GPU")
+def test_bf16_autocast_disabled_when_flag_off(tmp_path):
+    """use_bfloat16=False must leave the forward pass in fp32 (no autocast)."""
+    buf = ReplayBuffer(buffer_dir=tmp_path / "buf_noautocast", capacity=64, create_new=True)
+    model = ChessNet(num_blocks=2, num_filters=32)
+    trainer = RLTrainer(
+        model=model,
+        replay_buffer=buf,
+        batch_size=8,
+        device="cuda",
+        use_bfloat16=False,
+        checkpoint_dir=tmp_path / "ckpt_noautocast",
+        sync_weights_path=tmp_path / "sync_noautocast.pt",
+    )
+    assert trainer.use_bfloat16 is False
+
+    observed = {}
+    orig_forward = model.forward
+
+    def _spy(x):
+        observed["autocast"] = torch.is_autocast_enabled("cuda")
+        return orig_forward(x)
+
+    model.forward = _spy
+    batch = {
+        "planes": torch.randn(4, 19, 8, 8, device="cuda"),
+        "visits": torch.zeros(4, 4672, device="cuda"),
+        "outcomes": torch.zeros(4, dtype=torch.long, device="cuda"),
+        "is_full_search": torch.ones(4, dtype=torch.bool, device="cuda"),
+    }
+    trainer.train_step(batch_dict=batch)
+    model.forward = orig_forward
+
+    assert observed["autocast"] is False

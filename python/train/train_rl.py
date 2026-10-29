@@ -3,17 +3,18 @@
 from __future__ import annotations
 
 import logging
+import os
 import random
+import shutil
 import time
 from pathlib import Path
 from typing import Any, Optional, Union
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torch.optim import SGD
-
-import logging
 
 logger = logging.getLogger(__name__)
 from python.train.train_supervised import (
@@ -23,6 +24,37 @@ from python.train.train_supervised import (
     _safe_numpy_rng_state,
     _validate_arch,
 )
+
+# Finite stand-in for -inf when masking illegal policy logits. Using -inf directly
+# makes exp(log_softmax) == 0 and 0 * -inf == NaN in the entropy expression.
+_MASKED_LOGIT = -1e9
+
+
+def _masked_policy_entropy(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Mean Shannon entropy (nats) of softmax(logits) restricted to ``mask``.
+
+    ``logits`` is [B, A] and ``mask`` is a bool [B, A] legal-action mask. Illegal
+    actions are pushed to ``_MASKED_LOGIT`` so they carry exactly zero probability and
+    contribute nothing to the entropy, keeping every intermediate finite (hence
+    differentiable).
+    """
+    log_probs = F.log_softmax(logits.masked_fill(~mask, _MASKED_LOGIT), dim=-1)
+    return -(log_probs.exp() * log_probs).sum(dim=-1).mean()
+
+
+def _legal_move_mask(visits: torch.Tensor) -> torch.Tensor:
+    """Derive a legal-move mask from MCTS visit counts.
+
+    MCTS only ever visits legal moves, so ``visits > 0`` identifies a subset of the
+    legal actions for a position. Rows with no visits at all keep a single slot so
+    that ``log_softmax`` stays finite (such rows carry a zero policy target anyway).
+    """
+    mask = visits > 0
+    empty = ~mask.any(dim=-1)
+    if bool(empty.any()):
+        mask = mask.clone()
+        mask[empty, 0] = True
+    return mask
 
 
 class RLTrainer:
@@ -237,6 +269,40 @@ class RLTrainer:
                 logger.debug("Ignoring incompatible scheduler state in '%s': %s", path_str, e)
 
         self.step_num = int(ckpt.get("step", 0))
+        self.last_push_step = int(ckpt.get("last_push_step", self.step_num))
+
+        # Drive the shared scheduler to the resumed step so the optimizer LR and the
+        # scheduler counter both match the trainer's checkpointed position.
+        if scheduler_override:
+            self.scheduler.step(self.step_num)
+
+        if ckpt.get("policy_target_temp") is not None:
+            saved_temp = float(ckpt["policy_target_temp"])
+            if saved_temp != self.policy_target_temp:
+                logger.info(
+                    "Overriding saved policy_target_temp (%s) with explicit config (%s)",
+                    saved_temp,
+                    self.policy_target_temp,
+                )
+        if ckpt.get("entropy_bonus") is not None:
+            saved_entropy_bonus = float(ckpt["entropy_bonus"])
+            if saved_entropy_bonus != self.entropy_bonus:
+                logger.info(
+                    "Overriding saved entropy_bonus (%s) with explicit config (%s)",
+                    saved_entropy_bonus,
+                    self.entropy_bonus,
+                )
+
+        if ckpt.get("buffer_write_head") is not None and hasattr(self.replay_buffer, "write_head"):
+            try:
+                head = int(ckpt["buffer_write_head"])
+                cap = getattr(self.replay_buffer, "capacity", None)
+                if cap and cap > 0:
+                    head = head % cap
+                self.replay_buffer.write_head = head
+            except (ValueError, TypeError):
+                logger.debug("Ignoring invalid buffer_write_head in '%s'", path_str)
+
         if ckpt.get("rng_state") is not None:
             try:
                 rng = ckpt["rng_state"]
@@ -258,9 +324,13 @@ class RLTrainer:
             except (ValueError, TypeError):
                 pass
 
-        if self.direct_server is not None:
-            self.direct_server.model_version = int(ckpt.get("model_version", getattr(self.model, "model_version", 0)))
+        if "model_version" in ckpt and self.direct_server is not None:
+            try:
+                self.direct_server.model_version = int(ckpt["model_version"])
+            except (TypeError, ValueError):
+                pass
 
+        logger.info("Resumed training from %s at step %d", path_str, self.step_num)
         return self.step_num
 
     def save_checkpoint(
@@ -280,7 +350,7 @@ class RLTrainer:
             "optimizer": self.optimizer.state_dict(),
             "scheduler": getattr(self.scheduler, "state_dict", lambda: {})(),
             "step": self.step_num,
-            "model_version": int(getattr(self.model, "model_version", self.model_version)),
+            "model_version": int(getattr(self.direct_server, "model_version", getattr(self.model, "model_version", self.model_version))),
             "num_blocks": int(getattr(self.model, "num_blocks", 12)),
             "num_filters": int(getattr(self.model, "num_filters", 128)),
             "policy_target_temp": self.policy_target_temp,
@@ -303,6 +373,21 @@ class RLTrainer:
         }
         _atomic_torch_save(state, ckpt_path)
 
+        # Single write, then byte-copy to latest_checkpoint.pt (candidate-selection
+        # and crash-recovery paths resolve this stable name).
+        latest_path = ckpt_path.parent / "latest_checkpoint.pt"
+        latest_tmp = latest_path.with_name(latest_path.name + ".tmp")
+        try:
+            with open(ckpt_path, "rb") as fsrc, open(latest_tmp, "wb") as fdst:
+                shutil.copyfileobj(fsrc, fdst)
+            os.replace(latest_tmp, latest_path)
+        except OSError as e:
+            logger.warning("Failed to update %s: %s", latest_path, e)
+            try:
+                latest_tmp.unlink()
+            except OSError:
+                logger.debug("Failed to clean tmp checkpoint file %s", latest_tmp)
+
         if keep_last_n >= 0:
             try:
                 from python.common.cleanup import prune_checkpoints
@@ -315,9 +400,15 @@ class RLTrainer:
 
     def train_step(self, batch_dict: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         """Run one training step on a sampled batch and return metrics."""
+        self.model.train()
         # Prefer an explicit batch dict when provided; otherwise sample from the replay buffer.
         if batch_dict is None:
-            batch_dict = self.replay_buffer.sample_batch_tensors(self.batch_size, device=self.device)
+            # sample_batch_tensors returns (batch_dict, human_mix).
+            batch_dict, _ = self.replay_buffer.sample_batch_tensors(
+                batch_size=self.batch_size,
+                step=self.step_num,
+                device=self.device,
+            )
 
         if self.train_stream is not None:
             with torch.cuda.stream(self.train_stream):
@@ -330,90 +421,199 @@ class RLTrainer:
         outcomes = batch_dict["outcomes"].to(self.device, non_blocking=True)
         is_full = batch_dict["is_full_search"].to(self.device, non_blocking=True)
 
-        self.optimizer.zero_grad(set_to_none=True)
+        # LR is a pure function of the checkpointed trainer step (not of the shared
+        # scheduler's internal advance counter); the explicit-step call also keeps
+        # the shared counter in sync so scheduler state stays consistent across save/resume.
         self.scheduler.step(self.step_num)
         lr = self.scheduler.get_lr(self.step_num)
         for pg in self.optimizer.param_groups:
             pg["lr"] = lr
 
-        policy_logits, wdl_logits = self.model(planes)
+        self.optimizer.zero_grad(set_to_none=True)
 
+        # bf16 autocast covers the forward pass only (matching the inference server
+        # and the verified pre-regression configuration); losses are computed in fp32.
+        with torch.autocast(
+            device_type=self.device_type, dtype=torch.bfloat16, enabled=self.use_bfloat16
+        ):
+            policy_logits, wdl_logits = self.model(planes)
+
+        # Policy cross-entropy over full-search positions only, with visit-count
+        # temperature sharpening. A batch without full-search rows must yield a
+        # zero (not NaN) policy loss so the optimizer step is not skipped.
         full_mask = is_full
-        full_p_logits = policy_logits[full_mask].float()
-        full_visits = visits[full_mask].float()
+        entropy_reg: torch.Tensor
+        if full_mask.any():
+            full_p_logits = policy_logits[full_mask].float()
+            full_visits = visits[full_mask].float()
 
-        # Policy cross-entropy over full-search positions with temperature sharpening.
-        sharpened_visits = full_visits.clamp_min(0.0).pow(1.0 / max(1e-3, self.policy_target_temp))
-        sharpened_visits = sharpened_visits / sharpened_visits.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+            with torch.no_grad():
+                p_target_norm = full_visits / full_visits.sum(dim=-1, keepdim=True).clamp_min(
+                    1e-8
+                )
+                target_entropy_t = (
+                    -(p_target_norm * (p_target_norm + 1e-12).log()).sum(dim=-1).mean()
+                )
 
-        log_probs = torch.nn.functional.log_softmax(full_p_logits, dim=-1)
-        policy_loss = -(sharpened_visits * log_probs).sum(dim=-1).mean()
+            log_probs = F.log_softmax(full_p_logits, dim=-1)
+            if self.policy_target_temp != 1.0:
+                tau = self.policy_target_temp
+                sharpened = full_visits.clamp_min(0) ** (1.0 / tau)
+                target = sharpened / sharpened.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+            else:
+                # temp=1.0 keeps the historical raw-visit target (no normalization).
+                target = full_visits
+            policy_loss = -(target * log_probs).sum(dim=-1).mean()
 
-        # WDL cross-entropy over every sampled position.
-        wdl_loss = torch.nn.functional.cross_entropy(wdl_logits.float(), outcomes)
+            # Entropy regularizer over LEGAL moves only (visited slots), differentiable
+            # so the bonus actually contributes gradients (R-01 + R-02 semantics).
+            legal_mask = _legal_move_mask(full_visits)
+            entropy_reg = _masked_policy_entropy(full_p_logits, legal_mask)
+        else:
+            policy_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+            target_entropy_t = torch.tensor(0.0, device=self.device)
+            entropy_reg = torch.tensor(0.0, device=self.device)
 
-        # Policy entropy over legal moves (visited slots), R-01.
-        legal_mask = full_visits > 0
-        legal_log_probs = torch.nn.functional.log_softmax(
-            full_p_logits.masked_fill(~legal_mask, -1e9), dim=-1
-        )
-        policy_entropy = float(
-            -(legal_log_probs.exp() * legal_log_probs).sum(dim=-1).mean().item()
-        )
+        # WDL cross-entropy over every sampled position. Handles both class
+        # probability targets (N, 3) and class index targets (N,) or (N, 1);
+        # ignore_index=255 guards OUTCOME_UNAVAILABLE rows in tactical/human data.
+        if (
+            outcomes.is_floating_point()
+            and outcomes.ndim >= 2
+            and outcomes.shape[-1] == 3
+        ):
+            wdl_loss = F.cross_entropy(wdl_logits.float(), outcomes)
+        else:
+            outcomes_idx = outcomes.long()
+            if outcomes_idx.ndim > 1 and outcomes_idx.shape[-1] == 1:
+                outcomes_idx = outcomes_idx.squeeze(-1)
+            if (outcomes_idx != 255).any():
+                wdl_loss = F.cross_entropy(
+                    wdl_logits.float(), outcomes_idx, ignore_index=255
+                )
+            else:
+                wdl_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
 
-        total_loss = policy_loss + 0.5 * wdl_loss - self.entropy_bonus * policy_entropy
+        total_loss = policy_loss + 0.5 * wdl_loss - self.entropy_bonus * entropy_reg
 
         # Guard against NaNs/Infs so a bad batch cannot corrupt the live model.
         if not torch.isfinite(total_loss):
             logger.warning("RL trainer produced non-finite loss; skipping optimizer step")
             self.optimizer.zero_grad(set_to_none=True)
+            self.step_num += 1
             metrics = {
-                "step": self.step_num + 1,
+                "step": self.step_num,
                 "policy_loss": float(policy_loss.item()),
                 "wdl_loss": float(wdl_loss.item()),
                 "total_loss": float("nan"),
                 "lr": float(lr),
-                "policy_entropy": policy_entropy,
-                "target_entropy": policy_entropy,
+                "policy_entropy": float("nan"),
+                "target_entropy": float("nan"),
                 "n_full": int(full_mask.sum().item()),
                 "n_total": int(is_full.numel()),
             }
-            self.step_num += 1
             return metrics
 
         total_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
         self.optimizer.step()
 
+        # Reported entropy is a logging metric: the masked legal-move entropy when
+        # full-search rows exist, otherwise the unmasked value (no legal-move signal).
+        with torch.no_grad():
+            if full_mask.any():
+                entropy_metric_t = entropy_reg.detach()
+            else:
+                probs = F.softmax(policy_logits.float(), dim=-1)
+                entropy_metric_t = -(probs * torch.log(probs + 1e-12)).sum(dim=-1).mean()
+
+        # Single host-device sync for all scalar metrics.
+        metrics_t = torch.stack(
+            [
+                total_loss.detach(),
+                policy_loss.detach(),
+                wdl_loss.detach(),
+                entropy_metric_t.detach(),
+                target_entropy_t.detach(),
+                full_mask.sum().detach().float(),
+            ]
+        ).cpu()
+        n_total = int(is_full.numel())
+
         self.step_num += 1
         self.last_push_step = self.step_num if self.step_num % self.push_freq == 0 else self.last_push_step
 
+        # Weight push to the inference server every N steps.
+        if self.step_num % self.push_freq == 0:
+            self.push_weights()
+
+        # Periodic checkpoint (default every 30 minutes).
+        now = time.time()
+        if now - self.last_checkpoint_time >= self.checkpoint_interval_sec:
+            self.save_checkpoint()
+            if hasattr(self.replay_buffer, "flush_to_disk"):
+                self.replay_buffer.flush_to_disk()
+            self.last_checkpoint_time = now
+
+        m = metrics_t.tolist()
         return {
             "step": self.step_num,
-            "policy_loss": float(policy_loss.item()),
-            "wdl_loss": float(wdl_loss.item()),
-            "total_loss": float(total_loss.item()),
+            "policy_loss": float(m[1]),
+            "wdl_loss": float(m[2]),
+            "total_loss": float(m[0]),
             "lr": float(lr),
-            "policy_entropy": policy_entropy,
-            "target_entropy": policy_entropy,
-            "n_full": int(full_mask.sum().item()),
-            "n_total": int(is_full.numel()),
+            "policy_entropy": float(m[3]),
+            "target_entropy": float(m[4]),
+            "n_full": int(m[5]),
+            "n_total": n_total,
         }
 
-    def push_weights(self) -> None:
-        """Push current model weights to the inference server and disk sync path."""
+    def push_weights(self) -> Any:
+        """Push current model weights to the inference server and disk sync path.
+
+        Returns the CUDA event recorded on the training stream (so callers and the
+        server can order the weight swap behind in-flight training kernels), or None
+        on CPU / when no dedicated training stream exists.
+        """
+        num_blocks = getattr(self.model, "num_blocks", 12)
+        num_filters = getattr(self.model, "num_filters", 128)
+
+        # Record synchronization event on the training stream.
+        sync_event = None
+        if self.train_stream is not None:
+            sync_event = self.train_stream.record_event()
+
+        # Direct in-memory synchronization if an inference server is connected.
         if self.direct_server is not None:
-            state = {k: v.detach().cpu() for k, v in self.model.state_dict().items()}
+            state = {k: v.detach() for k, v in self.model.state_dict().items()}
             try:
-                self.direct_server.load_state_dict(state, strict=True)
+                if hasattr(self.direct_server, "load_state_dict_weights"):
+                    self.direct_server.load_state_dict_weights(state, sync_event=sync_event)
+                elif hasattr(self.direct_server, "load_checkpoint"):
+                    self.direct_server.load_checkpoint(
+                        str(self.sync_weights_path), sync_event=sync_event
+                    )
+                else:
+                    logger.warning(
+                        "Connected direct_server exposes no weight-reload API; skipping push"
+                    )
             except Exception as e:
                 logger.warning("RL weight push to inference server failed: %s", e)
 
         if self.sync_weights_path is not None:
+            payload = {
+                "model": self.model.state_dict(),
+                "model_version": self.model_version,
+                "step": self.step_num,
+                "num_blocks": num_blocks,
+                "num_filters": num_filters,
+            }
             try:
-                _atomic_torch_save({"model": self.model.state_dict(), "model_version": self.model_version}, self.sync_weights_path)
+                _atomic_torch_save(payload, self.sync_weights_path)
             except Exception as e:
                 logger.warning("RL weight sync write failed: %s", e)
+
+        return sync_event
 
 
 def _validate_checkpoint_optimizer_compatibility(
@@ -425,8 +625,23 @@ def _validate_checkpoint_optimizer_compatibility(
 
     This is the fix for the Phase 4 `KeyError: 'momentum'` incident: a fine-tune checkpoint
     whose optimizer state is AdamW (or otherwise incompatible) must be rejected for full RL
-    resume, or accepted only as a weights-only warm start.
+    resume, or accepted only as a weights-only warm start. Checkpoints explicitly tagged as
+    something other than "rl" (e.g. finetune, rnd) are rejected on every path: their
+    provenance is not an RL training checkpoint even when their optimizer shape looks
+    SGD-compatible.
     """
+    ckpt_type = ckpt.get("checkpoint_type")
+    if ckpt_type is not None and ckpt_type != "rl":
+        if ckpt_type == "finetune":
+            raise RuntimeError(
+                f"Checkpoint '{path_str}' is a fine-tune checkpoint (checkpoint_type='finetune') "
+                "and is not an RL training checkpoint. Use an RL checkpoint for resume."
+            )
+        raise RuntimeError(
+            f"Checkpoint '{path_str}' has checkpoint_type={ckpt_type!r} and is "
+            "not an RL training checkpoint."
+        )
+
     optimizer_state = ckpt.get("optimizer")
     if optimizer_state is None:
         return
