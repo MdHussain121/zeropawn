@@ -141,25 +141,6 @@ def certified_subset(
     return candidates
 
 
-def write_certified(
-    rows: Sequence[dict[str, str]],
-    output: Path,
-    provenance: dict,
-    fieldnames: Sequence[str],
-) -> Path:
-    output.parent.mkdir(parents=True, exist_ok=True)
-    with open(output, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(fieldnames), extrasaction="ignore")
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
-    manifest = output.with_name(output.name + ".certified.json")
-    with open(manifest, "w", encoding="utf-8") as f:
-        json.dump(provenance, f, indent=2, sort_keys=True)
-        f.write("\n")
-    return manifest
-
-
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Check eval puzzle CSV(s) for contamination against tactics training data",
@@ -244,6 +225,32 @@ def main(argv: Iterable[str] | None = None) -> int:
             print("ERROR: no disjoint puzzles available for the requested band", file=sys.stderr)
             return 1
         fieldnames = list(eval_rows[0].keys())
+        output = _resolve(args.output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        with open(output, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(fieldnames), extrasaction="ignore")
+            writer.writeheader()
+            for row in subset:
+                writer.writerow(row)
+
+        # Final verification of the actual serialized output (audit F-10): the
+        # certified claim must hold for the file on disk, not just the intent.
+        output_rows = read_rows(output)
+        verify = evaluate(output_rows, train_ids, train_fens)
+        if verify["either"] != 0 or len(output_rows) != len(subset):
+            print(
+                f"ERROR: certified output verification failed "
+                f"(rows {len(output_rows)}/{len(subset)}, overlap {verify['either']}); "
+                "refusing to write a certification manifest",
+                file=sys.stderr,
+            )
+            return 1
+
+        import hashlib as _hashlib
+
+        ids_digest = _hashlib.sha256(
+            "\n".join(sorted(str(r.get("PuzzleId", "")) for r in subset)).encode("utf-8")
+        ).hexdigest()
         provenance = {
             "certified": True,
             "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -255,14 +262,35 @@ def main(argv: Iterable[str] | None = None) -> int:
             "overlap_by_fen": stats["fen"],
             "overlap_either": stats["either"],
             "output_puzzles": len(subset),
+            "output_row_count": len(output_rows),
+            "output_sha256": _sha256(output),
+            "output_puzzle_ids_sha256": ids_digest,
             "min_rating": args.min_rating,
             "max_rating": args.max_rating,
-            "overlap_in_output": 0,
+            "overlap_in_output": verify["either"],
+            "identity_rule": (
+                "PuzzleId equality, or canonical FEN key (placement, side to move, "
+                "castling rights, en-passant target; halfmove/fullmove clocks excluded)"
+            ),
+            "scope": (
+                "source-ID and starting-FEN separation of the selected output from the "
+                "listed training CSVs, verified against the serialized output file"
+            ),
+            "limitations": [
+                "does not compare serialized puzzle continuation/solver positions against "
+                "binary training artifacts",
+                "does not establish independence from game-data positions, unlisted source "
+                "versions, or external corpora",
+                "does not reconstruct historical adaptive evaluation use of other puzzle sets",
+            ],
         }
-        output = _resolve(args.output)
-        manifest = write_certified(subset, output, provenance, fieldnames)
+        manifest = output.with_name(output.name + ".certified.json")
+        with open(manifest, "w", encoding="utf-8") as f:
+            json.dump(provenance, f, indent=2, sort_keys=True)
+            f.write("\n")
         print(f"Certified {len(subset)} puzzles -> {output}")
         print(f"Manifest                     -> {manifest}")
+        print(f"Output sha256                -> {provenance['output_sha256']}")
 
     if args.fail_on_overlap and stats["either"] > 0:
         print(
