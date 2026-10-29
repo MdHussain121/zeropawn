@@ -70,6 +70,7 @@ def merge_unified_dataset(
 
     total_conflicts_resolved = 0
     total_duplicates_filtered = 0
+    all_conflict_examples: List[Dict[str, Any]] = []
     split_summaries = {}
 
     for split in ("train", "val", "test"):
@@ -118,12 +119,33 @@ def merge_unified_dataset(
                 }
             )
 
-        # Step 1: Collect and resolve indices memory-efficiently
-        # chosen_entries stores (source_idx, sample_idx)
+        # Step 1: Collect and resolve indices memory-efficiently.
+        # chosen_entries stores (source_idx, sample_idx).
+        # Position identity is the serialized 19-plane state; duplicates and
+        # conflicts are CLASSIFIED and recorded (audit F-09) instead of being
+        # silently resolved by first-wins/tactical precedence alone:
+        #   - exact duplicate: same state, same move target, same outcome label
+        #   - label conflict:  same state + move target, different outcome label
+        #   - target conflict: same state, different move target
+        # Conflict policy: the tactical solver record supersedes the master
+        # record; a superseding or discarded conflict is counted and exampled.
         chosen_entries: List[Tuple[int, int]] = []
-        current_split_pos_map: Dict[bytes, int] = {}
+        current_split_pos_map: Dict[bytes, Dict[str, Any]] = {}
         split_master_count = 0
         split_tactics_count = 0
+        split_stats = {
+            "exact_duplicates_removed": 0,
+            "label_conflicts": 0,
+            "target_conflicts": 0,
+            "cross_split_duplicates_filtered": 0,
+        }
+        conflict_examples: List[Dict[str, Any]] = []
+
+        def _record_conflict_example(kind: str, kept: Dict[str, Any], dropped: Dict[str, Any]) -> None:
+            if len(conflict_examples) < 50:
+                conflict_examples.append(
+                    {"kind": kind, "split": split, "kept": kept, "dropped": dropped}
+                )
 
         for s_idx, s_info in enumerate(sources_data):
             s_type = s_info["type"]
@@ -133,34 +155,79 @@ def merge_unified_dataset(
 
             for i in range(n):
                 pos_hash = hashlib.md5(planes_mm[i].tobytes()).digest()
+                cur_move = int(s_info["moves"][i])
+                cur_outcome = int(s_info["outcomes"][i])
 
-                # Cross-split leakage check
+                # Cross-split leakage filter (a state seen in an earlier split
+                # never enters this one).
                 if split == "val" and pos_hash in train_seen_hashes:
-                    total_duplicates_filtered += 1
+                    split_stats["cross_split_duplicates_filtered"] += 1
                     continue
                 if split == "test" and (
                     pos_hash in train_seen_hashes or pos_hash in val_seen_hashes
                 ):
-                    total_duplicates_filtered += 1
+                    split_stats["cross_split_duplicates_filtered"] += 1
                     continue
 
-                if pos_hash in current_split_pos_map:
-                    prev_entry_idx = current_split_pos_map[pos_hash]
-                    prev_s_idx, _ = chosen_entries[prev_entry_idx]
-                    prev_type = sources_data[prev_s_idx]["type"]
+                prev = current_split_pos_map.get(pos_hash)
+                if prev is not None:
+                    prev_type = sources_data[prev["s_idx"]]["type"]
+                    same_move = cur_move == prev["move"]
+                    same_outcome = cur_outcome == prev["outcome"]
+                    if same_move and same_outcome:
+                        split_stats["exact_duplicates_removed"] += 1
+                        continue
+                    kind = "target_conflict" if not same_move else "label_conflict"
                     if s_type == 1 and prev_type == 0:
-                        # Tactical solver move supersedes general master move
-                        chosen_entries[prev_entry_idx] = (s_idx, i)
-                        total_conflicts_resolved += 1
+                        # Tactical solver record supersedes the master record.
+                        chosen_entries[prev["entry_idx"]] = (s_idx, i)
+                        current_split_pos_map[pos_hash] = {
+                            "s_idx": s_idx,
+                            "sample_idx": i,
+                            "entry_idx": prev["entry_idx"],
+                            "move": cur_move,
+                            "outcome": cur_outcome,
+                        }
                         split_master_count -= 1
                         split_tactics_count += 1
+                        _record_conflict_example(
+                            kind,
+                            {"source": s_info["name"], "row": i, "move": cur_move, "outcome": cur_outcome},
+                            {
+                                "source": sources_data[prev["s_idx"]]["name"],
+                                "row": prev["sample_idx"],
+                                "move": prev["move"],
+                                "outcome": prev["outcome"],
+                            },
+                        )
                     else:
-                        total_duplicates_filtered += 1
+                        # Incoming record loses to the kept one; the conflict is
+                        # still counted and exampled, never silently dropped.
+                        _record_conflict_example(
+                            kind,
+                            {
+                                "source": sources_data[prev["s_idx"]]["name"],
+                                "row": prev["sample_idx"],
+                                "move": prev["move"],
+                                "outcome": prev["outcome"],
+                            },
+                            {"source": s_info["name"], "row": i, "move": cur_move, "outcome": cur_outcome},
+                        )
+                    if kind == "target_conflict":
+                        split_stats["target_conflicts"] += 1
+                    else:
+                        split_stats["label_conflicts"] += 1
                     continue
 
                 # Unique position
                 entry_idx = len(chosen_entries)
-                current_split_pos_map[pos_hash] = entry_idx
+                current_split_pos_map[pos_hash] = {
+                    "s_idx": s_idx,
+                    "sample_idx": i,
+                    "entry_idx": entry_idx,
+                    "move": cur_move,
+                    "outcome": cur_outcome,
+                }
                 chosen_entries.append((s_idx, i))
 
                 if s_type == 0:
@@ -286,7 +353,16 @@ def merge_unified_dataset(
             "planes_bytes": (out_s_dir / "planes.bin").stat().st_size,
             "moves_bytes": (out_s_dir / "moves.bin").stat().st_size,
             "outcomes_bytes": (out_s_dir / "outcomes.bin").stat().st_size,
+            "exact_duplicates_removed": split_stats["exact_duplicates_removed"],
+            "label_conflicts": split_stats["label_conflicts"],
+            "target_conflicts": split_stats["target_conflicts"],
+            "cross_split_duplicates_filtered": split_stats["cross_split_duplicates_filtered"],
         }
+        total_duplicates_filtered += (
+            split_stats["exact_duplicates_removed"] + split_stats["cross_split_duplicates_filtered"]
+        )
+        total_conflicts_resolved += split_stats["label_conflicts"] + split_stats["target_conflicts"]
+        all_conflict_examples.extend(conflict_examples)
 
     leakage_train_val = len(train_seen_hashes.intersection(val_seen_hashes))
     leakage_train_test = len(train_seen_hashes.intersection(test_seen_hashes))
@@ -296,10 +372,76 @@ def merge_unified_dataset(
     total_master = sum(s["master_samples"] for s in split_summaries.values())
     total_tactics = sum(s["tactical_samples"] for s in split_summaries.values())
 
+    # Evaluation independence is MEASURED from the actual benchmark file and
+    # the actual selected outputs (audit F-09) — never hard-coded.
+    benchmark_path = Path("data/puzzles/lichess_puzzles_5000_1800_2800.csv")
+    if not benchmark_path.is_file():
+        benchmark_path = Path(__file__).resolve().parent.parent.parent / (
+            "data/puzzles/lichess_puzzles_5000_1800_2800.csv"
+        )
+    if benchmark_path.is_file():
+        import csv as _csv
+
+        def _tactics_gid(puzzle_id: str) -> int:
+            return int(
+                hashlib.sha256(f"tactics_{puzzle_id}".encode("utf-8")).hexdigest()[:16], 16
+            )
+
+        benchmark_gids: set[int] = set()
+        benchmark_rows = 0
+        with open(benchmark_path, newline="", encoding="utf-8") as f:
+            reader = _csv.DictReader(f)
+            for row in reader:
+                if row and row.get("PuzzleId"):
+                    benchmark_rows += 1
+                    benchmark_gids.add(_tactics_gid(row["PuzzleId"]))
+        leaked_by_split: Dict[str, int] = {}
+        for split, summary in split_summaries.items():
+            gids = np.unique(
+                np.memmap(
+                    output_dir / split / "game_ids.bin",
+                    dtype=np.uint64,
+                    mode="r",
+                    shape=(summary["total_samples"],),
+                )
+            )
+            leaked_by_split[split] = int(
+                np.isin(np.int64(gids), np.int64(list(benchmark_gids))).sum()
+            ) if benchmark_gids else 0
+        total_leaked = sum(leaked_by_split.values())
+        evaluation_independence = {
+            "benchmark_file": str(benchmark_path),
+            "benchmark_puzzles": benchmark_rows,
+            "identity_rule": "sha256('tactics_'+PuzzleId) game-id join against output game_ids.bin",
+            "benchmark_puzzles_leaked": total_leaked,
+            "leaked_by_split": leaked_by_split,
+            "status": (
+                "MEASURED - benchmark PuzzleIds absent from all merged splits"
+                if total_leaked == 0
+                else f"FAIL - {total_leaked} benchmark puzzle IDs present in merged splits"
+            ),
+        }
+    else:
+        evaluation_independence = {
+            "benchmark_file": str(benchmark_path),
+            "status": "NOT_VERIFIED - benchmark file not found; no independence claim is made",
+        }
+
+    # Output hashes bind the manifest to the exact published bytes.
+    output_hashes: Dict[str, Dict[str, str]] = {}
+    for split in ("train", "val", "test"):
+        s_dir = output_dir / split
+        if s_dir.is_dir():
+            output_hashes[split] = {
+                p.name: compute_file_sha256(p) for p in sorted(s_dir.glob("*.bin"))
+            }
+
     manifest = {
         "dataset_name": "dataset_training",
         "description": "Unified Canonical Training Dataset containing consolidated 2500+ master-game positions and curated tactical puzzle positions.",
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
+        "schema_version": "1.1",
+        "builder": "python.data.merge_unified_training_dataset.merge_unified_dataset",
         "component_sources": component_manifests,
         "consolidated_totals": {
             "total_unified_positions": total_unified,
@@ -309,24 +451,43 @@ def merge_unified_dataset(
             "tactics_ratio": round(total_tactics / max(1, total_unified), 4),
         },
         "deduplication_and_conflicts": {
+            "identity_rule": (
+                "MD5 of serialized 19-plane state; duplicates classified as exact, "
+                "label-conflict, or target-conflict before resolution"
+            ),
+            "conflict_policy": (
+                "Tactical puzzle solution record supersedes the master record on shared "
+                "states; every conflict is counted and exampled in conflict_examples"
+            ),
             "cross_source_duplicates_filtered": total_duplicates_filtered,
             "tactical_master_conflicts_resolved": total_conflicts_resolved,
-            "conflict_policy": "Tactical puzzle solution moves take precedence over general master moves; value targets masked unless forced mate.",
+            "per_split": {
+                name: {
+                    k: summary[k]
+                    for k in (
+                        "exact_duplicates_removed",
+                        "label_conflicts",
+                        "target_conflicts",
+                        "cross_split_duplicates_filtered",
+                    )
+                    if k in summary
+                }
+                for name, summary in split_summaries.items()
+            },
+            "conflict_examples": all_conflict_examples,
         },
         "splits": split_summaries,
         "leakage_verification": {
             "train_val_overlap": leakage_train_val,
             "train_test_overlap": leakage_train_test,
             "val_test_overlap": leakage_val_test,
-            "status": "PASS - ZERO LEAKAGE"
+            "identity_rule": "MD5 of serialized 19-plane state, accumulated across split order train->val->test",
+            "status": "MEASURED - ZERO LEAKAGE"
             if (leakage_train_val == 0 and leakage_train_test == 0 and leakage_val_test == 0)
-            else "FAIL",
+            else f"FAIL - cross-split overlaps: {leakage_train_val}/{leakage_train_test}/{leakage_val_test}",
         },
-        "evaluation_independence": {
-            "quarantined_benchmark_file": "data/puzzles/lichess_puzzles_5000_1800_2800.csv",
-            "benchmark_puzzles_leaked": 0,
-            "status": "PASS - 100% INDEPENDENT",
-        },
+        "evaluation_independence": evaluation_independence,
+        "output_sha256": output_hashes,
     }
 
     manifest_path = output_dir / "manifest.json"
