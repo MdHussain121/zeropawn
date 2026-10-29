@@ -32,12 +32,30 @@ from python.data.filter import FilterStats, filter_games
 ELITE_URL = "https://database.nikonoel.fr/lichess_elite_{month}.zip"
 
 
+def _zip_is_valid(path: Path) -> bool:
+    """Structural ZIP validation before reuse: readable, CRC-clean, contains a .pgn member."""
+    try:
+        with zipfile.ZipFile(path) as zf:
+            if zf.testzip() is not None:
+                return False
+            return any(n.endswith(".pgn") for n in zf.namelist())
+    except Exception:
+        return False
+
+
 def download(url: str, dest: Path) -> Path | None:
-    """Download, or return None if the server serves an HTML stub (month missing)."""
+    """Download, or return None if the server serves an HTML stub (month missing).
+
+    An existing archive is reused only when it passes structural validation
+    (audit F-07): a corrupt or same-sized-but-invalid ZIP is re-downloaded.
+    """
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists() and dest.stat().st_size > 0:
-        print(f"  exists, skipping: {dest.name} ({dest.stat().st_size / 1e6:.0f} MB)")
-        return dest
+        if _zip_is_valid(dest):
+            print(f"  exists and validates, reusing: {dest.name} ({dest.stat().st_size / 1e6:.0f} MB)")
+            return dest
+        print(f"  exists but FAILS archive validation, re-downloading: {dest.name}")
+        dest.unlink()
 
     # Pre-flight disk space check: ensure at least 1 GB free
     free_bytes = shutil.disk_usage(dest.parent).free
@@ -62,6 +80,10 @@ def download(url: str, dest: Path) -> Path | None:
     try:
         with urllib.request.urlopen(req, timeout=120) as r, open(part_dest, "wb") as f:
             shutil.copyfileobj(r, f, length=4 * 1024 * 1024)
+        # Validate the archive BEFORE publishing it for future reuse.
+        if not _zip_is_valid(part_dest):
+            part_dest.unlink(missing_ok=True)
+            raise ValueError(f"Downloaded archive failed validation (truncated or no .pgn member): {url}")
         part_dest.replace(dest)
     except Exception:
         part_dest.unlink(missing_ok=True)

@@ -524,7 +524,7 @@ class GpuResidentDataLoader:
             elif self.is_tactical:
                 # Tactical shards may legitimately ship without outcome labels;
                 # treat every row as value-unavailable in memory. The source
-                # tree is never written (audit V-1).
+                # tree is never written (audit V-1, data-integrity F-series).
                 outcomes_m = np.full(self.num_samples, OUTCOME_UNAVAILABLE, dtype=np.uint8)
             else:
                 raise FileNotFoundError(

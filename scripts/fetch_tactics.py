@@ -139,14 +139,69 @@ def fetch_tactics(
             if kept >= total_needed:
                 break
 
-    with open(output_path, "w", newline="", encoding="utf-8") as f:
+    tmp_path = output_path.with_name(output_path.name + ".tmp")
+    with open(tmp_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(header)
         writer.writerows(selected)
 
+    # Publish only a verified selection (audit F-07): row count matches,
+    # PuzzleIds are unique, and no excluded eval-set ID leaked in.
+    with open(tmp_path, newline="", encoding="utf-8") as f:
+        written_rows = list(csv.reader(f))
+    written_data = written_rows[1:] if written_rows else []
+    if len(written_data) != len(selected):
+        tmp_path.unlink(missing_ok=True)
+        raise IOError(
+            f"Tactics CSV write verification failed: {len(written_data)} rows on disk, "
+            f"{len(selected)} selected. Nothing was published."
+        )
+    written_ids = [r[0] for r in written_data if r]
+    if len(set(written_ids)) != len(written_ids):
+        tmp_path.unlink(missing_ok=True)
+        raise IOError("Tactics CSV write verification failed: duplicate PuzzleIds in output.")
+    leaked = sorted(set(written_ids) & exclude)
+    if leaked:
+        tmp_path.unlink(missing_ok=True)
+        raise IOError(
+            f"Tactics CSV write verification failed: {len(leaked)} eval-set PuzzleIds leaked "
+            f"into the training output (e.g. {leaked[:5]}). Nothing was published."
+        )
+    tmp_path.replace(output_path)
+
+    import hashlib
+    import json
+    from datetime import datetime, timezone
+
+    digest = hashlib.sha256(output_path.read_bytes()).hexdigest()
+    Path(str(output_path) + ".provenance.json").write_text(
+        json.dumps(
+            {
+                "url": PUZZLE_URL,
+                "retrieved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "target_count": target_count,
+                "rating_band": [min_rating, max_rating],
+                "quality_gates": {
+                    "min_popularity": min_popularity,
+                    "min_plays": min_plays,
+                    "max_rd": max_rd,
+                },
+                "exclude_csvs": [str(p) for p in (exclude_csvs or [])],
+                "rows_written": len(selected),
+                "examined": examined,
+                "bin_fill": filled,
+                "sha256": digest,
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
     print(f"Saved {len(selected)} tactics to {output_path} (examined {examined})")
     print(f"bin fill: {filled} / quotas {quotas}")
     print(f"top themes: {theme_counts.most_common(12)}")
+    print(f"sha256: {digest}")
     return output_path
 
 

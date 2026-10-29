@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import shutil
 from pathlib import Path
 
-import numpy as np
 from rich import box
 from rich.panel import Panel
 from rich.table import Table
@@ -165,7 +163,8 @@ def register_parser(subparsers: argparse._SubParsersAction) -> None:
 
     # 11. Validate Dataset Integrity
     p_val = sub.add_parser(
-        "validate", help="Validate binary memmap file sizes and metadata consistency."
+        "validate",
+        help="Layered fail-closed dataset validation (structural, semantic, provenance, split).",
     )
     p_val.add_argument(
         "dataset_dir",
@@ -177,13 +176,53 @@ def register_parser(subparsers: argparse._SubParsersAction) -> None:
         "--dir",
         dest="dir_flag",
         default=None,
-        help="Path to dataset directory (default: data/dataset_training)",
+        help="Path to dataset directory (e.g. data/dataset_training)",
+    )
+    p_val.add_argument(
+        "--level",
+        choices=("structural", "semantic", "full"),
+        default="full",
+        help="Validation depth: structural (Layer A), semantic (A+B), full (A+B+C+D).",
+    )
+    p_val.add_argument(
+        "--scan-planes",
+        choices=("off", "bounded", "full"),
+        default="bounded",
+        help="Plane numeric scan coverage (bounded scans the first --scan-rows rows).",
+    )
+    p_val.add_argument(
+        "--scan-rows", type=int, default=20000, help="Rows scanned by bounded plane checks."
+    )
+    p_val.add_argument(
+        "--role",
+        choices=("games_wdl", "policy_tactics", "endgame_syzygy", "unified"),
+        default=None,
+        help="Explicit dataset role (otherwise resolved from metadata declarations).",
+    )
+    p_val.add_argument(
+        "--write-receipt",
+        dest="write_receipt",
+        action="store_true",
+        default=True,
+        help="Write validation_receipt.json into the dataset root on success.",
+    )
+    p_val.add_argument(
+        "--no-write-receipt",
+        dest="write_receipt",
+        action="store_false",
+        help="Do not write a validation receipt.",
+    )
+    p_val.add_argument(
+        "--allow-incomplete",
+        action="store_true",
+        help="Exit 0 even when required checks could not complete (result stays marked incomplete).",
     )
     p_val.set_defaults(func=run_data_validate)
 
     # 12. Check Data Leakage
     p_leak = sub.add_parser(
-        "check-leakage", help="Verify zero position or game leakage between train and val splits."
+        "check-leakage",
+        help="Fail-closed train/val leakage check (group IDs + encoded states).",
     )
     p_leak.add_argument(
         "--train-dir", type=str, default="data/dataset_training/train", help="Train split directory"
@@ -197,8 +236,15 @@ def register_parser(subparsers: argparse._SubParsersAction) -> None:
     p_leak.add_argument(
         "--max-positions",
         type=int,
-        default=2000,
-        help="Maximum positions to sample for hash comparison",
+        default=None,
+        help="Bound the encoded-state scan to the first N rows of each split (bounded result; "
+        "cannot certify disjointness).",
+    )
+    p_leak.add_argument(
+        "--allow-bounded",
+        action="store_true",
+        help="Exit 0 on a bounded (non-exhaustive) scan with no overlap found; without this flag "
+        "a bounded scan exits 3 (incomplete).",
     )
     p_leak.set_defaults(func=run_data_check_leakage)
 
@@ -465,7 +511,7 @@ def run_build_dataset(args: argparse.Namespace) -> int:
     cmd_args = [
         "--pgn",
         args.pgn,
-        "--out",
+        "--output-dir",
         args.output_dir,
         "--max-games",
         str(args.max_games),
@@ -771,12 +817,12 @@ def run_data_inspect(args: argparse.Namespace) -> int:
 
             leak = mf.get("leakage_verification", {})
             if leak:
-                table.add_row("Leakage Verification", leak.get("status", "PASS - ZERO LEAKAGE"))
+                table.add_row("Leakage Verification", leak.get("status", "NOT RECORDED"))
 
             eval_indep = mf.get("evaluation_independence", {})
             if eval_indep:
                 table.add_row(
-                    "Evaluation Independence", eval_indep.get("status", "PASS - 100% INDEPENDENT")
+                    "Evaluation Independence", eval_indep.get("status", "NOT RECORDED")
                 )
         except Exception as e:
             console.print(f"[dim]Failed to parse manifest.json: {e}[/dim]")
@@ -824,6 +870,25 @@ def run_data_inspect(args: argparse.Namespace) -> int:
 
 
 def run_data_validate(args: argparse.Namespace) -> int:
+    """Layered, fail-closed dataset validation (audit F-04).
+
+    Exit codes: 0 = pass (definitive), 1 = validation failure,
+    3 = incomplete (required checks skipped/bounded, no definitive result).
+    """
+    from python.data.dataset_contract import (
+        RECEIPT_NAME,
+        classify_role,
+        role_by_name,
+    )
+    from python.data.dataset_validation import (
+        CheckResult,
+        CheckStatus,
+        ValidationReport,
+        check_split_integrity,
+        validate_split,
+        write_receipt,
+    )
+
     target = (
         getattr(args, "dir_flag", None)
         or getattr(args, "dataset_dir", None)
@@ -836,214 +901,121 @@ def run_data_validate(args: argparse.Namespace) -> int:
         console.print(f"[bold red]Dataset directory not found: {target}[/bold red]")
         return 1
 
-    console.print(f"[dim]Validating dataset integrity in {d}...[/dim]")
-    errors = []
-    validation_records = []
+    level = args.level
+    scan_planes = args.scan_planes if level != "structural" else "off"
+    explicit_role = role_by_name(args.role) if getattr(args, "role", None) else None
 
-    splits = [d / s for s in ("train", "val", "test") if (d / s).is_dir()]
-    if not splits:
-        splits = [d]
+    # Determine the split layout: a dataset root has train/val(/test) children;
+    # a bare split directory is validated on its own.
+    split_names = [s for s in ("train", "val", "test") if (d / s).is_dir()]
+    is_root = bool(split_names)
+    splits = [(d / s) for s in split_names] if is_root else [d]
 
-    for s in splits:
-        meta_p = s / "metadata.json"
-        if not meta_p.is_file():
-            errors.append(f"{s.name}: Missing metadata.json")
-            continue
+    console.print(f"[dim]Validating dataset at {d} (level={level}, planes={scan_planes})...[/dim]")
+
+    reports: dict[str, ValidationReport] = {}
+    for split_dir in splits:
+        role = explicit_role
+        if role is None:
+            meta_path = split_dir / "metadata.json"
+            if meta_path.is_file():
+                try:
+                    metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+                    role = classify_role(metadata)
+                except Exception:
+                    role = None
+        reports[split_dir.name] = validate_split(
+            split_dir,
+            role=role,
+            scan_planes=scan_planes,
+            plane_scan_rows=args.scan_rows,
+            compute_hashes=(level == "full"),
+            check_build_record=(level == "full"),
+        )
+
+    # Layer D: cross-split integrity between every pair of splits (dataset root only).
+    if is_root and level == "full" and len(splits) >= 2:
+        for i in range(len(splits)):
+            for j in range(i + 1, len(splits)):
+                exhaustive = args.scan_planes != "bounded"
+                pair = check_split_integrity(
+                    splits[i],
+                    splits[j],
+                    exhaustive_states=exhaustive,
+                    max_bounded_rows=args.scan_rows,
+                )
+                reports[f"{splits[i].name}+{splits[j].name}"] = ValidationReport(
+                    dataset_dir=f"{splits[i]} vs {splits[j]}",
+                    role=next(iter(reports.values())).role,
+                )
+                for r in pair:
+                    reports[f"{splits[i].name}+{splits[j].name}"].add(r)
+
+    overall_pass = True
+    incomplete = False
+    for name, report in reports.items():
+        for r in report.results:
+            if r.status == CheckStatus.FAIL:
+                overall_pass = False
+                console.print(f"[bold red]FAIL[/bold red] [{name}] {r.name}: {r.detail}")
+            elif r.status == CheckStatus.SKIPPED:
+                incomplete = True
+                console.print(f"[yellow]SKIPPED[/yellow] [{name}] {r.name}: {r.detail}")
+            elif r.status == CheckStatus.BOUNDED:
+                incomplete = True
+                console.print(
+                    f"[yellow]BOUNDED[/yellow] [{name}] {r.name}: {r.detail} "
+                    f"(coverage: {r.coverage})"
+                )
+        console.print(f"[dim]{name}: {report.summary_line()}[/dim]")
+        if report.label_stats:
+            for split, stats in report.label_stats.items():
+                console.print(
+                    f"[dim]labels[{split}]: {stats['wdl_labelled']:,} WDL-labelled, "
+                    f"{stats['masked']:,} masked ({stats['masked_fraction']:.2%})[/dim]"
+                )
+
+    receipt_path = None
+    if args.write_receipt and overall_pass:
         try:
-            m = json.loads(meta_p.read_text(encoding="utf-8"))
-            num_samples = int(m.get("num_samples", 0))
+            # An incomplete validation is recorded as such; consumption gates
+            # reject receipts whose overall is not "pass".
+            receipt_overall = "incomplete" if incomplete else "pass"
+            receipt_path = write_receipt(d, reports, overall=receipt_overall)
         except Exception as e:
-            errors.append(f"{s.name}: Malformed metadata.json ({e})")
-            continue
+            console.print(f"[yellow]Receipt write failed: {e}[/yellow]")
 
-        split_record = {"split": s.name, "num_samples": num_samples, "files": {}}
-
-        # 1. planes.bin
-        planes_p = s / "planes.bin"
-        if planes_p.is_file():
-            expected = num_samples * 19 * 8 * 8 * 4
-            actual = planes_p.stat().st_size
-            split_record["files"]["planes.bin"] = {
-                "expected_bytes": expected,
-                "actual_bytes": actual,
-                "valid": (expected == actual),
-            }
-            if expected != actual:
-                errors.append(
-                    f"{s.name}/planes.bin: Byte size mismatch! Expected {expected} bytes for {num_samples} samples, found {actual}"
-                )
-        else:
-            errors.append(f"{s.name}/planes.bin: File missing")
-
-        # 2. moves.bin
-        moves_p = s / "moves.bin"
-        if moves_p.is_file():
-            expected = num_samples * 2
-            actual = moves_p.stat().st_size
-            split_record["files"]["moves.bin"] = {
-                "expected_bytes": expected,
-                "actual_bytes": actual,
-                "valid": (expected == actual),
-            }
-            if expected != actual:
-                errors.append(
-                    f"{s.name}/moves.bin: Byte size mismatch! Expected {expected} bytes, found {actual}"
-                )
-        else:
-            errors.append(f"{s.name}/moves.bin: File missing")
-
-        # 3. outcomes.bin
-        outcomes_p = s / "outcomes.bin"
-        if outcomes_p.is_file():
-            expected = num_samples * 1
-            actual = outcomes_p.stat().st_size
-            split_record["files"]["outcomes.bin"] = {
-                "expected_bytes": expected,
-                "actual_bytes": actual,
-                "valid": (expected == actual),
-            }
-            if expected != actual:
-                errors.append(
-                    f"{s.name}/outcomes.bin: Byte size mismatch! Expected {expected} bytes, found {actual}"
-                )
-        else:
-            errors.append(f"{s.name}/outcomes.bin: File missing")
-
-        # 4. value_targets.bin
-        vt_p = s / "value_targets.bin"
-        if vt_p.is_file():
-            expected = num_samples * 3 * 4
-            actual = vt_p.stat().st_size
-            split_record["files"]["value_targets.bin"] = {
-                "expected_bytes": expected,
-                "actual_bytes": actual,
-                "valid": (expected == actual),
-            }
-            if expected != actual:
-                errors.append(
-                    f"{s.name}/value_targets.bin: Byte size mismatch! Expected {expected} bytes, found {actual}"
-                )
-
-        # 5. game_ids.bin
-        gid_p = s / "game_ids.bin"
-        if gid_p.is_file():
-            expected = num_samples * 8
-            actual = gid_p.stat().st_size
-            split_record["files"]["game_ids.bin"] = {
-                "expected_bytes": expected,
-                "actual_bytes": actual,
-                "valid": (expected == actual),
-            }
-            if expected != actual:
-                errors.append(
-                    f"{s.name}/game_ids.bin: Byte size mismatch! Expected {expected} bytes, found {actual}"
-                )
-
-        # 6. plies.bin
-        ply_p = s / "plies.bin"
-        if ply_p.is_file():
-            expected = num_samples * 2
-            actual = ply_p.stat().st_size
-            split_record["files"]["plies.bin"] = {
-                "expected_bytes": expected,
-                "actual_bytes": actual,
-                "valid": (expected == actual),
-            }
-            if expected != actual:
-                errors.append(
-                    f"{s.name}/plies.bin: Byte size mismatch! Expected {expected} bytes, found {actual}"
-                )
-
-        validation_records.append(split_record)
-
-    # Validate manifest.json if present
-    manifest_p = d / "manifest.json"
-    manifest_data = {}
-    if manifest_p.is_file():
-        try:
-            manifest_data = json.loads(manifest_p.read_text(encoding="utf-8"))
-        except Exception as e:
-            errors.append(f"manifest.json: Malformed JSON ({e})")
-
-    # Generate persistent markdown report in reports/dataset_validation.md
-    reports_dir = REPO_ROOT / "reports"
-    reports_dir.mkdir(parents=True, exist_ok=True)
-    report_md_path = reports_dir / "dataset_validation.md"
-
-    from datetime import datetime, timezone
-
-    report_lines = [
-        "# Dataset Validation Report",
-        "",
-        f"- **Validated Dataset**: `{d.as_posix()}`",
-        f"- **Validation Timestamp**: `{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}`",
-        f"- **Status**: `{'PASS - 100% INTEGRITY' if not errors else 'FAIL'}`",
-        "",
-        "## Split Breakdown & File Verification",
-        "",
-        "| Split | Samples | Planes Size | Moves Size | Outcomes Size | Value Targets Size | Status |",
-        "| :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
-    ]
-
-    for rec in validation_records:
-        s_name = rec["split"]
-        s_n = rec["num_samples"]
-        planes_sz = (
-            f"{rec['files'].get('planes.bin', {}).get('actual_bytes', 0) / (1024 * 1024):.2f} MB"
-        )
-        moves_sz = f"{rec['files'].get('moves.bin', {}).get('actual_bytes', 0) / 1024:.1f} KB"
-        out_sz = f"{rec['files'].get('outcomes.bin', {}).get('actual_bytes', 0) / 1024:.1f} KB"
-        vt_sz = (
-            f"{rec['files'].get('value_targets.bin', {}).get('actual_bytes', 0) / (1024 * 1024):.2f} MB"
-            if "value_targets.bin" in rec["files"]
-            else "N/A"
-        )
-        s_status = (
-            "VALID" if all(f.get("valid", False) for f in rec["files"].values()) else "MISMATCH"
-        )
-        report_lines.append(
-            f"| **{s_name}** | {s_n:,} | {planes_sz} | {moves_sz} | {out_sz} | {vt_sz} | {s_status} |"
-        )
-
-    if manifest_data:
-        totals = manifest_data.get("consolidated_totals", {})
-        report_lines.extend(
-            [
-                "",
-                "## Source Composition & Semantics",
-                "",
-                f"- **Total Unified Samples**: {totals.get('total_unified_positions', 0):,}",
-                f"- **Master-Game Samples**: {totals.get('master_game_positions', 0):,} ({totals.get('master_ratio', 0) * 100:.2f}%)",
-                f"- **Tactical Puzzle Samples**: {totals.get('tactical_puzzle_positions', 0):,} ({totals.get('tactics_ratio', 0) * 100:.2f}%)",
-                f"- **Cross-Split Leakage**: `{manifest_data.get('leakage_verification', {}).get('status', 'PASS')}`",
-                f"- **Evaluation Independence**: `{manifest_data.get('evaluation_independence', {}).get('status', 'PASS')}`",
-            ]
-        )
-
-    if errors:
-        report_lines.extend(["", "## Validation Errors", ""])
-        for e in errors:
-            report_lines.append(f"- {e}")
-
-    report_md_path.write_text("\n".join(report_lines) + "\n", encoding="utf-8")
-
-    if not errors:
-        console.print(
-            f"[bold green]Dataset '{d.name}' passed validation with 100% integrity.[/bold green]"
-        )
-        console.print(f"[dim]Validation report written to {report_md_path}[/dim]")
-        return 0
-    else:
-        console.print(
-            f"[bold red]Dataset '{d.name}' failed validation with {len(errors)} error(s):[/bold red]"
-        )
-        for e in errors:
-            console.print(f"  [red]- {e}[/red]")
-        console.print(f"[dim]Validation failure report written to {report_md_path}[/dim]")
+    if not overall_pass:
+        console.print(f"[bold red]Dataset '{d.name}' FAILED validation.[/bold red]")
         return 1
+    if incomplete and not args.allow_incomplete:
+        console.print(
+            f"[bold yellow]Dataset '{d.name}' passed executed checks but validation is "
+            "INCOMPLETE (skipped/bounded checks above). No definitive integrity claim is "
+            "made; re-run with --scan-planes full for exhaustive coverage, or pass "
+            "--allow-incomplete to accept an incomplete result.[/bold yellow]"
+        )
+        return 3
+    console.print(
+        f"[bold green]Dataset '{d.name}' passed {'definitive' if not incomplete else 'incomplete but accepted'} "
+        f"validation.[/bold green]"
+        + (f" Receipt: {receipt_path}" if receipt_path else "")
+        + (f" ({RECEIPT_NAME} binds these results to the exact validated bytes.)" if receipt_path else "")
+    )
+    return 0
 
 
 def run_data_check_leakage(args: argparse.Namespace) -> int:
+    """Fail-closed leakage check between two splits (audit F-04).
+
+    Exit codes: 0 = definitively disjoint (exhaustive, all checks completed),
+    1 = leakage detected, 2 = check could not complete (missing data / errors),
+    3 = bounded scan only (no definitive result; requires --allow-bounded to
+    accept). A definitive "disjoint" claim is never printed after a skipped
+    or bounded check.
+    """
+    from python.data.dataset_validation import CheckStatus, check_split_integrity
+
     train_dir = Path(args.train_dir)
     val_dir = Path(args.val_dir)
     if not train_dir.is_dir():
@@ -1055,61 +1027,64 @@ def run_data_check_leakage(args: argparse.Namespace) -> int:
         console.print(
             f"[bold red]Train or Val directory not found: {train_dir} / {val_dir}[/bold red]"
         )
-        return 1
+        return 2
 
+    exhaustive = args.max_positions is None
     console.print(
-        f"[bold cyan]Checking Data Leakage between:[/] [white]{train_dir}[/] and [white]{val_dir}[/]"
+        f"[bold cyan]Checking Data Leakage between:[/] [white]{train_dir}[/] and [white]{val_dir}[/] "
+        f"({'exhaustive' if exhaustive else 'BOUNDED'})"
     )
 
-    # Check game IDs if available
-    tr_ids_p = train_dir / "game_ids.bin"
-    va_ids_p = val_dir / "game_ids.bin"
-    if tr_ids_p.is_file() and va_ids_p.is_file():
-        tr_ids = np.fromfile(tr_ids_p, dtype=np.uint64)
-        va_ids = np.fromfile(va_ids_p, dtype=np.uint64)
-        overlap = set(tr_ids).intersection(set(va_ids))
-        if overlap:
-            console.print(
-                f"[bold red]DATA LEAKAGE DETECTED! {len(overlap)} game IDs appear in both train and val splits![/bold red]"
-            )
-            return 1
+    try:
+        results = check_split_integrity(
+            train_dir,
+            val_dir,
+            exhaustive_states=exhaustive,
+            max_bounded_rows=args.max_positions or 2000,
+        )
+    except Exception as e:
+        console.print(f"[bold red]Leakage check failed to complete: {e}[/bold red]")
+        return 2
+
+    exit_code = 0
+    for r in results:
+        if r.status == CheckStatus.FAIL:
+            console.print(f"[bold red]FAIL[/bold red] {r.name}: {r.detail}")
+            exit_code = 1
+        elif r.status == CheckStatus.BOUNDED:
+            console.print(f"[yellow]BOUNDED[/yellow] {r.name}: {r.detail} (coverage: {r.coverage})")
+            exit_code = 3
+        elif r.status == CheckStatus.SKIPPED:
+            console.print(f"[yellow]SKIPPED[/yellow] {r.name}: {r.detail}")
+            exit_code = 2
         else:
+            console.print(f"[bold green]PASS[/bold green] {r.name}: {r.detail} ({r.coverage})")
+
+    if exit_code == 0:
+        console.print(
+            "[bold green]Result: splits are DEFINITIVELY disjoint under the checked identities "
+            "(exhaustive group-ID and encoded-state scans completed).[/bold green]"
+        )
+    elif exit_code == 3:
+        if args.allow_bounded:
             console.print(
-                f"[bold green]Zero Game ID overlap detected across {len(tr_ids):,} train and {len(va_ids):,} val positions.[/bold green]"
+                "[bold yellow]Result: bounded scan found no overlap, but this is NOT an "
+                "exhaustive result; no definitive disjoint claim is made (--allow-bounded).[/bold yellow]"
             )
-
-    # Check planes hash samples (first 1000 positions sample check)
-    tr_planes_p = train_dir / "planes.bin"
-    va_planes_p = val_dir / "planes.bin"
-    if tr_planes_p.is_file() and va_planes_p.is_file():
-        try:
-            tr_m = json.loads((train_dir / "metadata.json").read_text(encoding="utf-8"))
-            va_m = json.loads((val_dir / "metadata.json").read_text(encoding="utf-8"))
-            max_pos = getattr(args, "max_positions", 2000)
-            n_tr = min(max_pos, tr_m.get("num_samples", 0))
-            n_va = min(max_pos, va_m.get("num_samples", 0))
-            if n_tr > 0 and n_va > 0:
-                tr_mm = np.memmap(tr_planes_p, dtype=np.float32, mode="r", shape=(n_tr, 19, 8, 8))
-                va_mm = np.memmap(va_planes_p, dtype=np.float32, mode="r", shape=(n_va, 19, 8, 8))
-
-                tr_hashes = set(hashlib.md5(tr_mm[i].tobytes()).hexdigest() for i in range(n_tr))
-                va_hashes = set(hashlib.md5(va_mm[i].tobytes()).hexdigest() for i in range(n_va))
-                overlap_p = tr_hashes.intersection(va_hashes)
-                if overlap_p:
-                    console.print(
-                        f"[bold yellow]Warning: {len(overlap_p)} identical position plane states found between train/val sample.[/bold yellow]"
-                    )
-                else:
-                    console.print(
-                        "[bold green]Zero position sample overlap found between train and val splits.[/bold green]"
-                    )
-        except Exception as e:
-            console.print(f"[dim]Deep plane check skipped: {e}[/dim]")
-
-    console.print(
-        "[bold green]Leakage check complete: Train and Validation datasets are properly disjoint.[/bold green]"
-    )
-    return 0
+            return 0
+        console.print(
+            "[bold yellow]Result: INCOMPLETE — the encoded-state scan was bounded. Pass --allow-bounded "
+            "to accept a bounded result, or run without --max-positions for the exhaustive scan.[/bold yellow]"
+        )
+    elif exit_code == 2:
+        console.print(
+            "[bold red]Result: INCOMPLETE — a required check could not run. No disjoint claim is made.[/bold red]"
+        )
+    else:
+        console.print(
+            "[bold red]Result: LEAKAGE DETECTED — the splits share group IDs and/or encoded states.[/bold red]"
+        )
+    return exit_code
 
 
 def run_data_merge(args: argparse.Namespace) -> int:
@@ -1155,22 +1130,23 @@ def run_data_merge(args: argparse.Namespace) -> int:
 
 
 def run_data_split(args: argparse.Namespace) -> int:
-    in_dir = Path(args.input) if Path(args.input).is_absolute() else (REPO_ROOT / args.input)
-    out_dir = Path(args.output) if Path(args.output).is_absolute() else (REPO_ROOT / args.output)
-
-    if not in_dir.is_dir():
-        console.print(f"[bold red]Input directory not found: {in_dir}[/bold red]")
-        return 1
-
+    # This command has never implemented an actual record split; historically it
+    # silently created empty train/val directories (audit F-04 section 8).
+    # Failing loudly instead of producing a "successful" no-op.
     console.print(
-        f"[bold cyan]Splitting {in_dir} (val_ratio={args.val_ratio}) into {out_dir}...[/bold cyan]"
+        Panel(
+            "[bold red]`data split` is not implemented.[/bold red] It previously created only "
+            "empty train/val directories without copying any records, which could be mistaken "
+            "for a completed split. Use a real builder instead:\n\n"
+            "  [bold yellow]zeropawn data build --pgn <pgn> --output-dir <dir>[/bold yellow] "
+            "(98/2 game-hash split), or\n"
+            "  [bold yellow]zeropawn data build-tactics --csv <csv> --output-dir <dir>[/bold yellow]",
+            title="[bold red]Unimplemented Operation[/bold red]",
+            box=box.ROUNDED,
+            border_style="red",
+        )
     )
-    # Copy or repartition
-    out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "train").mkdir(parents=True, exist_ok=True)
-    (out_dir / "val").mkdir(parents=True, exist_ok=True)
-    console.print(f"[bold green]Dataset split created at {out_dir}[/bold green]")
-    return 0
+    return 2
 
 
 def run_data_build_syzygy(args: argparse.Namespace) -> int:

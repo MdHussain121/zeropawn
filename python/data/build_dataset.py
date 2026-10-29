@@ -35,6 +35,12 @@ if str(_repo_root) not in sys.path:
 import python  # noqa: F401  (ensures zeropawn_cpp + DLL paths)
 import zeropawn_cpp
 from python.cli.common import setup_logging
+from python.data.dataset_contract import (
+    SCHEMA_VERSION,
+    BuildRecord,
+    detect_git_commit,
+    sha256_file,
+)
 from python.common.progress import (
     artifacts_list,
     banner,
@@ -56,15 +62,29 @@ def hash_game_id(game_id: str) -> int:
     return int(h[:16], 16)
 
 
-def extract_game_id(game: chess.pgn.Game) -> str:
-    """Extract game ID from Site URL or create a deterministic string."""
+def extract_game_id(game: chess.pgn.Game, mainline_uci: list[str] | None = None) -> str:
+    """Extract a stable, collision-resistant game identity.
+
+    Sources with a URL ``Site`` header use the URL's last path segment (stable
+    source ID). Otherwise the identity combines the game headers with a digest
+    of the canonical mainline content, so distinct games sharing the same
+    date and player names (audit F-03) no longer collapse into one group while
+    genuinely identical duplicate games still resolve to the same identity.
+
+    ``mainline_uci`` is the ordered UCI move list of the game's mainline; when
+    omitted (legacy callers without move context) the ambiguous headers-only
+    fallback is returned unchanged.
+    """
     site = game.headers.get("Site", "")
     if site.startswith("http"):
         return site.rstrip("/").split("/")[-1]
     w = game.headers.get("White", "W")
     b = game.headers.get("Black", "B")
     d = game.headers.get("Date", "D")
-    return f"{d}_{w}_{b}"
+    if mainline_uci is None:
+        return f"{d}_{w}_{b}"
+    content_digest = hashlib.sha256(" ".join(mainline_uci).encode("utf-8")).hexdigest()[:16]
+    return f"{d}_{w}_{b}#{content_digest}"
 
 
 def parse_result(result_str: str) -> int | None:
@@ -85,7 +105,7 @@ VALID_OUTCOMES: tuple[int, ...] = (0, 1, 2, OUTCOME_UNAVAILABLE)
 
 
 class PositionData:
-    __slots__ = ("planes", "move_idx", "outcome", "game_id", "ply", "pos_hash")
+    __slots__ = ("planes", "move_idx", "outcome", "game_id", "ply", "pos_hash", "state_key")
 
     def __init__(
         self,
@@ -95,6 +115,7 @@ class PositionData:
         game_id: int,
         ply: int,
         pos_hash: int,
+        state_key: bytes | None = None,
     ) -> None:
         if outcome not in VALID_OUTCOMES:
             raise ValueError(f"Invalid outcome {outcome}: must be one of {VALID_OUTCOMES}")
@@ -104,6 +125,13 @@ class PositionData:
         self.game_id = game_id
         self.ply = ply
         self.pos_hash = pos_hash
+        # Exact serialized-state identity: MD5 of the plane bytes. The C++
+        # engine hash distinguishes rule state the 19-plane encoder renders
+        # identically, so val dedup MUST key on the serialized bytes or
+        # identical encoded states survive across splits (audit finding).
+        self.state_key = state_key if state_key is not None else hashlib.md5(
+            np.ascontiguousarray(planes).tobytes()
+        ).digest()
 
 
 def process_pgn_game(game: chess.pgn.Game) -> tuple[int, bool, list[PositionData]]:
@@ -112,7 +140,10 @@ def process_pgn_game(game: chess.pgn.Game) -> tuple[int, bool, list[PositionData
     Returns:
         (game_id_hash, is_val, list of PositionData)
     """
-    game_id_str = extract_game_id(game)
+    # Snapshot the canonical mainline first so the fallback game identity can
+    # bind to game content (collision-resistant, audit F-03).
+    mainline_uci = [move.uci() for move in game.mainline_moves()]
+    game_id_str = extract_game_id(game, mainline_uci)
     game_id = hash_game_id(game_id_str)
     # Deterministic 98% train / 2% val split by game ID hash
     is_val = (game_id % 100) < 2
@@ -125,8 +156,7 @@ def process_pgn_game(game: chess.pgn.Game) -> tuple[int, bool, list[PositionData
     positions: list[PositionData] = []
     cpp_game = zeropawn_cpp.ChessGame()
 
-    for ply_num, move in enumerate(game.mainline_moves()):
-        uci_move = move.uci()
+    for ply_num, uci_move in enumerate(mainline_uci):
         planes = zeropawn_cpp.encode_state(cpp_game)
         move_idx = zeropawn_cpp.move_to_index(cpp_game, uci_move)
 
@@ -297,12 +327,20 @@ def build_binary_dataset(
 
     train_chunk: list[PositionData] = []
     candidate_val_positions: list[PositionData] = []
-    train_hashes: set[int] = set()
+    # Serialized-state identity of every accepted train position: val dedup
+    # keys on the exact encoded bytes, not the C++ engine hash (which can
+    # distinguish states the encoder renders identically).
+    train_state_keys: set[bytes] = set()
 
     train_games_count = 0
     val_games_count = 0
     total_games_seen = 0
     n_train = 0
+    # Exact-duplicate game handling (audit F-03): games with identical content
+    # identity are processed once; conflicting results are counted, never mixed.
+    seen_games: dict[int, str] = {}
+    duplicate_games = 0
+    conflicting_duplicate_games = 0
 
     try:
         with (
@@ -330,13 +368,22 @@ def build_binary_dataset(
                     if not pos_list:
                         continue
 
+                    res_raw = game.headers.get("Result", "")
+                    if game_id in seen_games:
+                        if seen_games[game_id] == res_raw:
+                            duplicate_games += 1
+                        else:
+                            conflicting_duplicate_games += 1
+                        continue
+                    seen_games[game_id] = res_raw
+
                     if is_val:
                         val_games_count += 1
                         candidate_val_positions.extend(pos_list)
                     else:
                         train_games_count += 1
                         for p in pos_list:
-                            train_hashes.add(p.pos_hash)
+                            train_state_keys.add(p.state_key)
                         train_chunk.extend(pos_list)
                         n_train += len(pos_list)
 
@@ -394,15 +441,27 @@ def build_binary_dataset(
             "dtype_outcomes": "uint8",
             "dtype_game_ids": "uint64",
             "dtype_plies": "int16",
+            "schema_version": SCHEMA_VERSION,
+            "role": "games_wdl",
+            "label_semantics": {
+                "role": "games_wdl",
+                "outcome_encoding": "mover perspective: 0=win, 1=draw, 2=loss, 255=masked",
+                "wdl_supervised": True,
+            },
+            "game_identity_rule": (
+                "sha256 game identity: Site URL last segment when present, else "
+                "Date_White_Black + sha256(mainline UCI) digest (audit F-03)"
+            ),
         }
         with open(train_dir / "metadata.json", "w", encoding="utf-8") as f:
             json.dump(train_metadata, f, indent=2)
 
-        # Deduplicate validation positions against training positions
+        # Deduplicate validation positions against training positions by the
+        # exact serialized state identity.
         final_val_positions: list[PositionData] = []
         removed_count = 0
         for pos in candidate_val_positions:
-            if pos.pos_hash in train_hashes:
+            if pos.state_key in train_state_keys:
                 removed_count += 1
             else:
                 final_val_positions.append(pos)
@@ -450,6 +509,17 @@ def build_binary_dataset(
             "dtype_outcomes": "uint8",
             "dtype_game_ids": "uint64",
             "dtype_plies": "int16",
+            "schema_version": SCHEMA_VERSION,
+            "role": "games_wdl",
+            "label_semantics": {
+                "role": "games_wdl",
+                "outcome_encoding": "mover perspective: 0=win, 1=draw, 2=loss, 255=masked",
+                "wdl_supervised": True,
+            },
+            "game_identity_rule": (
+                "sha256 game identity: Site URL last segment when present, else "
+                "Date_White_Black + sha256(mainline UCI) digest (audit F-03)"
+            ),
             "candidate_val_positions": len(candidate_val_positions),
             "dedup_removed_positions": removed_count,
         }
@@ -481,9 +551,59 @@ def build_binary_dataset(
     pct_removed = (removed_count / max(1, len(candidate_val_positions))) * 100
     print(f"Validation positions removed:    {removed_count} ({pct_removed:.2f}%)")
     print(f"Final validation positions:      {n_val_final}")
+    print(f"Duplicate games skipped:         {duplicate_games}")
+    print(f"Conflicting duplicate games:     {conflicting_duplicate_games}")
     print("=" * 60 + "\n")
 
-    del candidate_val_positions, final_val_positions, train_hashes
+    # Provenance build record (audit F-04 Layer C): binds this build to its
+    # exact source bytes, configuration, measured counts, and output hashes.
+    if isinstance(pgn_path_or_stream, (str, Path)):
+        src_path = Path(pgn_path_or_stream)
+        source_identity: dict[str, Any] = {
+            "path": str(src_path),
+            "sha256": sha256_file(src_path),
+            "size": src_path.stat().st_size,
+        }
+    else:
+        source_identity = {"kind": "TextIO stream (not hashable)"}
+
+    output_hashes: dict[str, dict[str, str]] = {"train": {}, "val": {}}
+    for split_name, split_dir in (("train", train_dir), ("val", val_dir)):
+        for array_file in sorted(split_dir.glob("*.bin")) + [split_dir / "metadata.json"]:
+            if array_file.is_file():
+                output_hashes[split_name][array_file.name] = sha256_file(array_file)
+
+    BuildRecord(
+        builder="python.data.build_dataset.build_binary_dataset",
+        source=source_identity,
+        config={
+            "split_rule": "hash_game_id(game_id) % 100 < 2 -> val, else train",
+            "val_dedup": "val positions whose exact serialized-state identity (MD5 of encoded planes) occurs in train are dropped",
+            "max_games": max_games,
+            "chunk_size": chunk_size,
+        },
+        label_semantics={
+            "role": "games_wdl",
+            "outcome_encoding": "mover perspective: 0=win, 1=draw, 2=loss, 255=masked",
+            "wdl_supervised": True,
+            "outcome_source": "game Result header mapped to the side to move at each ply",
+        },
+        counts={
+            "total_games_seen": total_games_seen,
+            "train_games": train_games_count,
+            "val_games": val_games_count,
+            "train_positions": n_train,
+            "candidate_val_positions": len(candidate_val_positions),
+            "dedup_removed_val_positions": removed_count,
+            "final_val_positions": n_val_final,
+            "duplicate_games_skipped": duplicate_games,
+            "conflicting_duplicate_games_skipped": conflicting_duplicate_games,
+        },
+        outputs=output_hashes,
+        git_commit=detect_git_commit(),
+    ).write(out_dir)
+
+    del candidate_val_positions, final_val_positions, train_state_keys
     gc.collect()
 
     return n_train, n_val_final, removed_count

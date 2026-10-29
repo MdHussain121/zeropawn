@@ -421,6 +421,8 @@ class ReplayBuffer:
         tactical_csv_path: Optional[Union[str, Path]] = None,
         tactical_mix: float = 0.12,
         tactical_cache_size: int = 20_000,
+        data_role: Optional[str] = None,
+        allow_uncertified_data: bool = False,
     ) -> None:
         self.buffer_dir = Path(buffer_dir)
         self.buffer_dir.mkdir(parents=True, exist_ok=True)
@@ -435,6 +437,8 @@ class ReplayBuffer:
         self.final_human_mix = final_human_mix
         self.taper_steps = taper_steps
         self.human_cache_size = human_cache_size
+        self.data_role = data_role
+        self.allow_uncertified_data = allow_uncertified_data
         self.gpu_device: Optional[torch.device] = (
             torch.device(gpu_device) if gpu_device is not None else None
         )
@@ -908,6 +912,29 @@ class ReplayBuffer:
             except Exception:
                 pass
         if (p / "metadata.json").exists():
+            # Consumption gate (audit F-04/F-01): the human replay data must
+            # satisfy its declared role and match a passing validation receipt
+            # before a single position is ingested.
+            from python.data.dataset_validation import require_validated_dataset
+
+            gate = require_validated_dataset(
+                p,
+                expected_role=self.data_role,
+                allow_uncertified=self.allow_uncertified_data,
+                deep=True,
+                consumer="replay-buffer[human]",
+            )
+            role_name = gate.role.name if gate.role else "unclassified"
+            logger.info(
+                "Human data gate: role=%s certified=%s masked_fraction=%.4f samples=%d (%s)",
+                role_name,
+                gate.certified,
+                gate.masked_fraction,
+                gate.num_samples,
+                p,
+            )
+            for warning in gate.warnings:
+                logger.warning(warning)
             self.human_dataset = BinaryChessDataset(p)
             logger.info(f"Loaded human dataset with {len(self.human_dataset)} positions from {p}")
             self._load_human_cache(cache_size=cache_size, device=device)

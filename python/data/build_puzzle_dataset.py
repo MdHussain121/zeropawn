@@ -93,7 +93,18 @@ def build_puzzle_dataset(
     val_ratio: float = 0.1,
     seed: int = 42,
 ) -> Dict[str, Any]:
-    """Compile tactical puzzles into binary train and val datasets."""
+    """Compile tactical puzzles into binary train and val datasets.
+
+    Split integrity (audit F-08): assignment is by the deterministic
+    ``hash(PuzzleId)`` rule, so every row of a puzzle (including duplicate
+    PuzzleId rows) lands in the same split; the real source PuzzleId hash is
+    stored in ``game_ids.bin`` (not an ordinal); and the degenerate fallbacks
+    that duplicated an example across train and val are removed — a build that
+    cannot produce both splits fails explicitly.
+    """
+    from python.data.build_dataset import OUTCOME_UNAVAILABLE, hash_game_id
+    from python.data.dataset_contract import SCHEMA_VERSION, BuildRecord, detect_git_commit, sha256_file
+
     csv_path = Path(csv_path)
     output_dir = Path(output_dir)
     train_dir = output_dir / "train"
@@ -104,9 +115,13 @@ def build_puzzle_dataset(
     if not csv_path.exists():
         raise FileNotFoundError(f"Puzzle CSV not found at {csv_path}")
 
-    rng = np.random.RandomState(seed)
+    val_pct = int(round(val_ratio * 100))
+    if not (0 <= val_pct <= 99):
+        raise ValueError(f"val_ratio {val_ratio} outside [0.0, 0.99]")
+
     train_samples: List[Dict[str, Any]] = []
     val_samples: List[Dict[str, Any]] = []
+    rows_seen = 0
 
     with open(csv_path, "r", encoding="utf-8") as f:
         reader = csv.reader(f)
@@ -131,6 +146,7 @@ def build_puzzle_dataset(
 
         count = 0
         for row in reader:
+            rows_seen += 1
             if not row or len(row) <= max(fen_col, moves_col):
                 continue
 
@@ -189,19 +205,27 @@ def build_puzzle_dataset(
             # If a verified forced-mate label is added in future, set to [1.0, 0.0, 0.0]
             # with outcome=0 and a separate value_mask=1.0.
 
+            puzzle_id = row[id_col] if len(row) > id_col else ""
+            gid = hash_game_id(f"puzzle_{puzzle_id}") if puzzle_id else 0
+
             sample = {
                 "fen": puzzle_fen,
                 "planes": planes,
                 "move_idx": int(sol_idx),
-                "outcome": 1,
+                # Explicit policy-only semantics (audit F-08): a placeholder
+                # draw label is never written; masked outcomes make the role
+                # unambiguous to loaders and validators.
+                "outcome": OUTCOME_UNAVAILABLE,
                 "value_target": value_target,
                 "policy_dist": policy_dist,
                 "ply": int(board.fullmove_number * 2 - (1 if board.turn == chess.WHITE else 0)),
-                "puzzle_id": row[id_col] if len(row) > id_col else f"puz_{count}",
+                "puzzle_id": puzzle_id,
+                "gid": gid,
             }
 
-            # Split train / val
-            if rng.uniform() < val_ratio:
+            # Deterministic PuzzleId-family split (audit F-08): all rows of a
+            # PuzzleId land in the same split; no per-row RNG.
+            if gid % 100 < val_pct:
                 val_samples.append(sample)
             else:
                 train_samples.append(sample)
@@ -210,12 +234,13 @@ def build_puzzle_dataset(
             if max_positions is not None and count >= max_positions:
                 break
 
-    if not train_samples and val_samples:
-        train_samples.append(val_samples.pop())
-    if not val_samples and train_samples:
-        val_samples.append(train_samples[-1])
-    if not train_samples:
-        raise RuntimeError("No qualified tactical puzzle samples found to build dataset.")
+    if not train_samples or not val_samples:
+        raise RuntimeError(
+            "Cannot produce the required split structure: "
+            f"train={len(train_samples)} val={len(val_samples)} puzzles qualified "
+            f"(val_ratio={val_ratio}). Provide more puzzles or a different --val-ratio; "
+            "examples are never duplicated across splits."
+        )
 
     _write_dataset_split(train_dir, train_samples, "train")
     _write_dataset_split(val_dir, val_samples, "val")
@@ -225,8 +250,28 @@ def build_puzzle_dataset(
         "total_samples": len(train_samples) + len(val_samples),
         "train_samples": len(train_samples),
         "val_samples": len(val_samples),
+        "skipped_rows": rows_seen - count,
         "min_rating": min_rating,
     }
+    BuildRecord(
+        builder="python.data.build_puzzle_dataset.build_puzzle_dataset",
+        source={"path": str(csv_path), "sha256": sha256_file(csv_path)},
+        config={
+            "val_ratio": val_ratio,
+            "split_rule": f"hash_game_id('puzzle_'+PuzzleId) % 100 < {val_pct} -> val",
+            "min_rating": min_rating,
+            "max_rating": max_rating,
+            "max_positions": max_positions,
+            "seed_note": "seed retained for API compatibility; split is hash-based (no RNG)",
+        },
+        label_semantics={
+            "role": "policy_tactics",
+            "outcome_encoding": "255=masked (policy-only example)",
+            "wdl_supervised": False,
+        },
+        counts={k: v for k, v in summary.items() if k != "output_dir"},
+        git_commit=detect_git_commit(),
+    ).write(output_dir)
     logger.info("Built tactical puzzle dataset: %s", summary)
     return summary
 
@@ -256,7 +301,7 @@ def _write_dataset_split(split_dir: Path, samples: List[Dict[str, Any]], split_n
         planes_mm[i] = s["planes"]
         moves_mm[i] = np.int16(s["move_idx"])
         outcomes_mm[i] = np.uint8(s["outcome"])
-        game_ids_mm[i] = np.uint64(i + 1)
+        game_ids_mm[i] = np.uint64(s["gid"])
         plies_mm[i] = np.int16(s["ply"])
         val_targets_mm[i] = s["value_target"]
         policy_targets_mm[i] = s["policy_dist"]
@@ -274,6 +319,14 @@ def _write_dataset_split(split_dir: Path, samples: List[Dict[str, Any]], split_n
         "planes_shape": [19, 8, 8],
         "split": split_name,
         "kind": "tactics_puzzles",
+        "schema_version": "1.1",
+        "role": "policy_tactics",
+        "label_semantics": {
+            "role": "policy_tactics",
+            "outcome_encoding": "255=masked (policy-only example)",
+            "wdl_supervised": False,
+        },
+        "game_identity_rule": "hash_game_id('puzzle_'+PuzzleId); source PuzzleId family preserved",
     }
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)

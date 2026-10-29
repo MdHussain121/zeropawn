@@ -7,6 +7,7 @@ a strict download size threshold (max 30 GB without explicit approval).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import re
 import shutil
 import sys
@@ -118,8 +119,24 @@ def download_file(
     allow_over_30gb: bool = False,
     timeout: float = 60.0,
 ) -> Path:
-    """Download a file with resume support and size limit validation."""
+    """Download a file with validated resume support and size limit enforcement.
+
+    Completion contract (audit F-07):
+    - downloads go to a ``.part`` file and are published atomically only after
+      the expected byte count has been received;
+    - resumed requests must be answered with HTTP 206 and a ``Content-Range``
+      starting exactly at the resume offset — an ignored Range (HTTP 200)
+      restarts from zero, an invalid 206 aborts;
+    - a body shorter than the expected size is never published;
+    - the SHA-256 of the published file is recorded in a ``.sha256`` sidecar
+      plus a ``.provenance.json`` retrieval record.
+    """
+    import json as _json
+    from datetime import datetime, timezone
+
+    destination = Path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
+    part_dest = Path(str(destination) + ".part")
 
     remote_size = get_remote_file_size(url)
     print(f"Target URL: {url}")
@@ -140,51 +157,103 @@ def download_file(
             f"need at least {needed_bytes / 1e9:.2f} GB + 1 GB safety buffer."
         )
 
-    headers = {"User-Agent": "ZeroPawn/1.0"}
-    existing_bytes = 0
+    # Already-complete published file: trust it with a matching sidecar hash
+    # when one exists, otherwise only by exact size match.
     if destination.exists():
-        existing_bytes = destination.stat().st_size
-        if remote_size > 0 and existing_bytes == remote_size:
-            print(f"File already completely downloaded at {destination}")
-            return destination
-        if existing_bytes > 0:
-            print(f"Resuming download from byte {existing_bytes}...")
-            headers["Range"] = f"bytes={existing_bytes}-"
+        existing_size = destination.stat().st_size
+        sidecar = Path(str(destination) + ".sha256")
+        if remote_size > 0 and existing_size == remote_size:
+            if sidecar.is_file():
+                expected_hash = sidecar.read_text(encoding="utf-8").split()[0].strip()
+                actual_hash = _hash_file(destination)
+                if actual_hash != expected_hash:
+                    print(
+                        f"Existing file hash mismatch ({actual_hash[:12]}… != {expected_hash[:12]}…); "
+                        "redownloading."
+                    )
+                else:
+                    print(f"File already completely downloaded and hash-verified at {destination}")
+                    return destination
+            else:
+                print(f"File already completely downloaded at {destination}")
+                return destination
 
-    req = urllib.request.Request(url, headers=headers)
-    total_downloaded = existing_bytes
-    limit = (
-        max_bytes if max_bytes is not None else (remote_size if remote_size > 0 else float("inf"))
+    if part_dest.exists():
+        stale = part_dest.stat().st_size
+        if remote_size > 0 and stale > remote_size:
+            part_dest.unlink()
+            stale = 0
+        if stale:
+            print(f"Resuming download from byte {stale}...")
+
+    headers = {"User-Agent": "ZeroPawn/1.0"}
+    existing_bytes = part_dest.stat().st_size if part_dest.exists() else 0
+    if existing_bytes > 0:
+        headers["Range"] = f"bytes={existing_bytes}-"
+
+    expected_total: Optional[int] = (
+        max_bytes if max_bytes is not None else (remote_size if remote_size > 0 else None)
     )
 
+    hasher = hashlib.sha256()
+    total_downloaded = existing_bytes
     t0 = time.time()
     last_print = t0
 
-    mode = "ab" if existing_bytes > 0 else "wb"
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        resp_code = getattr(resp, "code", getattr(resp, "status", None))
-        if isinstance(resp_code, int) and resp_code == 200 and existing_bytes > 0:
-            # Server sent full response (HTTP 200) instead of partial content (HTTP 206)
-            mode = "wb"
-            total_downloaded = 0
-            existing_bytes = 0
+    resumed = existing_bytes > 0
+    with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=timeout) as resp:
+        status = getattr(resp, "status", None)
+        if not isinstance(status, int):
+            status = getattr(resp, "code", None)
+        mode = "ab" if existing_bytes > 0 else "wb"
+        if existing_bytes > 0:
+            if status == 206:
+                content_range = resp.headers.get("Content-Range", "")
+                m = re.match(r"bytes (\d+)-(\d+)/(\d+|\*)", content_range)
+                if not m or int(m.group(1)) != existing_bytes:
+                    raise ValueError(
+                        f"Server returned an invalid Content-Range for resumed download "
+                        f"({content_range!r}, expected start {existing_bytes}); aborting."
+                    )
+                if m.group(3) != "*":
+                    remote_size = int(m.group(3))
+                    if expected_total is None or expected_total == max_bytes:
+                        expected_total = remote_size
+            elif status == 200:
+                # Server ignored the Range request; restart from zero so the
+                # part file is never a mix of duplicate offset data.
+                print("Server ignored Range request (HTTP 200); restarting from byte 0.")
+                mode = "wb"
+                total_downloaded = 0
+                existing_bytes = 0
+                hasher = hashlib.sha256()
+            else:
+                raise ValueError(
+                    f"Unexpected HTTP status {status} for resumed download (expected 206 or 200)."
+                )
+        elif isinstance(status, int) and status not in (200, 206):
+            raise ValueError(f"Unexpected HTTP status {status} at download start.")
 
-        with open(destination, mode) as f_out:
-            while total_downloaded < limit:
-                remaining = int(limit - total_downloaded)
-                read_sz = min(chunk_size, remaining)
-                chunk = resp.read(read_sz)
+        with open(part_dest, mode) as f_out:
+            while expected_total is None or total_downloaded < expected_total:
+                if expected_total is not None:
+                    remaining = int(expected_total - total_downloaded)
+                    read_sz = min(chunk_size, remaining)
+                else:
+                    read_sz = chunk_size
+                chunk = resp.read(read_sz) if read_sz > 0 else None
                 if not chunk:
                     break
                 f_out.write(chunk)
+                hasher.update(chunk)
                 total_downloaded += len(chunk)
 
                 now = time.time()
                 if now - last_print >= 2.0:
                     elapsed = now - t0
-                    speed = (total_downloaded - existing_bytes) / elapsed if elapsed > 0 else 0
+                    base = existing_bytes if mode == "ab" else 0
+                    speed = (total_downloaded - base) / elapsed if elapsed > 0 else 0
                     pct = (total_downloaded / remote_size * 100) if remote_size > 0 else 0
-                    # In-place refresh only on a TTY; otherwise one plain line per update.
                     line = (
                         f"downloaded_mb={(total_downloaded / 1e6):.1f} "
                         f"total_mb={(remote_size / 1e6):.1f} "
@@ -201,8 +270,45 @@ def download_file(
                         print(f"[{time.strftime('%H:%M:%S')}] {line}", flush=True)
                     last_print = now
 
-    print(f"\nDownload finished: {total_downloaded / 1e6:.1f} MB saved to {destination}")
+    # Never publish a body that fell short of the expected byte count; the
+    # part file is kept so a later call can resume.
+    if expected_total is not None and total_downloaded < expected_total:
+        raise IOError(
+            f"Incomplete download: received {total_downloaded} of {expected_total} expected "
+            f"bytes. Nothing was published; partial data kept at {part_dest} for resume."
+        )
+
+    part_dest.replace(destination)
+
+    digest = hasher.hexdigest()
+    Path(str(destination) + ".sha256").write_text(f"{digest}  {destination.name}\n", encoding="utf-8")
+    Path(str(destination) + ".provenance.json").write_text(
+        _json.dumps(
+            {
+                "url": url,
+                "retrieved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "remote_size": remote_size,
+                "bytes_written": total_downloaded,
+                "resumed_from_byte": existing_bytes if resumed else 0,
+                "sha256": digest,
+                "expected_size_verified": expected_total == total_downloaded,
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    print(f"\nDownload finished and verified: {total_downloaded / 1e6:.1f} MB published to {destination}")
     return destination
+
+
+def _hash_file(path: Path, chunk_size: int = 4 * 1024 * 1024) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(chunk_size):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def main() -> None:
