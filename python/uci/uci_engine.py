@@ -126,10 +126,10 @@ class UCIEngine:
             logger.error("Failed to load model from %s: %s", path, e)
             return False
 
-    def _eval_callback(self, game: Any) -> Tuple[List[float], float]:
+    def _eval_callback(self, game: Any) -> Tuple[Any, float]:
         if self.model is None:
             num_actions = game.num_actions()
-            return ([1.0 / num_actions] * num_actions, 0.0)
+            return (np.full(num_actions, 1.0 / num_actions, dtype=np.float32), 0.0)
 
         # Encode the passed C++ game directly: it is a ChessGame carrying the
         # real move history, so the repetition plane matches training semantics.
