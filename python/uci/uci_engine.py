@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any, List, Optional, Tuple, Union
 
@@ -22,6 +23,7 @@ from python.cli.common import (
     setup_environment,
 )
 from python.model.chess_net import ChessNet
+from python.uci.time_management import SearchTimeManager, ThroughputKey, allocate_clock_ms
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +93,11 @@ class UCIEngine:
         # Game state and subtree reuse tracking
         self.game = self.zeropawn_cpp.ChessGame()
         self._lock = threading.Lock()
+        # Mode-aware time management (audit H-3): throughput observations are
+        # EWMA'd per (device, search_mode, batch_size); cold start uses a
+        # conservative per-configuration default instead of a hardcoded rate.
+        self.time_manager = SearchTimeManager()
+        self._last_search_ran = False
         self.last_engine_action: Optional[int] = None
         self.last_engine_move: Optional[str] = None
         self.prev_moves_at_search: Optional[List[str]] = None
@@ -124,8 +131,11 @@ class UCIEngine:
             num_actions = game.num_actions()
             return ([1.0 / num_actions] * num_actions, 0.0)
 
-        chess_g = self.zeropawn_cpp.ChessGame(game.get_fen())
-        planes = self.zeropawn_cpp.encode_state(chess_g)
+        # Encode the passed C++ game directly: it is a ChessGame carrying the
+        # real move history, so the repetition plane matches training semantics.
+        # The former FEN round-trip (ChessGame(game.get_fen())) erased history
+        # and pinned plane 18 to zero at play time (audit H-2).
+        planes = self.zeropawn_cpp.encode_state(game)
         t = torch.from_numpy(planes).unsqueeze(0).to(self.device)
         if self.device == "cuda":
             t = t.to(memory_format=torch.channels_last)
@@ -137,11 +147,14 @@ class UCIEngine:
                         p_logits, v_wdl = self.model(t)
                 else:
                     p_logits, v_wdl = self.model(t)
-            p_probs = torch.softmax(p_logits.float(), dim=-1).squeeze(0).cpu().numpy().tolist()
+            p_probs = torch.softmax(p_logits.float(), dim=-1).squeeze(0).cpu().numpy()
             v_probs = torch.softmax(v_wdl.float(), dim=-1).squeeze(0).cpu().numpy()
             scalar_val = float(v_probs[0] - v_probs[2])
 
-        return (p_probs, scalar_val)
+        # Return a float32 ndarray (not a Python list): the native binding has
+        # a memcpy fast path for arrays; .tolist() serialization cost the
+        # batched play-time path a measured ~2.4x in throughput (audit H-4).
+        return (p_probs.astype(np.float32), scalar_val)
 
     def _batched_eval_callback(self, batch_planes: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         n = int(batch_planes.shape[0])
@@ -174,13 +187,9 @@ class UCIEngine:
             uniform_policy = [1.0 / num_actions] * num_actions
             return [(uniform_policy, 0.0) for _ in games]
 
-        batch_planes = []
-        for g in games:
-            if hasattr(g, "get_fen"):
-                cg = self.zeropawn_cpp.ChessGame(g.get_fen())
-                batch_planes.append(self.zeropawn_cpp.encode_state(cg))
-            else:
-                batch_planes.append(self.zeropawn_cpp.encode_state(g))
+        # Encode the passed games directly (audit H-2): they are ChessGame
+        # objects carrying real move history — a FEN round-trip would erase it.
+        batch_planes = [self.zeropawn_cpp.encode_state(g) for g in games]
 
         batch_arr = np.stack(batch_planes)
         t = torch.from_numpy(batch_arr).to(self.device)
@@ -198,10 +207,9 @@ class UCIEngine:
             v_probs = torch.softmax(v_wdl.float(), dim=-1).cpu().numpy()
             scalar_vals = (v_probs[:, 0] - v_probs[:, 2]).astype(float)
 
-        results = []
-        for i in range(len(games)):
-            results.append((p_probs[i].tolist(), float(scalar_vals[i])))
-        return results
+        # Array returns (not .tolist() lists): the binding fast-paths numpy
+        # arrays; list serialization cost ~2.4x throughput at B=16 (audit H-4).
+        return [(p_probs[i], float(scalar_vals[i])) for i in range(len(games))]
 
     def _init_opening_book(self) -> None:
         try:
@@ -218,7 +226,14 @@ class UCIEngine:
             self.opening_book = None
 
     def search_and_respond(self, sims: int) -> str:
-        """Run MCTS search on current game state and output bestmove."""
+        """Run MCTS search on current game state and output bestmove.
+
+        Sets ``self._last_search_ran``: True only when an MCTS search actually
+        executed (time-management observations must ignore game-over and
+        opening-book short-circuits, whose near-zero elapsed time would poison
+        the throughput estimate).
+        """
+        self._last_search_ran = False
         self._require_serial_search(self.search_mode, "UCIEngine.search_and_respond")
         if self.game.is_game_over():
             self.mcts.reset_root()
@@ -255,6 +270,7 @@ class UCIEngine:
                     return book_move
 
         # Search with MCTS
+        self._last_search_ran = True
         self.prev_moves_at_search = list(self.prev_moves)
         res = self.mcts.search(self.game, sims, self._eval_callback, self._eval_batch_callback)
         best_action = res.best_action
@@ -421,7 +437,15 @@ class UCIEngine:
             elif idx < len(tokens) and tokens[idx] == "fen":
                 end_fen = moves_idx if moves_idx is not None else len(tokens)
                 fen_str = " ".join(tokens[idx + 1 : end_fen])
-                new_game = self.zeropawn_cpp.ChessGame(fen_str)
+                try:
+                    new_game = self.zeropawn_cpp.ChessGame(fen_str)
+                except ValueError as e:
+                    # Malformed or rule-illegal FEN (e.g. side not to move in
+                    # check): the native layer rejects it with ValueError
+                    # instead of crashing on king-capture move generation.
+                    # Keep the previous game state and stay alive.
+                    logger.error("Rejected invalid position FEN (%s): %s", e, fen_str)
+                    return True
                 current_fen = fen_str
             else:
                 new_game = self.zeropawn_cpp.ChessGame()
@@ -493,6 +517,11 @@ class UCIEngine:
                     arg_dict[k] = True
                     i += 1
 
+            # Time management (audit H-3): translate wall-clock budgets into a
+            # simulation count using the observed throughput for THIS device /
+            # mode / batch-size configuration (conservative default on the
+            # cold start), instead of the former hardcoded 400 sims/s.
+            tp_key = ThroughputKey.from_engine(self.device, self.search_mode, self.batch_size)
             if "nodes" in arg_dict:
                 try:
                     sims = max(10, int(arg_dict["nodes"]))
@@ -501,7 +530,7 @@ class UCIEngine:
             elif "movetime" in arg_dict:
                 try:
                     ms = float(arg_dict["movetime"])
-                    sims = max(10, min(10000, int((ms / 1000.0) * 400)))
+                    sims = max(10, min(10000, self.time_manager.sims_for_budget(tp_key, ms, "movetime")))
                 except ValueError:
                     pass
             else:
@@ -512,13 +541,24 @@ class UCIEngine:
                     try:
                         total_time_ms = float(arg_dict[time_key])
                         inc_ms = float(arg_dict.get(inc_key, 0.0))
-                        allocated_sec = (total_time_ms / 30000.0) + (inc_ms / 1000.0)
-                        allocated_sec = max(0.1, min(10.0, allocated_sec))
-                        sims = max(20, min(2000, int(allocated_sec * 400)))
+                        mtg = None
+                        if "movestogo" in arg_dict:
+                            try:
+                                mtg = max(1, int(float(arg_dict["movestogo"])))
+                            except ValueError:
+                                mtg = None
+                        allocated_ms = allocate_clock_ms(total_time_ms, inc_ms, mtg)
+                        sims = max(
+                            10,
+                            min(10000, self.time_manager.sims_for_budget(tp_key, allocated_ms, "clock")),
+                        )
                     except ValueError:
                         pass
 
+            t_search0 = time.perf_counter()
             self.search_and_respond(sims)
+            if getattr(self, "_last_search_ran", False):
+                self.time_manager.record(tp_key, sims, time.perf_counter() - t_search0)
 
         elif cmd == "stop":
             pass

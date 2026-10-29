@@ -26,6 +26,21 @@ ChessGame::ChessGame(const std::string& fen) : board_(chess::constants::STARTPOS
 bool ChessGame::set_fen(const std::string& fen) {
     chess::Board temp;
     if (!temp.setFen(fen)) return false;
+    // Required king invariants: the vendored parser accepts king-less and
+    // multi-king FENs (require_kings defaults to false), while every later
+    // code path (movegen, search) dereferences exactly one king per side.
+    if (temp.pieces(chess::PieceType::KING, chess::Color::WHITE).count() != 1 ||
+        temp.pieces(chess::PieceType::KING, chess::Color::BLACK).count() != 1) {
+        return false;
+    }
+    // Rule-illegal position guard (audit C-1): if the side NOT to move is
+    // already in check, move generation for the side to move emits king
+    // captures; applying one removes a king and the following move generation
+    // crashes (access violation). Such positions cannot arise from legal play,
+    // so reject them at the boundary instead of letting them reach search.
+    const chess::Color stm = temp.sideToMove();
+    const chess::Color other = ~stm;
+    if (temp.isAttacked(temp.kingSq(other), stm)) return false;
     board_ = temp;
     move_history_.clear();
     return true;

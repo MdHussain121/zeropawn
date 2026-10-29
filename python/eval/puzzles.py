@@ -188,8 +188,9 @@ class PuzzleEvaluator:
         mcts = zeropawn_cpp.MCTS(mcts_config)
 
         def eval_fn(game: zeropawn_cpp.Game):
-            chess_g = zeropawn_cpp.ChessGame(game.get_fen())
-            planes = zeropawn_cpp.encode_state(chess_g)
+            # Encode the passed C++ game directly (audit H-2): the former FEN
+            # round-trip erased move history and zeroed the repetition plane.
+            planes = zeropawn_cpp.encode_state(game)
             t = torch.from_numpy(planes).unsqueeze(0).to(self.device)
             if self.device == "cuda":
                 t = t.to(memory_format=torch.channels_last)
@@ -201,10 +202,11 @@ class PuzzleEvaluator:
             with torch.no_grad():
                 with autocast_ctx:
                     p_logits, v_wdl = self.model(t)
-                p_probs = torch.softmax(p_logits.float(), dim=-1).squeeze(0).cpu().numpy().tolist()
+                p_probs = torch.softmax(p_logits.float(), dim=-1).squeeze(0).cpu().numpy()
                 v_probs = torch.softmax(v_wdl.float(), dim=-1).squeeze(0).cpu().numpy()
                 scalar_val = float(v_probs[0] - v_probs[2])
-            return (p_probs, scalar_val)
+            # Array return (audit H-4): binding fast-paths numpy arrays.
+            return (p_probs.astype(np.float32), scalar_val)
 
         def batched_eval_fn(batch_planes: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
             n = int(batch_planes.shape[0])

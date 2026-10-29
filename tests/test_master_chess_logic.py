@@ -186,7 +186,9 @@ def test_move_encoding_decoding_roundtrip():
         "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
         "rnbqkbnr/pppp1ppp/8/4p3/6P1/5P2/PPPPP2P/RNBQKBNR b KQkq - 0 2",
         "4k3/4P3/8/8/8/8/3p4/4K3 w - - 0 1",
-        "4k3/4P3/8/8/8/8/3p4/4K3 b - - 0 1",
+        # NOTE: the former '4k3/4P3/8/8/8/8/3p4/4K3 b' entry is rule-illegal
+        # (White in check while Black is to move) and is rejected by set_fen
+        # since the C-1 fix; the 'w' variant above covers the same structure.
     ]
     for fen in fens:
         game = zeropawn_cpp.ChessGame(fen)

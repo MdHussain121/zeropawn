@@ -41,8 +41,10 @@ VALID_SEARCH_MODES = ("serial", "batched")
 def check_search_mode(search_mode: str) -> str:
     """Validate an explicit search-mode setting (default ``serial``).
 
-    The ``batched`` C++ path does not exist on this branch; requesting it
-    raises at use time. Unknown values raise immediately.
+    ``serial`` runs one leaf evaluation per simulation; ``batched`` routes
+    through the legacy ``MCTS.search_batched`` entry point (intra-search
+    batching, no subtree reuse — see audit M-2). Unknown values raise
+    immediately.
     """
     if search_mode not in VALID_SEARCH_MODES:
         raise ValueError(
@@ -480,8 +482,9 @@ class MatchRunner:
         return fens
 
     def _eval_callback(self, game: zeropawn_cpp.Game):
-        chess_g = zeropawn_cpp.ChessGame(game.get_fen())
-        planes = zeropawn_cpp.encode_state(chess_g)
+        # Encode the passed C++ game directly (audit H-2): it carries the real
+        # move history; the former FEN round-trip zeroed the repetition plane.
+        planes = zeropawn_cpp.encode_state(game)
         t = torch.from_numpy(planes).unsqueeze(0).to(self.device)
         if self.device == "cuda":
             t = t.to(memory_format=torch.channels_last)
@@ -495,11 +498,13 @@ class MatchRunner:
             with self._lock:
                 with autocast_ctx:
                     p_logits, v_wdl = self.model(t)
-            p_probs = torch.softmax(p_logits.float(), dim=-1).squeeze(0).cpu().numpy().tolist()
+            # Array return (audit H-4): the binding fast-paths numpy arrays;
+            # .tolist() serialization cost ~2.4x at B=16.
+            p_probs = torch.softmax(p_logits.float(), dim=-1).squeeze(0).cpu().numpy()
             v_probs = torch.softmax(v_wdl.float(), dim=-1).squeeze(0).cpu().numpy()
             scalar_val = float(v_probs[0] - v_probs[2])
 
-        return (p_probs, scalar_val)
+        return (p_probs.astype(np.float32), scalar_val)
 
     def _batched_eval_callback(self, batch_planes: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         n = int(batch_planes.shape[0])
@@ -530,11 +535,9 @@ class MatchRunner:
             return []
         batch_planes = []
         for g in games:
-            if hasattr(g, "get_fen"):
-                cg = zeropawn_cpp.ChessGame(g.get_fen())
-                batch_planes.append(zeropawn_cpp.encode_state(cg))
-            else:
-                batch_planes.append(zeropawn_cpp.encode_state(g))
+            # Encode the passed games directly (audit H-2): they are ChessGame
+            # objects with real move history — no FEN round-trip.
+            batch_planes.append(zeropawn_cpp.encode_state(g))
 
         batch_arr = np.stack(batch_planes)
         t = torch.from_numpy(batch_arr).to(self.device)
@@ -554,10 +557,9 @@ class MatchRunner:
             v_probs = torch.softmax(v_wdl.float(), dim=-1).cpu().numpy()
             scalar_vals = (v_probs[:, 0] - v_probs[:, 2]).astype(float)
 
-        results = []
-        for i in range(len(games)):
-            results.append((p_probs[i].tolist(), float(scalar_vals[i])))
-        return results
+        # Array returns (audit H-4): binding fast-paths numpy arrays; no
+        # per-leaf .tolist() serialization.
+        return [(p_probs[i], float(scalar_vals[i])) for i in range(len(games))]
 
     def _play_game_worker(
         self,

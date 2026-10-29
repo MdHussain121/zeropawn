@@ -73,6 +73,7 @@ public:
         int batch_size
     );
     size_t cache_size() const { return nn_cache_.size(); }
+    const MCTSConfig& get_config() const { return config_; }
 
     // Subtree reuse API
     bool advance_root(int my_action, int opp_action, const Game& new_state);

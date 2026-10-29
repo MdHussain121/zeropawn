@@ -36,6 +36,17 @@ logger = logging.getLogger(__name__)
 _WARNED_BOOK_PATHS: set[str] = set()
 
 
+class InferenceError(RuntimeError):
+    """A genuine leaf-evaluation failure (model/inference error), not a draw.
+
+    Raised into waiting simulations when a batched inference call fails, so a
+    transient CUDA/driver error aborts the affected search instead of silently
+    substituting uniform policies and 0.0 values (audit M-3). Shutdown wake-ups
+    use the same error so partially played games are discarded rather than
+    recorded with fabricated evaluations.
+    """
+
+
 def resolve_opening_book_path(book_path: Optional[Union[str, Path]] = None) -> str:
     """Find the best available opening book file across CWD and REPO_ROOT."""
     if book_path:
@@ -134,6 +145,7 @@ class WorkerBatchAggregator:
         self._window_wait_count = 0
         self.flush_timeout_count = 0
         self.flush_capacity_count = 0
+        self.inference_failure_count = 0
         self.total_gil_eval_sec = 0.0
         self.total_gil_wait_sec = 0.0
         self.total_gil_dispatch_sec = 0.0
@@ -157,7 +169,7 @@ class WorkerBatchAggregator:
             # ChessGame
             state = zeropawn_cpp.encode_state(game)
 
-        res_box: List[Any] = [None, None]  # [policy_list, scalar_val]
+        res_box: List[Any] = [None, None, None]  # [policy, scalar_val, error]
         evt = threading.Event()
 
         need_flush = False
@@ -187,8 +199,11 @@ class WorkerBatchAggregator:
         if not evt.wait(timeout=60):
             raise TimeoutError("Timed out waiting for batched inference result")
         t_after_wait = time.perf_counter()
-        res0, res1 = res_box[0], res_box[1]
+        res0, res1, err = res_box[0], res_box[1], res_box[2]
         t_end = time.perf_counter()
+
+        if err is not None:
+            raise InferenceError(f"Leaf evaluation failed: {err}") from err
 
         wait_elapsed = t_after_wait - t0
         gil_eval = (t_before_wait - t0) + (t_end - t_after_wait)
@@ -219,25 +234,39 @@ class WorkerBatchAggregator:
         threads can keep enqueueing. Kept name for API compatibility;
         callers must NOT hold ``self.lock`` when calling.
         """
-        t_flush0 = time.perf_counter()
         with self.lock:
             if not self.pending:
                 return
             batch = self.pending
             self.pending = []
             self.first_arrival_time = None
+        self._flush_batch(batch)
 
+    def _fail_batch(self, batch: List[Any], exc: Exception) -> None:
+        """Deliver an inference failure to every waiter in ``batch``.
+
+        Genuine failures abort the affected searches with ``InferenceError``
+        (audit M-3) instead of fabricating uniform policies and 0.0 values
+        inside a running search.
+        """
+        self.inference_failure_count += 1
+        for item in batch:
+            item[1][0] = None
+            item[1][1] = None
+            item[1][2] = exc
+            item[2].set()
+
+    def _flush_batch(self, batch: List[Any]) -> None:
+        """Evaluate one snapshot batch and deliver results to its waiters."""
+        t_flush0 = time.perf_counter()
         try:
             states = np.stack([item[0] for item in batch], axis=0)
             t_flush_pack = time.perf_counter() - t_flush0
             p_logits, w_logits, version = self.client.evaluate_leaves(states)
             t_unpack0 = time.perf_counter()
-        except Exception:
-            logger.exception("Batched inference RPC failed; waking %d waiters", len(batch))
-            for item in batch:
-                item[1][0] = np.full(4672, 1.0 / 4672, dtype=np.float32)
-                item[1][1] = 0.0
-                item[2].set()
+        except Exception as exc:
+            logger.exception("Batched inference RPC failed; failing %d waiters", len(batch))
+            self._fail_batch(batch, exc)
             return
         self.last_model_version = version
 
@@ -285,12 +314,9 @@ class WorkerBatchAggregator:
                 p_logits, w_logits, version = self.client.evaluate_leaves(states)
                 self.last_model_version = version
                 self.delivery_queue.put((batch, p_logits, w_logits, t_pack))
-            except Exception:
-                logger.exception("Batched inference failed in GPU worker loop; waking waiters")
-                for item in batch:
-                    item[1][0] = [1.0 / 4672] * 4672
-                    item[1][1] = 0.0
-                    item[2].set()
+            except Exception as exc:
+                logger.exception("Batched inference failed in GPU worker loop; failing waiters")
+                self._fail_batch(batch, exc)
             finally:
                 self.gpu_queue.task_done()
 
@@ -324,12 +350,9 @@ class WorkerBatchAggregator:
                     item[1][0] = policy
                     item[1][1] = float(scalar_vals[i])
                     item[2].set()
-            except Exception:
-                logger.exception("Unboxing failed in delivery worker loop; waking waiters")
-                for item in batch:
-                    item[1][0] = np.full(4672, 1.0 / 4672, dtype=np.float32)
-                    item[1][1] = 0.0
-                    item[2].set()
+            except Exception as exc:
+                logger.exception("Unboxing failed in delivery worker loop; failing waiters")
+                self._fail_batch(batch, exc)
             finally:
                 t_unpack = time.perf_counter() - t_unpack0
                 with self._window_lock:
@@ -407,11 +430,74 @@ class WorkerBatchAggregator:
         with self.lock:
             self.first_arrival_time = None
             for item in self.pending:
-                item[1][0] = np.full(4672, 1.0 / 4672, dtype=np.float32)
-                item[1][1] = 0.0
+                # Wake waiters with an explicit failure (not fabricated
+                # evaluations): half-played games are discarded by the game
+                # runner instead of recorded with uniform-policy garbage.
+                item[1][0] = None
+                item[1][1] = None
+                item[1][2] = InferenceError("WorkerBatchAggregator stopped before evaluation completed")
                 item[2].set()
             self.pending.clear()
             self.cond.notify_all()
+
+    def evaluate_planes_batch(self, planes: Any) -> Tuple[Any, Any]:
+        """Raw batch evaluator callback conforming to ``MCTS.search_batched``.
+
+        Receives an ``(n, state_size)`` float32 array of encoded leaf planes
+        and returns ``(policy (n, 4672) float32, values (n,) float32)``
+        (audit H-1). States are enqueued into the same batch pipeline as
+        :meth:`evaluate_game_state`, so legacy-batched searches share the
+        aggregator's single inference stream with serial searches.
+        """
+        planes = np.ascontiguousarray(planes, dtype=np.float32)
+        if planes.ndim != 2:
+            raise ValueError(
+                f"evaluate_planes_batch expects (n, state_size) planes, got shape {planes.shape}"
+            )
+        n = planes.shape[0]
+
+        res_boxes: List[Tuple[List[Any], threading.Event]] = []
+        full_batches: List[List[Any]] = []
+        with self.lock:
+            for i in range(n):
+                res_box: List[Any] = [None, None, None]
+                evt = threading.Event()
+                if not self.pending:
+                    self.first_arrival_time = time.perf_counter()
+                self.pending.append((planes[i], res_box, evt))
+                if len(self.pending) >= self.max_batch_size:
+                    if self.pipelined:
+                        full_batches.append(self.pending)
+                        self.pending = []
+                    else:
+                        batch = self.pending
+                        self.pending = []
+                        self.first_arrival_time = None
+                        full_batches.append(batch)
+                res_boxes.append((res_box, evt))
+            if not full_batches:
+                # Notify dispatcher so it can compute the remaining wait time
+                self.cond.notify()
+
+        if full_batches:
+            with self._window_lock:
+                self.flush_capacity_count += len(full_batches)
+            for batch in full_batches:
+                if self.pipelined:
+                    self.gpu_queue.put(batch)
+                else:
+                    self._flush_batch(batch)
+
+        for res_box, evt in res_boxes:
+            if not evt.wait(timeout=60):
+                raise TimeoutError("Timed out waiting for batched inference result")
+            err = res_box[2]
+            if err is not None:
+                raise InferenceError(f"Leaf evaluation failed: {err}") from err
+
+        policies = np.stack([np.asarray(rb[0], dtype=np.float32) for rb, _ in res_boxes], axis=0)
+        values = np.array([float(rb[1]) for rb, _ in res_boxes], dtype=np.float32)
+        return policies, values
 
 
 class SelfPlayGame:
@@ -649,8 +735,15 @@ class SelfPlayGame:
 
             # 3. MCTS Search (respect configured search_mode)
             if self.search_mode == "batched" and hasattr(self.mcts, "search_batched"):
+                # Legacy batched entry point (audit H-1): the binding requires
+                # four arguments — (game, sims, batch_size, batch_evaluator) —
+                # where the evaluator receives an (n, state_size) plane array
+                # and returns (policy (n, 4672), values (n,)).
                 search_result = self.mcts.search_batched(
-                    self.game, num_sims, self.aggregator.evaluate_game_state
+                    self.game,
+                    num_sims,
+                    max(1, int(self.aggregator.max_batch_size)),
+                    self.aggregator.evaluate_planes_batch,
                 )
             else:
                 search_result = self.mcts.search(
@@ -1069,7 +1162,10 @@ class SelfPlayWorker:
 
             try:
                 positions, summary = game.play_game()
-            except TimeoutError:
+            except (TimeoutError, InferenceError):
+                # Timed-out wait or failed inference: on shutdown this is the
+                # normal wake-up path (discard the partial game); otherwise the
+                # failure must surface instead of being silently swallowed.
                 if not self.running:
                     break
                 raise

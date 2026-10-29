@@ -42,7 +42,17 @@ PYBIND11_MODULE(zeropawn_cpp, m) {
     // ChessGame class
     py::class_<zeropawn::ChessGame, zeropawn::Game>(m, "ChessGame")
         .def(py::init<>())
-        .def(py::init<const std::string&>(), py::arg("fen"))
+        // FEN constructor: raise ValueError on malformed or rule-illegal FENs
+        // (e.g. side not to move already in check) instead of silently keeping
+        // a start-position board (audit C-1: invalid positions must not be
+        // silently transformed into different positions).
+        .def(py::init([](const std::string& fen) {
+            auto game = std::make_unique<zeropawn::ChessGame>();
+            if (!game->set_fen(fen)) {
+                throw py::value_error("Invalid or rule-illegal FEN: '" + fen + "'");
+            }
+            return game;
+        }), py::arg("fen"))
         .def("set_fen", &zeropawn::ChessGame::set_fen, py::arg("fen"))
         .def("get_fen", &zeropawn::ChessGame::get_fen)
         .def("legal_moves_uci", &zeropawn::ChessGame::legal_moves_uci)
@@ -205,6 +215,18 @@ PYBIND11_MODULE(zeropawn_cpp, m) {
         }, py::arg("game"), py::arg("num_simulations"), py::arg("evaluator"),
            py::arg("batch_evaluator") = py::none(), py::call_guard<py::gil_scoped_release>())
         .def("search_batched", [](zeropawn::MCTS& mcts, const zeropawn::Game& game, int num_simulations, py::object arg3, py::object arg4) {
+            // Legacy search_batched builds a fresh root per call and never
+            // touches the retained tree, so a reuse_tree config would be a
+            // silent no-op here (audit M-2). Refuse the unsupported
+            // combination explicitly; the internal-batched path (search()
+            // with config.batch_size > 1) supports subtree reuse.
+            if (mcts.get_config().reuse_tree) {
+                throw py::value_error(
+                    "search_batched does not support reuse_tree=true (legacy batched path builds a "
+                    "fresh root per call and silently ignores subtree reuse). Use the internal-batched "
+                    "path instead: set MCTSConfig.batch_size > 1 and call search() with the same "
+                    "MCTS instance.");
+            }
             py::function batch_fn;
             int batch_size = 16;
             if (py::isinstance<py::function>(arg3) && py::isinstance<py::int_>(arg4)) {
