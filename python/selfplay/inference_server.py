@@ -103,12 +103,20 @@ class InferenceServer:
         self._window_time_sec = 0.0
 
     def _create_model_from_checkpoint(self, path: str) -> nn.Module:
-        """Inspect checkpoint and construct appropriate network."""
+        """Inspect checkpoint and construct appropriate network.
+
+        Fails closed (Stage A §5): an unreadable or structurally invalid
+        checkpoint raises instead of silently constructing a random-init
+        ChessNet — a silent fallback here previously let runs proceed with
+        random weights while logging only an exception.
+        """
         try:
             ckpt = torch.load(path, map_location="cpu", weights_only=True)
-        except Exception:
-            logger.exception("Failed to load checkpoint %s; using default arch", path)
-            return ChessNet(num_blocks=12, num_filters=128)
+        except Exception as e:
+            raise RuntimeError(
+                f"Checkpoint '{path}' is unreadable or invalid: {e}. "
+                "Refusing to construct a random-init model (fail-closed)."
+            ) from e
         state_dict = (
             ckpt.get("model", ckpt.get("state_dict", ckpt)) if isinstance(ckpt, dict) else ckpt
         )

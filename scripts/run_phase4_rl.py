@@ -172,6 +172,8 @@ class Phase4Orchestrator:
         eval_sims: Optional[int] = None,
         promotion_min_games: int = 100,
         promotion_min_score: float = 0.55,
+        # ── Checkpoint provenance (Stage A §5) ────────────────────────────
+        allow_unverified_warm_start: bool = False,
         # ──────────────────────────────────────────────────────────────────
     ) -> None:
         self.max_hours = max_hours
@@ -441,6 +443,50 @@ class Phase4Orchestrator:
         self._active_checkpoint_path = (
             str(active_checkpoint) if active_checkpoint else "random_init"
         )
+        self.allow_unverified_warm_start = bool(allow_unverified_warm_start)
+        # P0-4 (Stage A §5): fail-closed warm-start provenance. A missing,
+        # unreadable, architecture-mismatched, unregistered, quarantined, or
+        # undesignated checkpoint stops the run before any model exists — the
+        # inference server must never silently fall back to random init.
+        # Resume of an existing RL checkpoint is validated by
+        # RLTrainer.load_checkpoint instead (registry designation applies to
+        # warm starts, not crash recovery).
+        self._warm_start_record: Optional[dict] = None
+        if active_checkpoint and resume_checkpoint is None:
+            from python.model.checkpoint_registry import validate_warm_start
+
+            try:
+                self._warm_start_record = validate_warm_start(
+                    active_checkpoint,
+                    repo_root=str(Path(__file__).resolve().parent.parent),
+                    allow_unverified=self.allow_unverified_warm_start,
+                )
+            except Exception as e:
+                raise RuntimeError(
+                    f"Refusing to start Phase 4 RL from '{active_checkpoint}': {e}"
+                ) from e
+            self._active_checkpoint_sha256 = self._warm_start_record["sha256"]
+            logger.info(
+                "[WARM-START] verified %s (sha256=%s, status=%s, role=%s)",
+                self._warm_start_record["path"],
+                self._active_checkpoint_sha256[:16],
+                self._warm_start_record["status"],
+                self._warm_start_record.get("role", "n/a"),
+            )
+        elif active_checkpoint:
+            # Crash-recovery resume: verify the checkpoint is readable before
+            # building anything on top of it.
+            if not Path(active_checkpoint).is_file():
+                raise RuntimeError(
+                    f"Refusing to resume: RL checkpoint '{active_checkpoint}' does not exist."
+                )
+            self._active_checkpoint_sha256 = None
+        else:
+            logger.warning(
+                "[WARM-START] base_checkpoint explicitly empty: starting from RANDOM "
+                "initialization. Unapproved for any strength-relevant evaluation."
+            )
+            self._active_checkpoint_sha256 = None
         # Auto-detect Syzygy tablebase if not explicitly disabled
         if self.tablebase_path is None:
             for candidate in ("data/syzygy", "syzygy", "/usr/share/syzygy"):
@@ -1694,7 +1740,20 @@ def main() -> None:
         "--base-checkpoint",
         type=str,
         default="models/checkpoints_scaled/best_model.pt",
-        help="Base warm-start checkpoint path",
+        help=(
+            "Base warm-start checkpoint path. Must exist, be readable, match the "
+            "12x128 architecture and be a designated warm start in "
+            "docs/checkpoint_registry.json, or the run fails closed."
+        ),
+    )
+    parser.add_argument(
+        "--allow-unverified-warm-start",
+        action="store_true",
+        help=(
+            "Explicit operator override to warm-start from a checkpoint that is "
+            "not a designated registry entry (logged as an override; use only "
+            "with a documented provisional selection)."
+        ),
     )
     parser.add_argument(
         "--device", type=str, default=None, help="Execution device (default: auto cuda/cpu)"
@@ -1824,6 +1883,7 @@ def main() -> None:
             log_dir=args.log_dir,
             checkpoint_dir=args.checkpoint_dir,
             base_checkpoint=args.base_checkpoint,
+            allow_unverified_warm_start=args.allow_unverified_warm_start,
             device=args.device,
             train_device=args.train_device,
             infer_device=args.infer_device,
@@ -1867,6 +1927,7 @@ def main() -> None:
             log_dir=args.log_dir,
             checkpoint_dir=args.checkpoint_dir,
             base_checkpoint=args.base_checkpoint,
+            allow_unverified_warm_start=args.allow_unverified_warm_start,
             device=args.device,
             train_device=args.train_device,
             infer_device=args.infer_device,
