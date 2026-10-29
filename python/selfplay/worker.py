@@ -35,6 +35,15 @@ logger = logging.getLogger(__name__)
 # Track books that have already logged warnings to prevent spamming across concurrent workers
 _WARNED_BOOK_PATHS: set[str] = set()
 
+# Per-leaf plane layouts by state size. The batch pipeline stores rank-3 planes
+# (the ``encode_state`` output shape) so ``np.stack`` yields the (N, C, H, W)
+# rank-4 tensor the inference server requires; flat rows would crash the CUDA
+# channels_last conversion (rank-2 tensor) in ``InferenceServer.predict_batch``.
+_PLANE_LAYOUTS: Dict[int, Tuple[int, int, int]] = {
+    1216: (19, 8, 8),  # chess
+    126: (3, 6, 7),  # connect4
+}
+
 
 class InferenceError(RuntimeError):
     """A genuine leaf-evaluation failure (model/inference error), not a draw.
@@ -445,9 +454,11 @@ class WorkerBatchAggregator:
 
         Receives an ``(n, state_size)`` float32 array of encoded leaf planes
         and returns ``(policy (n, 4672) float32, values (n,) float32)``
-        (audit H-1). States are enqueued into the same batch pipeline as
-        :meth:`evaluate_game_state`, so legacy-batched searches share the
-        aggregator's single inference stream with serial searches.
+        (audit H-1). Rows are reshaped to their rank-3 plane layout so the
+        shared batch pipeline produces the rank-4 tensor the inference server
+        requires (same convention as ``evaluate_game_state``); flat rows would
+        crash the CUDA channels_last conversion on a rank-2 tensor. Legacy-batched
+        searches share the aggregator's single inference stream with serial searches.
         """
         planes = np.ascontiguousarray(planes, dtype=np.float32)
         if planes.ndim != 2:
@@ -455,6 +466,13 @@ class WorkerBatchAggregator:
                 f"evaluate_planes_batch expects (n, state_size) planes, got shape {planes.shape}"
             )
         n = planes.shape[0]
+        layout = _PLANE_LAYOUTS.get(int(planes.shape[1]))
+        if layout is None:
+            raise ValueError(
+                f"evaluate_planes_batch: unknown state_size {planes.shape[1]}; "
+                f"known layouts: {sorted(_PLANE_LAYOUTS.items())}"
+            )
+        rows = planes.reshape(n, *layout)
 
         res_boxes: List[Tuple[List[Any], threading.Event]] = []
         full_batches: List[List[Any]] = []
@@ -464,7 +482,7 @@ class WorkerBatchAggregator:
                 evt = threading.Event()
                 if not self.pending:
                     self.first_arrival_time = time.perf_counter()
-                self.pending.append((planes[i], res_box, evt))
+                self.pending.append((rows[i], res_box, evt))
                 if len(self.pending) >= self.max_batch_size:
                     if self.pipelined:
                         full_batches.append(self.pending)
