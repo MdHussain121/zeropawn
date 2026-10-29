@@ -551,3 +551,40 @@ def test_orchestrator_eval_persistence_helpers(tmp_path):
     old_csv.write_text("timestamp,step\n1,2\n", encoding="utf-8")
     with pytest.raises(RuntimeError, match="archive"):
         orch._init_eval_csv()
+
+
+def test_match_runner_eval_callback_array_contract():
+    """MatchRunner serial eval callbacks return contiguous float32 ndarrays with
+    finite, probability-like outputs (Stage A §8; the native binding fast-paths
+    arrays — .tolist() returns are the historical 9-10% overhead)."""
+    import numpy as np
+    from types import SimpleNamespace
+
+    import zeropawn_cpp
+
+    runner = object.__new__(MatchRunner)
+    runner.model = ChessNet(num_blocks=1, num_filters=8)
+    runner.device = "cpu"
+    runner._lock = threading.Lock()
+
+    game = zeropawn_cpp.ChessGame()
+    policy, value = runner._eval_callback(game)
+    assert isinstance(policy, np.ndarray)
+    assert policy.dtype == np.float32
+    assert policy.shape == (4672,)
+    assert policy.flags["C_CONTIGUOUS"]
+    assert np.isfinite(policy).all()
+    assert isinstance(value, float) and -1.0 <= value <= 1.0
+
+    batch_policy, batch_values = runner._batched_eval_callback(
+        np.stack([zeropawn_cpp.encode_state(game)] * 3)
+    )
+    assert batch_policy.dtype == np.float32 and batch_policy.shape == (3, 4672)
+    assert batch_values.dtype == np.float32 and batch_values.shape == (3,)
+    assert np.isfinite(batch_policy).all() and np.isfinite(batch_values).all()
+
+    list_based = runner._eval_batch_callback([game, game])
+    assert len(list_based) == 2
+    for policy_item, _ in list_based:
+        assert isinstance(policy_item, np.ndarray)
+        assert policy_item.dtype == np.float32
