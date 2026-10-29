@@ -492,9 +492,10 @@ class GpuResidentDataLoader:
             )
             self._memmaps.append(outcomes_m)
 
-        # Tactics dataset: if no outcomes file exists but tactics_dir indicates
-        # tactical data, create synthetic outcomes array with 255 (unavailable)
-        # so tactics_mask works consistently when tactics_dir is set.
+        # Tactics mixing: when tactics_dir is set, build a synthetic in-memory
+        # outcomes array for masking. NEVER rewrite the dataset's own
+        # outcomes.bin — an earlier version overwrote the file in place with
+        # 255 (mode "r+"), silently destroying real WDL labels on disk.
         if (
             not val_targets_path.exists()
             and self.tactics_dir is not None
@@ -502,26 +503,17 @@ class GpuResidentDataLoader:
         ):
             outcomes_path = self.data_dir / "outcomes.bin"
             if not outcomes_path.exists():
-                # Create synthetic outcomes file with 255 (unavailable) for tactics
-                outcomes_m = np.memmap(
-                    self.data_dir / "outcomes.bin",
-                    dtype=np.uint8,
-                    mode="w+",
-                    shape=(self.num_samples,),
-                )
-                outcomes_m[:] = 255
-                self._memmaps.append(outcomes_m)
+                outcomes_m = np.full(self.num_samples, 255, dtype=np.uint8)
             else:
-                # If outcomes file already exists but tactics_dir indicates tactical,
-                # set all outcomes to 255 so tactics_mask picks them up correctly
-                outcomes_m = np.memmap(
-                    outcomes_path,
+                outcomes_m = np.array(
+                    np.memmap(
+                        outcomes_path,
+                        dtype=np.uint8,
+                        mode="r",
+                        shape=(self.num_samples,),
+                    ),
                     dtype=np.uint8,
-                    mode="r+",
-                    shape=(self.num_samples,),
                 )
-                outcomes_m[:] = 255
-                self._memmaps.append(outcomes_m)
 
         # Load separate tactics dataset and concatenate arrays if tactics_dir is set.
         # This fixes the critical bug where --tactics-dir was silently ignored in GPU mode.

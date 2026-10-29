@@ -138,6 +138,10 @@ class Phase4Orchestrator:
         stockfish_nodes: int = 1000,
         is_verify_mode: bool = False,
         skip_baseline_eval: bool = False,
+        data_role: Optional[str] = None,
+        allow_uncertified_data: bool = False,
+        allow_uncertified_eval: bool = False,
+        require_certified_eval: bool = True,
         gpu_cache_capacity: Optional[int] = 160_000,
         human_cache_size: int = 80_000,
         tablebase_path: Optional[str] = None,
@@ -198,6 +202,10 @@ class Phase4Orchestrator:
         self.num_concurrent_games = num_concurrent_games
         self.is_verify_mode = is_verify_mode
         self.skip_baseline_eval = skip_baseline_eval
+        self.data_role = data_role
+        self.allow_uncertified_data = allow_uncertified_data
+        self.allow_uncertified_eval = allow_uncertified_eval
+        self.require_certified_eval = require_certified_eval
         self.gpu_cache_capacity = gpu_cache_capacity
         self.human_cache_size = human_cache_size
         self.tablebase_path = tablebase_path
@@ -333,6 +341,19 @@ class Phase4Orchestrator:
                 break
         self.puzzle_csv_path = resolved_puzzle_path or Path(puzzle_csv_path)
         self.puzzle_certified = self._report_puzzle_certification()
+        if (
+            not self.puzzle_certified
+            and self.require_certified_eval
+            and not self.allow_uncertified_eval
+            and not self.is_verify_mode
+        ):
+            raise RuntimeError(
+                f"Refusing to run Phase 4 against an UNCERTIFIED evaluation puzzle set "
+                f"({self.puzzle_csv_path}): its certification manifest is missing, stale, or "
+                f"incomplete, so reported puzzle solve rates would not be trustworthy. "
+                f"Re-certify with scripts/check_puzzle_overlap.py, or pass "
+                f"--allow-uncertified-eval to run with uncertified evaluation explicitly."
+            )
         openings_p = Path(openings_path)
         if not openings_p.is_file() and (_repo_root / openings_p).is_file():
             openings_p = _repo_root / openings_p
@@ -412,6 +433,8 @@ class Phase4Orchestrator:
             create_new=self.reset_buffer,
             tactical_csv_path=self.tactical_csv_path,
             tactical_mix=self.tactical_mix,
+            data_role=self.data_role,
+            allow_uncertified_data=self.allow_uncertified_data,
         )
 
         # Detect resumable checkpoint if explicitly provided, else auto-resume from existing RL checkpoint if present.
@@ -629,30 +652,29 @@ class Phase4Orchestrator:
         os.replace(tmp, self._best_eval_state_path)
 
     def _report_puzzle_certification(self) -> bool:
-        """Log whether the eval puzzle set is certified disjoint from training data.
+        """Verify the eval puzzle set's certification before use (audit F-10).
 
-        A certified set is produced by scripts/check_puzzle_overlap.py, which writes a
-        ``<csv>.certified.json`` manifest next to the CSV after removing every puzzle
-        that also occurs in the tactics training data. Without that manifest the puzzle
-        solve rate (and the puzzle-decline safety trigger) may be measuring memorisation.
+        Delegates to :func:`python.data.eval_certification.verify_eval_certification`,
+        which re-checks the certification manifest against the CURRENT bytes of the
+        eval CSV and every recorded training source. A stale or incomplete
+        certification is reported as NOT certified; when ``require_certified_eval``
+        is set (default), the run refuses to start rather than evaluating against
+        an uncertified set.
         """
-        manifest = Path(str(self.puzzle_csv_path) + ".certified.json")
-        if not manifest.is_file():
+        from python.data.eval_certification import verify_eval_certification
+
+        certified, reasons, data = verify_eval_certification(self.puzzle_csv_path)
+        if not certified:
             logger.warning(
-                "[EVAL] Puzzle set %s is NOT certified disjoint from tactics training data. "
-                "Solve rates may be optimistic; run scripts/check_puzzle_overlap.py to build a "
-                "certified set.",
+                "[EVAL] Puzzle set %s is NOT certified: %s. Solve rates may measure "
+                "memorisation; re-certify with scripts/check_puzzle_overlap.py.",
                 self.puzzle_csv_path,
+                "; ".join(reasons),
             )
-            return False
-        try:
-            data = json.loads(manifest.read_text(encoding="utf-8"))
-        except Exception as exc:  # malformed manifest must not stop training
-            logger.warning("[EVAL] Unreadable puzzle certification manifest %s: %s", manifest, exc)
             return False
         logger.info(
             "[EVAL] Puzzle set %s certified: %s puzzles, overlap_in_output=%s, "
-            "source_overlap=%s/%s",
+            "source_overlap=%s/%s, output hash verified",
             self.puzzle_csv_path,
             data.get("output_puzzles"),
             data.get("overlap_in_output"),
@@ -1798,6 +1820,31 @@ def main() -> None:
         default=0.55,
         help="Minimum match score before best_eval.pt may be promoted (default: 0.55)",
     )
+    parser.add_argument(
+        "--data-role",
+        choices=("games_wdl", "policy_tactics", "endgame_syzygy", "unified"),
+        default=None,
+        help="Explicit role for the human replay dataset (default: from dataset metadata).",
+    )
+    parser.add_argument(
+        "--allow-uncertified-data",
+        action="store_true",
+        help="Consume human/tactic datasets without valid validation receipts "
+        "(loud UNCERTIFIED warning; role/label invariants still apply).",
+    )
+    parser.add_argument(
+        "--allow-uncertified-eval",
+        action="store_true",
+        help="Run with an uncertified evaluation puzzle set (results are NOT certified).",
+    )
+    parser.add_argument(
+        "--no-require-certified-eval",
+        dest="require_certified_eval",
+        action="store_false",
+        default=True,
+        help="Do not abort when the evaluation puzzle set is uncertified "
+        "(equivalent to --allow-uncertified-eval for the startup gate).",
+    )
     args = parser.parse_args()
 
     if args.test_verify:
@@ -1842,6 +1889,10 @@ def main() -> None:
             eval_sims=args.eval_sims,
             promotion_min_games=args.promotion_min_games,
             promotion_min_score=args.promotion_min_score,
+            data_role=args.data_role,
+            allow_uncertified_data=args.allow_uncertified_data,
+            allow_uncertified_eval=args.allow_uncertified_eval,
+            require_certified_eval=args.require_certified_eval,
         )
         sys.exit(orchestrator.run())
     else:
@@ -1885,6 +1936,10 @@ def main() -> None:
             eval_sims=args.eval_sims,
             promotion_min_games=args.promotion_min_games,
             promotion_min_score=args.promotion_min_score,
+            data_role=args.data_role,
+            allow_uncertified_data=args.allow_uncertified_data,
+            allow_uncertified_eval=args.allow_uncertified_eval,
+            require_certified_eval=args.require_certified_eval,
         )
         sys.exit(orchestrator.run())
 

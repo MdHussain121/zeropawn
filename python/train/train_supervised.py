@@ -464,6 +464,9 @@ def train_supervised(
     micro_batch_size: Optional[int] = None,
     gradient_accumulation_steps: Optional[int] = None,
     tactics_dir: Optional[str | Path] = None,
+    data_role: Optional[str] = None,
+    allow_uncertified_data: bool = False,
+    verify_identity: str = "full",
     **kwargs: Any,
 ) -> dict[str, float]:
     """Execute supervised training loop.
@@ -471,6 +474,31 @@ def train_supervised(
     ``seed`` sets Python/numpy/torch RNGs once up front (None = unseeded,
     today's behavior). Seeding is initialization only; no training math changes.
     """
+    # ── Consumption gate (audit F-04/F-01): refuse invalid, stale, or
+    #    uncertified datasets BEFORE any loader/optimizer work. Each dataset
+    #    must satisfy its declared role (a WDL-supervised game dataset whose
+    #    every value label is masked fails here), and the loaded bytes must
+    #    match a passing validation receipt unless the caller explicitly opts
+    #    out with allow_uncertified_data.
+    from python.data.dataset_validation import require_validated_dataset
+
+    for label, split_dir in (("train", train_dir), ("val", val_dir)):
+        gate = require_validated_dataset(
+            Path(split_dir),
+            expected_role=data_role,
+            allow_uncertified=allow_uncertified_data,
+            deep=(verify_identity == "full"),
+            consumer=f"supervised-trainer[{label}]",
+        )
+        role_name = gate.role.name if gate.role else "unclassified"
+        print(
+            f"[data-gate] {label}: role={role_name} certified={gate.certified} "
+            f"masked_fraction={gate.masked_fraction:.4f} samples={gate.num_samples:,} "
+            f"identity={verify_identity}"
+        )
+        for warning in gate.warnings:
+            print(f"[data-gate] {warning}")
+
     if seed is not None:
         random.seed(seed)
         np.random.seed(seed)
@@ -1073,6 +1101,26 @@ def main() -> None:
         default=None,
         help="RNG seed for reproducible runs (default: None = unseeded, today's behavior).",
     )
+    parser.add_argument(
+        "--data-role",
+        choices=("games_wdl", "policy_tactics", "endgame_syzygy", "unified"),
+        default=None,
+        help="Explicit dataset role for train/val (default: resolved from dataset metadata "
+        "declarations; unclassified datasets are refused).",
+    )
+    parser.add_argument(
+        "--allow-uncertified-data",
+        action="store_true",
+        help="Consume datasets without a valid validation receipt (loud UNCERTIFIED warning; "
+        "role/label invariants still apply). Default: refuse.",
+    )
+    parser.add_argument(
+        "--verify-identity",
+        choices=("full", "stat"),
+        default="full",
+        help="full: re-hash every dataset file against the validation receipt before training; "
+        "stat: cheaper size/mtime staleness check.",
+    )
 
     args = parser.parse_args()
 
@@ -1163,6 +1211,9 @@ def main() -> None:
             num_blocks=args.num_blocks,
             num_filters=args.num_filters,
             tactics_ratio=args.tactics_ratio,
+            data_role=args.data_role,
+            allow_uncertified_data=args.allow_uncertified_data,
+            verify_identity=args.verify_identity,
             seed=args.seed,
         )
         emit_report(
