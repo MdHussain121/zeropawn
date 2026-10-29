@@ -9,7 +9,7 @@ from python.model.chess_net import ChessNet
 from python.selfplay.worker import SavedPosition
 from python.selfplay.replay_buffer import ReplayBuffer
 from python.selfplay.inference_server import InferenceServer
-from python.train.train_rl import RLTrainer, WarmupCosineDecayScheduler
+from python.train.train_rl import RLTrainer, WarmupCosineDecayScheduler, WeightPushError
 
 
 def _create_dummy_positions(n: int, full_prob: float = 0.5) -> list[SavedPosition]:
@@ -1221,3 +1221,208 @@ def test_bf16_autocast_disabled_when_flag_off(tmp_path):
     model.forward = orig_forward
 
     assert observed["autocast"] is False
+
+
+# ---------------------------------------------------------------------------
+# Stage A: warm-start optimizer isolation (R-09) and fail-closed weight pushes
+# ---------------------------------------------------------------------------
+
+
+def test_warm_start_ignores_optimizer_state_and_resets_step(tmp_path):
+    """warm_start=True loads weights only: foreign optimizer/scheduler state is
+    never adopted (audit R-09) and the RL step counter restarts at 0."""
+    torch.manual_seed(7)
+    buf = ReplayBuffer(buffer_dir=tmp_path / "buf_ws", capacity=500, create_new=True)
+    buf.add_positions(_create_dummy_positions(50, full_prob=0.5))
+
+    model_a = ChessNet(num_blocks=2, num_filters=32)
+    trainer_a = RLTrainer(
+        model=model_a,
+        replay_buffer=buf,
+        batch_size=16,
+        checkpoint_dir=tmp_path / "ckpt_ws_a",
+        sync_weights_path=tmp_path / "sync_ws_a.pt",
+    )
+    trainer_a.train_step()
+    trained_state = {k: v.clone() for k, v in model_a.state_dict().items()}
+
+    # A supervised-style checkpoint: AdamW optimizer state, source step 777,
+    # no checkpoint_type stamp (legacy layout).
+    foreign_path = tmp_path / "supervised_style.pt"
+    torch.save(
+        {
+            "model": trained_state,
+            "optimizer": torch.optim.AdamW(model_a.parameters(), lr=1e-3).state_dict(),
+            "step": 777,
+            "num_blocks": 2,
+            "num_filters": 32,
+        },
+        foreign_path,
+    )
+
+    model_b = ChessNet(num_blocks=2, num_filters=32)
+    trainer_b = RLTrainer(
+        model=model_b,
+        replay_buffer=buf,
+        batch_size=16,
+        checkpoint_dir=tmp_path / "ckpt_ws_b",
+        sync_weights_path=tmp_path / "sync_ws_b.pt",
+    )
+    step = trainer_b.load_checkpoint(foreign_path, warm_start=True)
+    assert step == 0
+    assert trainer_b.step_num == 0
+    assert trainer_b.last_push_step == 0
+
+    # Weights were adopted...
+    for name, tensor in model_b.state_dict().items():
+        torch.testing.assert_close(tensor, trained_state[name])
+    # ...but the optimizer stayed a fresh SGD (no AdamW keys or state).
+    pg = trainer_b.optimizer.param_groups[0]
+    assert "betas" not in pg
+    assert all(len(state) == 0 for state in trainer_b.optimizer.state.values())
+
+    # Full resume of the same foreign checkpoint must still be rejected.
+    with pytest.raises(RuntimeError):
+        trainer_b.load_checkpoint(foreign_path, warm_start=False)
+
+
+class _GoodServer:
+    """Minimal stand-in honoring the InferenceServer weight-loading contract."""
+
+    def __init__(self) -> None:
+        self.model_version = 0
+        self.last_state = None
+
+    def load_state_dict_weights(self, state_dict, sync_event=None):
+        self.last_state = state_dict
+        self.model_version += 1
+        return self.model_version
+
+
+class _StuckServer(_GoodServer):
+    """Simulates a failed hot-swap: old weights kept, version unchanged."""
+
+    def load_state_dict_weights(self, state_dict, sync_event=None):
+        return self.model_version
+
+
+class _BoomServer(_GoodServer):
+    def load_state_dict_weights(self, state_dict, sync_event=None):
+        raise RuntimeError("boom")
+
+
+class _NoApiServer:
+    model_version = 0
+
+
+def test_push_weights_success_tracks_version_and_counts(tmp_path):
+    buf = ReplayBuffer(buffer_dir=tmp_path / "buf_push", capacity=100, create_new=True)
+    trainer = RLTrainer(
+        model=ChessNet(num_blocks=2, num_filters=32),
+        replay_buffer=buf,
+        device="cpu",
+        checkpoint_dir=tmp_path / "ck",
+        sync_weights_path=tmp_path / "sync.pt",
+        direct_server=_GoodServer(),
+    )
+    assert trainer.push_weights() is None  # CPU: no CUDA event
+    assert trainer.push_success_count == 1
+    assert trainer.push_failure_count == 0
+    assert trainer.model_version == 1
+
+
+def test_push_weights_failure_raises_and_counts(tmp_path):
+    for server in (_StuckServer(), _BoomServer(), _NoApiServer()):
+        trainer = RLTrainer(
+            model=ChessNet(num_blocks=2, num_filters=32),
+            replay_buffer=ReplayBuffer(
+                buffer_dir=tmp_path / "buf_pf", capacity=100, create_new=True
+            ),
+            device="cpu",
+            checkpoint_dir=tmp_path / "ck_pf",
+            sync_weights_path=tmp_path / "sync_pf.pt",
+            direct_server=server,
+        )
+        with pytest.raises(WeightPushError):
+            trainer.push_weights()
+        assert trainer.push_failure_count == 1
+        assert trainer.push_success_count == 0
+        # The version mirror never advances on failure.
+        assert trainer.model_version == getattr(server, "model_version", 0)
+
+
+def test_train_step_propagates_push_failure(tmp_path):
+    """A failed weight push must be observable to the training loop (fail-closed)."""
+    buf = ReplayBuffer(buffer_dir=tmp_path / "buf_tc", capacity=200, create_new=True)
+    buf.add_positions(_create_dummy_positions(60, full_prob=0.5))
+    trainer = RLTrainer(
+        model=ChessNet(num_blocks=2, num_filters=32),
+        replay_buffer=buf,
+        device="cpu",
+        batch_size=16,
+        push_freq=1,
+        checkpoint_dir=tmp_path / "ck_tc",
+        sync_weights_path=tmp_path / "sync_tc.pt",
+        direct_server=_StuckServer(),
+    )
+    with pytest.raises(WeightPushError):
+        trainer.train_step()
+    assert trainer.step_num == 1  # optimizer stepped, then the push failed loudly
+    assert trainer.push_failure_count == 1
+
+
+def test_train_step_masks_sentinel_wdl_targets(tmp_path):
+    """Real train_step with outcome-sentinel 255 rows (Stage A §3.3): mixed and
+    all-unavailable batches must produce finite loss; invalid rows contribute
+    zero WDL loss/gradient; all-invalid batches give exactly zero WDL loss."""
+    torch.manual_seed(3)
+    buf = ReplayBuffer(buffer_dir=tmp_path / "buf_255", capacity=200, create_new=True)
+    model = ChessNet(num_blocks=2, num_filters=32)
+    trainer = RLTrainer(
+        model=model,
+        replay_buffer=buf,
+        device="cpu",
+        batch_size=8,
+        checkpoint_dir=tmp_path / "ck_255",
+        sync_weights_path=tmp_path / "sync_255.pt",
+    )
+    planes = torch.randn(8, 19, 8, 8)
+    visits = torch.zeros(8, 4672)
+    visits[torch.arange(8), torch.randint(0, 4672, (8,))] = 1.0
+
+    # Mixed: five valid labels, three unavailable sentinels.
+    mixed = {
+        "planes": planes,
+        "visits": visits,
+        "outcomes": torch.tensor([0, 1, 2, 255, 0, 1, 255, 2], dtype=torch.long),
+        "is_full_search": torch.ones(8, dtype=torch.bool),
+    }
+    metrics = trainer.train_step(batch_dict=mixed)
+    assert math.isfinite(metrics["total_loss"])
+    assert math.isfinite(metrics["wdl_loss"])
+    assert metrics["wdl_loss"] > 0  # valid rows contribute
+    assert any(p.grad is not None for p in model.parameters())
+    for p in model.parameters():
+        assert p.grad is None or torch.isfinite(p.grad).all()
+
+    # All-unavailable: WDL loss must be exactly zero, loss still finite.
+    model.zero_grad(set_to_none=True)
+    all_invalid = {
+        "planes": planes,
+        "visits": visits,
+        "outcomes": torch.full((8,), 255, dtype=torch.long),
+        "is_full_search": torch.ones(8, dtype=torch.bool),
+    }
+    metrics = trainer.train_step(batch_dict=all_invalid)
+    assert math.isfinite(metrics["total_loss"])
+    assert metrics["wdl_loss"] == 0.0
+    # Zero WDL contribution: gradients are finite where present (None == zero).
+    for p in model.parameters():
+        assert p.grad is None or torch.isfinite(p.grad).all()
+
+    # And a fully valid batch keeps normal WDL semantics.
+    model.zero_grad(set_to_none=True)
+    valid = dict(mixed)
+    valid["outcomes"] = torch.tensor([0, 1, 2, 0, 1, 2, 0, 1], dtype=torch.long)
+    metrics = trainer.train_step(batch_dict=valid)
+    assert metrics["wdl_loss"] > 0

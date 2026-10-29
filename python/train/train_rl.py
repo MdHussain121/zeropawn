@@ -30,6 +30,15 @@ from python.train.train_supervised import (
 _MASKED_LOGIT = -1e9
 
 
+class WeightPushError(RuntimeError):
+    """Raised when the learner cannot publish new weights to the inference server.
+
+    Fail-closed by design (Stage A §4): a push that fails silently would let
+    actors keep sampling stale weights while the learner advances, so the
+    failure must be observable to the caller.
+    """
+
+
 def _masked_policy_entropy(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """Mean Shannon entropy (nats) of softmax(logits) restricted to ``mask``.
 
@@ -141,6 +150,10 @@ class RLTrainer:
         self.last_checkpoint_time = time.time()
         self.last_push_step = 0
         self.model_version = getattr(self.model, "model_version", 0)
+        # Weight-push telemetry: every push attempt is counted so a failing
+        # learner-to-actor loop is visible in metrics, not just in logs.
+        self.push_success_count = 0
+        self.push_failure_count = 0
 
         # Dedicated non-default CUDA stream for training pipeline
         if self.device.type == "cuda":
@@ -224,6 +237,22 @@ class RLTrainer:
 
         self.model.load_state_dict(ckpt.get("model"))
         _validate_checkpoint_optimizer_compatibility(ckpt, path_str, warm_start=warm_start)
+
+        if warm_start:
+            # Weights-only warm start (audit R-09): never adopt foreign
+            # optimizer/scheduler state, and restart the RL schedule from
+            # step 0 — the checkpointed step belongs to the source trainer
+            # and is kept only as provenance.
+            inherited_step = int(ckpt.get("step", 0) or 0)
+            self.step_num = 0
+            self.last_push_step = 0
+            logger.info(
+                "Warm start from '%s': weights loaded; optimizer/scheduler state "
+                "ignored; RL step counter reset to 0 (inherited source step %d).",
+                path_str,
+                inherited_step,
+            )
+            return self.step_num
 
         if ckpt.get("optimizer") is not None:
             try:
@@ -574,6 +603,16 @@ class RLTrainer:
         Returns the CUDA event recorded on the training stream (so callers and the
         server can order the weight swap behind in-flight training kernels), or None
         on CPU / when no dedicated training stream exists.
+
+        The server's weight-loading contract is to return the new model version on
+        a successful swap and the *unchanged* version on failure. A push whose
+        version does not advance is therefore a failed push, not a success.
+
+        Raises:
+            WeightPushError: when the connected inference server fails to adopt
+                the new weights or exposes no weight-loading API. The trainer's
+                ``model_version`` mirrors the server and advances only after a
+                successful push, so versions and served weights never diverge.
         """
         num_blocks = getattr(self.model, "num_blocks", 12)
         num_filters = getattr(self.model, "num_filters", 128)
@@ -586,19 +625,58 @@ class RLTrainer:
         # Direct in-memory synchronization if an inference server is connected.
         if self.direct_server is not None:
             state = {k: v.detach() for k, v in self.model.state_dict().items()}
+            prev_version = int(getattr(self.direct_server, "model_version", 0) or 0)
             try:
                 if hasattr(self.direct_server, "load_state_dict_weights"):
-                    self.direct_server.load_state_dict_weights(state, sync_event=sync_event)
+                    new_version = self.direct_server.load_state_dict_weights(
+                        state, sync_event=sync_event
+                    )
                 elif hasattr(self.direct_server, "load_checkpoint"):
-                    self.direct_server.load_checkpoint(
+                    new_version = self.direct_server.load_checkpoint(
                         str(self.sync_weights_path), sync_event=sync_event
                     )
                 else:
-                    logger.warning(
-                        "Connected direct_server exposes no weight-reload API; skipping push"
+                    raise WeightPushError(
+                        "direct server exposes no weight-loading API "
+                        "(expected load_state_dict_weights or load_checkpoint)"
                     )
+            except WeightPushError:
+                self.push_failure_count += 1
+                raise
             except Exception as e:
-                logger.warning("RL weight push to inference server failed: %s", e)
+                self.push_failure_count += 1
+                logger.error(
+                    "RL weight push failed at step %d (%d failures so far): %s",
+                    self.step_num,
+                    self.push_failure_count,
+                    e,
+                    exc_info=True,
+                )
+                raise WeightPushError(
+                    f"inference server rejected weight push at step {self.step_num}: {e}"
+                ) from e
+
+            try:
+                new_version = int(new_version)
+            except (TypeError, ValueError):
+                new_version = prev_version
+            if new_version <= prev_version:
+                self.push_failure_count += 1
+                raise WeightPushError(
+                    f"inference server did not adopt new weights "
+                    f"(model_version {prev_version} -> {new_version}) at step {self.step_num}"
+                )
+            self.push_success_count += 1
+            self.model_version = new_version
+            logger.info(
+                "Pushed weights to inference server: model_version %d -> %d "
+                "(step %d, pushes ok=%d failed=%d)",
+                prev_version,
+                new_version,
+                self.step_num,
+                self.push_success_count,
+                self.push_failure_count,
+            )
 
         if self.sync_weights_path is not None:
             payload = {
@@ -611,7 +689,12 @@ class RLTrainer:
             try:
                 _atomic_torch_save(payload, self.sync_weights_path)
             except Exception as e:
-                logger.warning("RL weight sync write failed: %s", e)
+                logger.error(
+                    "RL weight sync write to %s failed: %s",
+                    self.sync_weights_path,
+                    e,
+                    exc_info=True,
+                )
 
         return sync_event
 
