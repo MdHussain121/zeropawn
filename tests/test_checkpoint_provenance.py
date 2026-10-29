@@ -193,3 +193,11 @@ def test_bundled_registry_matches_disk_when_artifacts_present():
         assert rec.get("designated_warm_start") is False or rec.get("designation_evidence"), (
             f"{rec['file']} designated without evidence"
         )
+
+
+def test_inference_server_empty_checkpoint_path_means_random_init():
+    """checkpoint_path='' is 'no checkpoint requested' (None-like), not a bad file:
+    explicit random-init construction stays available for callers that opt in."""
+    server = InferenceServer(checkpoint_path="", device="cpu")
+    assert server.model is not None
+    assert server.model_version == 0

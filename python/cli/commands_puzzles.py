@@ -988,7 +988,8 @@ def run_solve_puzzles(args: argparse.Namespace) -> int:
             except (ValueError, OSError):
                 pass
     if puzzle_path is None or not puzzle_path.exists():
-        print_error(f"Puzzle file/dir not found: {args.puzzles_file}")
+        requested = getattr(args, "puzzles_file", None) or getattr(args, "puzzles", "<unspecified>")
+        print_error(f"Puzzle file/dir not found: {requested}")
         return 1
 
     try:

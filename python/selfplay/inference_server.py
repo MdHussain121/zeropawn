@@ -73,11 +73,15 @@ class InferenceServer:
         # Load or create model
         if model is not None:
             self.model = model.to(self.device)
-        elif checkpoint_path is not None:
+        elif checkpoint_path:
+            # An empty-string path means "no checkpoint requested" (same as
+            # None); a REAL path that fails to load raises — see
+            # _create_model_from_checkpoint's fail-closed contract.
             self.model = self._create_model_from_checkpoint(checkpoint_path).to(self.device)
             self.load_checkpoint(checkpoint_path)
         else:
-            # Default ChessNet with 12 blocks
+            # Explicit no-weights construction: caller opted into an (untrained)
+            # random-init ChessNet.
             self.model = ChessNet(num_blocks=12, num_filters=128).to(self.device)
 
         if self.channels_last and self.device.type == "cuda":
