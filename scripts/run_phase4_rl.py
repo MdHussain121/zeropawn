@@ -223,8 +223,7 @@ class Phase4Orchestrator:
         eval_sims: Optional[int] = None,
         promotion_min_games: int = 100,
         promotion_min_score: float = 0.55,
-        # ── Checkpoint provenance (Stage A §5) ────────────────────────────
-        allow_unverified_warm_start: bool = False,
+        # ── Checkpoint provenance (2026-10-30 integration) ────────────────
         promotion_sprt_max_games: int = 0,
         # ──────────────────────────────────────────────────────────────────
     ) -> None:
@@ -2455,7 +2454,6 @@ def main() -> None:
             max_wait_ms=args.max_wait_ms,
             stockfish_nodes=args.stockfish_nodes,
             stockfish_elo=None if args.stockfish_full_strength else args.stockfish_elo,
-            allow_unverified_warm_start=args.allow_unverified_warm_start,
             promotion_sprt_max_games=args.promotion_sprt_max_games,
             base_lr=args.base_lr,
             min_lr=args.min_lr,
@@ -2506,7 +2504,6 @@ def main() -> None:
             max_wait_ms=args.max_wait_ms,
             stockfish_nodes=args.stockfish_nodes,
             stockfish_elo=None if args.stockfish_full_strength else args.stockfish_elo,
-            allow_unverified_warm_start=args.allow_unverified_warm_start,
             promotion_sprt_max_games=args.promotion_sprt_max_games,
             base_lr=args.base_lr,
             min_lr=args.min_lr,

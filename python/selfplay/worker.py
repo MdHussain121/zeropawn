@@ -46,17 +46,6 @@ _PLANE_LAYOUTS: Dict[int, Tuple[int, int, int]] = {
 
 
 class InferenceError(RuntimeError):
-    """A genuine leaf-evaluation failure (model/inference error), not a draw.
-
-    Raised into waiting simulations when a batched inference call fails, so a
-    transient CUDA/driver error aborts the affected search instead of silently
-    substituting uniform policies and 0.0 values (audit M-3). Shutdown wake-ups
-    use the same error so partially played games are discarded rather than
-    recorded with fabricated evaluations.
-    """
-
-
-class InferenceError(RuntimeError):
     """Raised when an NN inference request cannot be served.
 
     A failed inference is NOT a neutral evaluation: handing back a uniform
@@ -337,20 +326,6 @@ class WorkerBatchAggregator:
             self.pending = []
             self.first_arrival_time = None
         self._flush_batch(batch)
-
-    def _fail_batch(self, batch: List[Any], exc: Exception) -> None:
-        """Deliver an inference failure to every waiter in ``batch``.
-
-        Genuine failures abort the affected searches with ``InferenceError``
-        (audit M-3) instead of fabricating uniform policies and 0.0 values
-        inside a running search.
-        """
-        self.inference_failure_count += 1
-        for item in batch:
-            item[1][0] = None
-            item[1][1] = None
-            item[1][2] = exc
-            item[2].set()
 
     def _flush_batch(self, batch: List[Any]) -> None:
         """Evaluate one snapshot batch and deliver results to its waiters."""

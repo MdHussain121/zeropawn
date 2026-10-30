@@ -3,6 +3,7 @@
 #include <vector>
 #include <cstdlib>
 #include <numeric>
+#include <stdexcept>
 #include "zeropawn/stub.h"
 #include "zeropawn/chess_game.hpp"
 #include "zeropawn/encoder.hpp"
@@ -603,6 +604,55 @@ void test_search_batched() {
     std::cout << "[PASS] test_search_batched\n";
 }
 
+void test_apply_action_invalid_raises() {
+    // F-4: an undecodable action index must throw (never silently no-op).
+    zeropawn::ChessGame game;
+    bool raised = false;
+    try {
+        game.apply_action(-1);
+    } catch (const std::invalid_argument&) {
+        raised = true;
+    }
+    TEST_CHECK(raised, "apply_action(-1) must raise std::invalid_argument");
+
+    raised = false;
+    try {
+        game.apply_action(999999);
+    } catch (const std::exception&) {
+        raised = true;
+    }
+    TEST_CHECK(raised, "apply_action(999999) must raise");
+
+    // State must be untouched and the game still fully usable.
+    TEST_CHECK(game.legal_actions().size() == 20, "startpos still has 20 legal actions");
+    game.apply_action(game.legal_actions()[0]);
+    TEST_CHECK(game.history_len() == 1, "valid action still applies");
+    std::cout << "[PASS] test_apply_action_invalid_raises\n";
+}
+
+void test_abort_fn_stops_search() {
+    // F-3: the abort predicate stops the search and reports actual sims.
+    zeropawn::ChessGame game;
+    zeropawn::MCTSConfig cfg;
+    zeropawn::MCTS mcts(cfg);
+    auto eval_fn = [](const zeropawn::Game& g) -> std::pair<std::vector<float>, float> {
+        return {std::vector<float>(g.num_actions(), 1.0f / g.num_actions()), 0.0f};
+    };
+
+    int polls = 0;
+    zeropawn::AbortFn abort = [&polls]() {
+        polls++;
+        return polls > 2;  // abort on the 3rd poll (sim 64)
+    };
+    auto res = mcts.search(game, 10000, eval_fn, nullptr, abort);
+    TEST_CHECK(res.new_simulations == 64, "aborted search reports actual sims (64)");
+
+    auto full = mcts.search(game, 50, eval_fn);
+    TEST_CHECK(full.new_simulations == 50, "unaborted search reports full budget");
+    TEST_CHECK(mcts.total_active_virtual_losses() == 0, "no residual virtual loss after abort");
+    std::cout << "[PASS] test_abort_fn_stops_search\n";
+}
+
 int main() {
     test_stub();
     test_board_basics();
@@ -615,6 +665,8 @@ int main() {
     test_mcts_batching();
     test_connect4();
     test_search_batched();
+    test_apply_action_invalid_raises();
+    test_abort_fn_stops_search();
     std::cout << "\nAll C++ tests passed successfully.\n";
     return 0;
 }
