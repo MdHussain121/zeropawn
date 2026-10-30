@@ -14,8 +14,11 @@ if str(_repo_root) in sys.path:
     sys.path.remove(str(_repo_root))
 sys.path.insert(0, str(_repo_root))
 
-# Check multiple standard build directories
+# Check multiple standard build directories. A parallel dev build tree
+# (build_zeropawn_dev) wins when present: it lets C++ changes be built and
+# tested while the primary build's .pyd is locked by a running process.
 _build_candidates = [
+    _repo_root / "build_zeropawn_dev" / "cpp",
     _repo_root / "build" / "cpp",
     _repo_root / "build_zeropawn" / "cpp",
     _repo_root / "build_zeropawn",

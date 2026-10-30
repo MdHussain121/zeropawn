@@ -142,7 +142,7 @@ def test_syzygy_and_checkpoint_preservation():
     with open(model_path, "rb") as f:
         while chunk := f.read(1024 * 1024):
             h.update(chunk)
-    expected_sha = "54d462823837f77c60621fb72e1a1474eca3dc9dbb2a2969d87ced18ada2b7df"
+    expected_sha = "79a72ef746f4bfda2555fe7d0ec04970be7ccd4a39e282e16a05594ed15bc36b"
     if h.hexdigest().lower() != expected_sha:
         pytest.skip(
             f"best_model.pt hash {h.hexdigest()[:8]} differs from supervised-audit baseline {expected_sha[:8]}"

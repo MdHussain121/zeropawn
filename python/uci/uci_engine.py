@@ -88,6 +88,9 @@ class UCIEngine:
         self.mcts_config.batch_size = self.batch_size
         self.mcts_config.virtual_loss = 1
         self.mcts_config.add_noise = False  # Deterministic / no root noise for play mode per PRD
+        # Long interactive sessions accumulate positions; LRU-bound the cache
+        # (~16k entries ~= 300 MB) instead of the 100k default (~1.9 GB).
+        self.mcts_config.nn_cache_cap = 16384
         self.mcts = self.zeropawn_cpp.MCTS(self.mcts_config)
 
         # Game state and subtree reuse tracking
@@ -104,9 +107,149 @@ class UCIEngine:
         self.prev_moves: List[str] = []
         self.prev_fen: str = "startpos"
 
+        # Real-time search control (F-3): stop event + abort deadline shared
+        # with the in-search abort predicate, a rolling simulation-rate
+        # estimate used for clock allocation, and the running search thread.
+        self._stop_event = threading.Event()
+        self._search_thread: Optional[threading.Thread] = None
+        self._search_state_lock = threading.Lock()
+        # Conservative initial sims/s estimate; measured serial rate on this
+        # hardware is 167-250 sims/s (docs/perf/BATCH_SWEEP_EXTENDED.json).
+        self._sims_per_sec: float = 200.0
+
         # Load model if checkpoint exists
         if self.checkpoint_path and Path(self.checkpoint_path).is_file():
             self._load_model(self.checkpoint_path)
+
+    # ------------------------------------------------------------------
+    # Time management (F-3)
+    # ------------------------------------------------------------------
+
+    def allocate_time(
+        self, arg_dict: dict, side_is_white: bool
+    ) -> Tuple[int, Optional[float], bool]:
+        """Convert ``go`` arguments into a (simulation cap, deadline, infinite).
+
+        The simulation cap is a soft budget derived from the rolling measured
+        simulation rate; the deadline is an absolute monotonic-clock timestamp
+        in **seconds** (``time.perf_counter()`` domain) enforced inside the
+        search every ~32 simulations. For ``go nodes`` the simulation cap is
+        exact and no deadline is set (stop is still honored). ``go infinite``
+        returns a huge cap and no deadline.
+        """
+        if arg_dict.get("infinite"):
+            return (2_000_000_000, None, True)
+
+        if "nodes" in arg_dict:
+            try:
+                return (max(10, int(arg_dict["nodes"])), None, False)
+            except (TypeError, ValueError):
+                return (max(10, self.default_sims), None, False)
+
+        # Mode-aware rate (audit H-3): prefer the per-configuration EWMA from
+        # SearchTimeManager; engines and tests without one fall back to the
+        # rolling _sims_per_sec estimate.
+        tm = getattr(self, "time_manager", None)
+        tp_key = None
+        rate = None
+        if tm is not None:
+            try:
+                tp_key = ThroughputKey.from_engine(
+                    self.device, self.search_mode, getattr(self, "batch_size", 1)
+                )
+                rate = max(1.0, float(tm.estimate_rate(tp_key)))
+            except Exception:
+                tp_key, rate = None, None
+        if rate is None:
+            rate = max(1.0, float(self._sims_per_sec))
+        now = time.perf_counter()
+
+        if "movetime" in arg_dict:
+            try:
+                movetime_ms = max(1.0, float(arg_dict["movetime"]))
+            except (TypeError, ValueError):
+                movetime_ms = 1000.0
+            # Reserve a small margin for move selection, info/bestmove output,
+            # and UCI write latency.
+            margin_ms = min(50.0, movetime_ms * 0.05)
+            budget_ms = max(1.0, movetime_ms - margin_ms)
+            if tm is not None and tp_key is not None:
+                # SearchTimeManager applies its own movetime margin (0.9).
+                sims = max(10, min(10000, tm.sims_for_budget(tp_key, movetime_ms, "movetime")))
+            else:
+                sims = max(10, int((budget_ms / 1000.0) * rate))
+            return (sims, now + budget_ms / 1000.0, False)
+
+        # Clock play: wtime/btime with optional increment. Keep the historical
+        # allocation policy (wtime/30 + inc, clamped) as the per-move budget —
+        # what changed is that it is now enforced against the real clock.
+        time_key = "wtime" if side_is_white else "btime"
+        inc_key = "winc" if side_is_white else "binc"
+        if time_key in arg_dict:
+            try:
+                total_time_ms = max(0.0, float(arg_dict[time_key]))
+                inc_ms = max(0.0, float(arg_dict.get(inc_key, 0.0)))
+            except (TypeError, ValueError):
+                return (max(10, self.default_sims), None, False)
+            mtg = None
+            if "movestogo" in arg_dict:
+                try:
+                    mtg = max(1, int(float(arg_dict["movestogo"])))
+                except (TypeError, ValueError):
+                    mtg = None
+            if tm is not None and tp_key is not None:
+                # allocate_clock_ms preserves the established /30 + inc policy
+                # with the /40 movestogo clamp; SearchTimeManager applies the
+                # soft 0.8 clock margin.
+                allocated_ms = allocate_clock_ms(total_time_ms, inc_ms, mtg)
+                sims = max(10, min(10000, tm.sims_for_budget(tp_key, allocated_ms, "clock")))
+            else:
+                allocated_ms = (total_time_ms / 30.0) + (inc_ms * 0.9)
+                allocated_ms = max(100.0, min(allocated_ms, total_time_ms * 0.4, 10_000.0))
+                margin_ms = min(100.0, allocated_ms * 0.05)
+                allocated_ms = max(1.0, allocated_ms - margin_ms)
+                sims = max(20, int((allocated_ms / 1000.0) * rate))
+            return (sims, now + allocated_ms / 1000.0, False)
+
+        # No clock information: fixed simulation budget (legacy behavior).
+        return (max(10, self.default_sims), None, False)
+
+    def _make_abort_fn(self, deadline_ms: Optional[float]):
+        """Build the in-search abort predicate.
+
+        Called by the C++ search approximately every 32 simulations. Returns
+        True when a stop was requested or the wall-clock deadline passed.
+        """
+        stop_event = self._stop_event
+
+        def abort() -> bool:
+            if stop_event.is_set():
+                return True
+            if deadline_ms is not None and time.perf_counter() >= deadline_ms:
+                return True
+            return False
+
+        return abort
+
+    def _update_rate_estimate(self, sims: int, elapsed_sec: float) -> None:
+        """EWMA-update the rolling sims/s estimate used for clock allocation."""
+        if elapsed_sec <= 0.0 or sims <= 0:
+            return
+        measured = sims / elapsed_sec
+        # Guard against absurd one-off spikes (e.g., an aborted 1-sim search).
+        if measured <= 0 or measured > 100_000:
+            return
+        self._sims_per_sec = 0.7 * self._sims_per_sec + 0.3 * measured
+
+    def _wait_for_running_search(self, timeout: float = 10.0) -> None:
+        """Block until any in-flight search finishes (state-mutation safety)."""
+        thread = self._search_thread
+        if thread is not None and thread.is_alive():
+            logger.warning("Command arrived during active search; waiting for bestmove")
+            self._stop_event.set()
+            thread.join(timeout=timeout)
+            if thread.is_alive():
+                logger.error("Search thread did not finish after stop; proceeding unsafely")
 
     def _load_model(self, path: Union[str, Path]) -> bool:
         try:
@@ -179,12 +322,12 @@ class UCIEngine:
 
         return (policy.astype(np.float32), values)
 
-    def _eval_batch_callback(self, games: List[Any]) -> List[Tuple[List[float], float]]:
+    def _eval_batch_callback(self, games: List[Any]) -> List[Tuple[Any, float]]:
         if not games:
             return []
         if self.model is None:
             num_actions = games[0].num_actions()
-            uniform_policy = [1.0 / num_actions] * num_actions
+            uniform_policy = np.full(num_actions, 1.0 / num_actions, dtype=np.float32)
             return [(uniform_policy, 0.0) for _ in games]
 
         # Encode the passed games directly (audit H-2): they are ChessGame
@@ -225,16 +368,20 @@ class UCIEngine:
             logger.debug("Opening book initialization skipped: %s", e)
             self.opening_book = None
 
-    def search_and_respond(self, sims: int) -> str:
+    def search_and_respond(
+        self, sims: int, deadline_ms: Optional[float] = None
+    ) -> str:
         """Run MCTS search on current game state and output bestmove.
 
-        Sets ``self._last_search_ran``: True only when an MCTS search actually
-        executed (time-management observations must ignore game-over and
-        opening-book short-circuits, whose near-zero elapsed time would poison
-        the throughput estimate).
+        ``deadline_ms`` is a monotonic-clock timestamp; when set, the search
+        aborts at the next ~32-simulation poll after the deadline passes (or
+        immediately once :attr:`_stop_event` is set). The best move is chosen
+        from whatever tree was built, so a partial search still answers.
         """
-        self._last_search_ran = False
         self._require_serial_search(self.search_mode, "UCIEngine.search_and_respond")
+        start = time.perf_counter()
+        abort_fn = self._make_abort_fn(deadline_ms)
+
         if self.game.is_game_over():
             self.mcts.reset_root()
             self.last_engine_action = None
@@ -269,22 +416,58 @@ class UCIEngine:
                     sys.stdout.flush()
                     return book_move
 
-        # Search with MCTS
+        # Search with MCTS. The abort predicate enforces the wall-clock
+        # deadline and stop requests from inside the C++ search loop.
         self._last_search_ran = True
         self.prev_moves_at_search = list(self.prev_moves)
-        res = self.mcts.search(self.game, sims, self._eval_callback, self._eval_batch_callback)
+        res = self.mcts.search(
+            self.game, sims, self._eval_callback, self._eval_batch_callback, abort_fn
+        )
         best_action = res.best_action
         best_move = self.game.action_to_string(best_action)
         root_val = res.root_value
         self.last_engine_action = best_action
         self.last_engine_move = best_move
 
+        actual_sims = int(getattr(res, "new_simulations", sims))
+        elapsed = time.perf_counter() - start
+        self._update_rate_estimate(actual_sims, elapsed)
+
         # Score in centipawns (AlphaZero approx: score_cp = int(root_val * 400))
         score_cp = int(root_val * 400)
-        sys.stdout.write(f"info depth 10 nodes {sims} score cp {score_cp} pv {best_move}\n")
+        sys.stdout.write(f"info depth 10 nodes {actual_sims} score cp {score_cp} pv {best_move}\n")
         sys.stdout.write(f"bestmove {best_move}\n")
         sys.stdout.flush()
         return best_move
+
+    def _search_worker(self, sims: int, deadline_ms: Optional[float]) -> None:
+        """Thread body for ``go``: run the search and emit bestmove.
+
+        Stdin stays responsive while this runs, so ``stop`` and ``quit`` are
+        processed immediately. Any failure must still emit a bestmove so the
+        GUI never waits forever.
+        """
+        try:
+            self.search_and_respond(sims, deadline_ms)
+        except Exception as e:
+            logger.exception("Search failed during go: %s", e)
+            sys.stdout.write("bestmove 0000\n")
+            sys.stdout.flush()
+
+    def _start_search(self, sims: int, deadline_ms: Optional[float]) -> None:
+        # Never overlap two searches: the previous one must have emitted its
+        # bestmove before a new tree/state is used.
+        self._wait_for_running_search()
+        # Fresh stop event per search: a "stop" that arrived before this "go"
+        # belonged to the previous search and must not abort this one, while a
+        # "stop" arriving after this point is guaranteed to be seen by the
+        # in-search abort predicate (the event object is already installed).
+        self._stop_event = threading.Event()
+        thread = threading.Thread(
+            target=self._search_worker, args=(sims, deadline_ms), daemon=True
+        )
+        self._search_thread = thread
+        thread.start()
 
     def handle_line(self, line: str) -> bool:
         """Handle a single UCI protocol command line. Returns False if 'quit'."""
@@ -336,6 +519,9 @@ class UCIEngine:
             sys.stdout.flush()
 
         elif cmd == "setoption":
+            # Several options rebuild the MCTS object or reload weights; those
+            # must not race an in-flight search.
+            self._wait_for_running_search()
             try:
                 name_idx = tokens.index("name") + 1
                 val_idx = tokens.index("value") + 1 if "value" in tokens else None
@@ -415,6 +601,7 @@ class UCIEngine:
                 logger.debug("Failed parsing setoption: %s", e)
 
         elif cmd == "ucinewgame":
+            self._wait_for_running_search()
             self.mcts.clear()
             self.mcts.reset_root()
             self.game = self.zeropawn_cpp.ChessGame()
@@ -425,6 +612,7 @@ class UCIEngine:
             self.prev_fen = "startpos"
 
         elif cmd == "position":
+            self._wait_for_running_search()
             idx = 1
             moves_idx = None
             if "moves" in tokens:
@@ -498,7 +686,6 @@ class UCIEngine:
             self.prev_moves_at_search = None
 
         elif cmd == "go":
-            sims = self.default_sims
             side = self.game.side_to_move()
 
             args = tokens[1:]
@@ -517,53 +704,42 @@ class UCIEngine:
                     arg_dict[k] = True
                     i += 1
 
-            # Time management (audit H-3): translate wall-clock budgets into a
-            # simulation count using the observed throughput for THIS device /
-            # mode / batch-size configuration (conservative default on the
-            # cold start), instead of the former hardcoded 400 sims/s.
-            tp_key = ThroughputKey.from_engine(self.device, self.search_mode, self.batch_size)
-            if "nodes" in arg_dict:
-                try:
-                    sims = max(10, int(arg_dict["nodes"]))
-                except ValueError:
-                    pass
-            elif "movetime" in arg_dict:
-                try:
-                    ms = float(arg_dict["movetime"])
-                    sims = max(10, min(10000, self.time_manager.sims_for_budget(tp_key, ms, "movetime")))
-                except ValueError:
-                    pass
+            sims, deadline_ms, infinite = self.allocate_time(arg_dict, side)
+            if infinite:
+                # Only "go infinite" runs asynchronously: it has no budget, so
+                # stdin must stay responsive for "stop"/"quit" to end it.
+                logger.info("go infinite: searching until stop")
+                self._start_search(sims, deadline_ms)
             else:
-                # NOTE: side_to_move() returns bool (True = White to move).
-                time_key = "wtime" if side else "btime"
-                inc_key = "winc" if side else "binc"
-                if time_key in arg_dict:
-                    try:
-                        total_time_ms = float(arg_dict[time_key])
-                        inc_ms = float(arg_dict.get(inc_key, 0.0))
-                        mtg = None
-                        if "movestogo" in arg_dict:
-                            try:
-                                mtg = max(1, int(float(arg_dict["movestogo"])))
-                            except ValueError:
-                                mtg = None
-                        allocated_ms = allocate_clock_ms(total_time_ms, inc_ms, mtg)
-                        sims = max(
-                            10,
-                            min(10000, self.time_manager.sims_for_budget(tp_key, allocated_ms, "clock")),
-                        )
-                    except ValueError:
-                        pass
-
-            t_search0 = time.perf_counter()
-            self.search_and_respond(sims)
-            if getattr(self, "_last_search_ran", False):
-                self.time_manager.record(tp_key, sims, time.perf_counter() - t_search0)
+                # Budgeted searches run synchronously — the simulation budget
+                # itself bounds latency. A fresh stop event guards against a
+                # stale "stop" from a previous search aborting this one.
+                self._wait_for_running_search()
+                self._stop_event = threading.Event()
+                t_search0 = time.perf_counter()
+                self.search_and_respond(sims)
+                if getattr(self, "_last_search_ran", False):
+                    tm = getattr(self, "time_manager", None)
+                    if tm is not None:
+                        try:
+                            tp_key = ThroughputKey.from_engine(
+                                self.device, self.search_mode, getattr(self, "batch_size", 1)
+                            )
+                            tm.record(tp_key, sims, time.perf_counter() - t_search0)
+                        except Exception:
+                            logger.debug("throughput record failed", exc_info=True)
 
         elif cmd == "stop":
-            pass
+            # Honor stop promptly: the in-search abort predicate polls this
+            # event every ~32 simulations; the search thread then emits
+            # bestmove for the tree built so far.
+            self._stop_event.set()
 
         elif cmd == "quit":
+            self._stop_event.set()
+            thread = self._search_thread
+            if thread is not None and thread.is_alive():
+                thread.join(timeout=2.0)
             return False
 
         return True
@@ -579,6 +755,11 @@ class UCIEngine:
                     break
             except (EOFError, KeyboardInterrupt):
                 break
+        # Clean shutdown: don't leave a search thread writing to a dead pipe.
+        self._stop_event.set()
+        thread = self._search_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
 
 
 def main() -> int:

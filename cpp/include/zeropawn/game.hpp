@@ -17,6 +17,11 @@ public:
     virtual bool is_terminal() const = 0;
     virtual float terminal_value() const = 0; // Perspective of side to move
     virtual uint64_t get_hash() const = 0;
+    // Draw-relevant history identity (halfmove clock, repetition count) that
+    // the position hash deliberately excludes. Default 0 for games without
+    // such state; ChessGame overrides. NN-cache keys MUST include this so
+    // transpositions with different draw status never share an evaluation.
+    virtual uint64_t draw_history_key() const { return 0; }
     virtual int num_planes() const = 0;
     virtual int state_size() const = 0;
     virtual int num_actions() const = 0;

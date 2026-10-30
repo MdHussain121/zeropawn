@@ -29,7 +29,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Optional, Union
+from typing import Any, Dict, List, Optional, Union
 import psutil
 import torch
 
@@ -119,12 +119,29 @@ class SafetyTriggerException(Exception):
     pass
 
 
-def puzzle_decline_trips(history: list[float], band: float = 0.005) -> bool:
+def pacing_target_step(total_added: int, batch_size: int, max_reuse_ratio: int) -> int:
+    """Maximum RL training steps the buffer's production supports (pacing gate).
+
+    Each full-search position may be reused at most ``max_reuse_ratio`` times,
+    giving ``total_added * max_reuse_ratio / batch_size`` supported steps, with
+    a floor of 500 so a fresh run can take its first steps before much data
+    exists. Compared against run-local RL steps only (never an inherited
+    supervised counter).
+    """
+    return max(500, int((total_added * max_reuse_ratio) / batch_size))
+
+
+def puzzle_decline_trips(history: list[float], band: float = 0.015) -> bool:
     """True if the last 3 steps each decline by MORE than ``band``.
 
     Same trigger semantics as before, plus a noise band so flat/jittered
     histories (drops within measurement noise) cannot trip a critical stop.
     Needs >= 4 samples; shorter histories never trip.
+
+    Band calibration: the certified 1,000-puzzle set has binomial sampling
+    noise sigma = sqrt(p(1-p)/n) ~= 0.015 at p ~= 0.64, so per-step drops must
+    exceed one standard deviation (~1.5 percentage points) to count as real
+    decline rather than sampling jitter (audit finding F-14).
     """
     if len(history) < 4:
         return False
@@ -158,6 +175,14 @@ class Phase4Orchestrator:
         openings_path: str = "data/openings/eval_openings_50.epd",
         stockfish_path: str = "tools/stockfish.exe",
         stockfish_nodes: int = 1000,
+        # Opponent calibration (EV-01): full-strength Stockfish at 1000 nodes is
+        # a floor opponent for the promotion match (measured 0/30 — the match
+        # term of the promotion composite saturates at 0 and promotion rides on
+        # a policy metric). The default is the calibrated UCI_Elo 1500 cell of
+        # the baseline protocol; pass --stockfish-full-strength to restore the
+        # legacy behavior deliberately.
+        stockfish_elo: Optional[int] = 1500,
+        allow_unverified_warm_start: bool = False,
         is_verify_mode: bool = False,
         skip_baseline_eval: bool = False,
         data_role: Optional[str] = None,
@@ -198,8 +223,8 @@ class Phase4Orchestrator:
         eval_sims: Optional[int] = None,
         promotion_min_games: int = 100,
         promotion_min_score: float = 0.55,
-        # ── Checkpoint provenance (Stage A §5) ────────────────────────────
-        allow_unverified_warm_start: bool = False,
+        # ── Checkpoint provenance (2026-10-30 integration) ────────────────
+        promotion_sprt_max_games: int = 0,
         # ──────────────────────────────────────────────────────────────────
     ) -> None:
         self.max_hours = max_hours
@@ -301,6 +326,10 @@ class Phase4Orchestrator:
         # a real score advantage instead of any composite-score improvement.
         self.promotion_min_games = int(promotion_min_games)
         self.promotion_min_score = float(promotion_min_score)
+        # 0 disables the promotion SPRT (threshold gate only, documented);
+        # >0 requires an ACCEPT_H1 SPRT vs best_eval/warm-start to promote.
+        self.promotion_sprt_max_games = int(promotion_sprt_max_games)
+        self._baseline_puzzle_rate: Optional[float] = None
         self._steps_this_run = 0
 
         # Task 5: watchdog limits
@@ -394,6 +423,8 @@ class Phase4Orchestrator:
             stockfish_p = _repo_root / stockfish_p
         self.stockfish_path = stockfish_p
         self.stockfish_nodes = stockfish_nodes
+        self.stockfish_elo = stockfish_elo
+        self.allow_unverified_warm_start = allow_unverified_warm_start
 
         self.stop_event = threading.Event()
         self.start_time = time.time()
@@ -402,8 +433,10 @@ class Phase4Orchestrator:
         # Historical evaluation metrics for trend tracking
         self.puzzle_solve_history: list[float] = []
         # Noise band for the puzzle-decline safety trigger: per-step drops at
-        # or below this absolute rate do not count as declines.
-        self.puzzle_noise_band: float = 0.005
+        # or below this absolute rate do not count as declines. Calibrated to
+        # one standard deviation of the certified 1,000-puzzle set
+        # (~1.5 percentage points at p~0.64); see puzzle_decline_trips.
+        self.puzzle_noise_band: float = 0.015
         self.initial_policy_entropy: Optional[float] = None
         self.entropy_history: list[float] = []
         self.low_gpu_util_counter = 0
@@ -421,6 +454,9 @@ class Phase4Orchestrator:
         self._completed_games_seen = 0
         self._last_push_version = 0
         self._known_ckpt_names: set[str] = set()
+        # Identity of the most recently saved eval checkpoint (provenance).
+        self._last_saved_ckpt_name: str = ""
+        self._last_saved_ckpt_path: str = ""
         self._active_checkpoint_path = ""
         self._tb_files_found = 0
         self._tb_enabled = False
@@ -467,30 +503,14 @@ class Phase4Orchestrator:
             allow_uncertified_data=self.allow_uncertified_data,
         )
 
-        # Detect resumable checkpoint if explicitly provided, else auto-resume from existing RL checkpoint if present.
-        # Candidate selection is restricted to the active RL checkpoint location and excludes quarantine
-        # directories and fine-tune checkpoint locations. Candidates are then validated for RL provenance
-        # by RLTrainer.load_checkpoint before training begins.
+        # Detect resumable checkpoint if explicitly provided, else auto-resume from
+        # the best SGD-compatible RL checkpoint (never by filename ordering — the
+        # poisoned final/latest artifacts of failed runs must not win).
         if resume_checkpoint is None and not self.reset_buffer and not self.is_verify_mode:
-            for candidate in [
-                self.checkpoint_dir / "phase4_final_checkpoint.pt",
-                self.checkpoint_dir / "latest_checkpoint.pt",
-            ]:
-                if candidate.exists():
-                    # Only consider candidates that live inside the configured checkpoint_dir so that
-                    # stale fine-tune checkpoints or quarantined files elsewhere are never selected automatically.
-                    try:
-                        candidate.resolve().relative_to(self.checkpoint_dir.resolve())
-                    except ValueError:
-                        logger.debug("Skipping auto-resume candidate outside checkpoint_dir: %s", candidate)
-                        continue
-                    resume_checkpoint = str(candidate)
-                    logger.info(
-                        f"[RESUME] Found existing RL checkpoint at {candidate}; auto-resuming training."
-                    )
-                    break
+            resume_checkpoint = self._select_resume_checkpoint()
 
-        active_checkpoint = resume_checkpoint if resume_checkpoint else base_checkpoint
+        is_resuming = resume_checkpoint is not None
+        active_checkpoint = resume_checkpoint if is_resuming else base_checkpoint
         self._active_checkpoint_path = (
             str(active_checkpoint) if active_checkpoint else "random_init"
         )
@@ -612,7 +632,7 @@ class Phase4Orchestrator:
             temp_cutoff_range=(15, 30),
             resign_threshold=-0.95,
             consecutive_resign_moves=4,
-            disable_resign_prob=0.15,
+            disable_resign_prob=0.15,  # also stamped on self for banner/trigger text
             allow_resignation=True,
             min_resign_ply=30,
             tablebase_path=self.tablebase_path,
@@ -620,6 +640,7 @@ class Phase4Orchestrator:
             position_sink=sink,
             seed=self.seed,
         )
+        self.disable_resign_prob = 0.15
 
         # 5. Initialize RL Trainer
         trainer_model = ChessNet(num_blocks=12, num_filters=128).to(self.train_device)
@@ -654,17 +675,89 @@ class Phase4Orchestrator:
             entropy_bonus=self.entropy_bonus,
         )
 
-        if resume_checkpoint is not None:
+        if is_resuming:
             self.trainer.load_checkpoint(resume_checkpoint)
             if hasattr(self.trainer, "direct_server") and self.trainer.direct_server is not None:
                 self.server.model_version = self.trainer.direct_server.model_version
             logger.info(
                 f"Resumed RL training from {resume_checkpoint} at step {self.trainer.step_num} (model_version={self.server.model_version})"
             )
+        else:
+            # Warm start (or cold start): the weights already came in via the
+            # inference server and RL counters are fresh at 0. The warm-start
+            # checkpoint's own step counter is inherited supervised progress —
+            # provenance metadata, never RL pacing progress (PR-03).
+            ws = self._warm_start_info or {}
+            self.trainer.run_metadata = {
+                "warm_start": str(base_checkpoint) if base_checkpoint else "random_init",
+                "warm_start_sha256": ws.get("sha256", "unverified"),
+                "warm_start_step": ws.get("step", 0),
+            }
+            if ws.get("step"):
+                self.trainer.inherited_step_num = int(ws["step"])
+                self.trainer.warm_start_path = str(base_checkpoint)
+                self.trainer.warm_start_step = int(ws["step"])
+            logger.info(
+                "[WARM-START] RL counters start at 0 (inherited supervised step=%s as provenance)",
+                ws.get("step", 0),
+            )
 
         # Load puzzles
         self.puzzles = load_puzzles(self.puzzle_csv_path)
         logger.info(f"Loaded {len(self.puzzles)} fixed Lichess puzzles for 6-hour evaluation.")
+
+    def _select_resume_checkpoint(self) -> Optional[str]:
+        """Pick the best RL-resumable checkpoint in ``checkpoint_dir``, or None.
+
+        A candidate is resumable only when it is readable, carries model weights
+        with the project architecture, and its optimizer state is SGD-compatible
+        (or has no per-parameter state yet). Poisoned checkpoints — supervised
+        AdamW state saved by a failed run's exception cleanup — are skipped with
+        a loud warning: filename ordering (``phase4_final``/``latest``) must
+        never decide what a relaunch resumes from.
+        """
+        from python.train.train_rl import inspect_rl_checkpoint
+
+        rejected: List[str] = []
+        candidates: List[Dict[str, Any]] = []
+        try:
+            files = sorted(self.checkpoint_dir.glob("*.pt"))
+        except OSError:
+            return None
+        for f in files:
+            if not f.is_file():
+                continue
+            info = inspect_rl_checkpoint(f)
+            if info is None:
+                rejected.append(f"{f.name}: unreadable or invalid")
+                continue
+            if info["optimizer_class"] not in ("SGD", "empty"):
+                rejected.append(
+                    f"{f.name}: optimizer state is {info['optimizer_class']} "
+                    "(foreign/poisoned — not resumable by an SGD trainer)"
+                )
+                continue
+            candidates.append(info)
+        for line in rejected:
+            logger.warning("[RESUME] excluded checkpoint: %s", line)
+        if not candidates:
+            if files:
+                logger.warning(
+                    "[RESUME] no SGD-compatible RL checkpoint in %s (%d file(s) rejected); "
+                    "starting from the warm-start base instead",
+                    self.checkpoint_dir,
+                    len(rejected),
+                )
+            return None
+        best = max(candidates, key=lambda c: (c["step"], c["mtime"]))
+        logger.info(
+            "[RESUME] selected %s (step=%s, optimizer=%s) — %d compatible candidate(s)",
+            best["path"],
+            best["step"],
+            best["optimizer_class"],
+            len(candidates),
+        )
+        return best["path"]
 
     def _init_eval_csv(self) -> None:
         # NOTE: columns are append-only. Never reorder or rename existing
@@ -696,6 +789,15 @@ class Phase4Orchestrator:
             "stockfish_sha256_16",
             "commit",
             "partial",
+            # Opponent provenance + search-aware puzzle metric (EV-01/EV-04,
+            # carried from the strength-remediation branch; appended).
+            "sf_engine",
+            "sf_elo",
+            "sf_elo_verified",
+            "mcts_puzzle_sims",
+            "mcts_puzzle_solved",
+            "mcts_puzzle_total",
+            "mcts_puzzle_rate",
         ]
         need_write = True
         if self.eval_csv_path.exists():
@@ -719,6 +821,30 @@ class Phase4Orchestrator:
             with open(self.eval_csv_path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 writer.writerow(headers)
+        # Per-game durability (F-15): every completed match game is persisted
+        # the moment it finishes, so an interrupted evaluation keeps its
+        # evidence and a resumed run can deduplicate by (step, seed, color).
+        self.match_games_csv_path = self.log_dir / "match_games.csv"
+        if not self.match_games_csv_path.exists():
+            with open(self.match_games_csv_path, "w", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow(
+                    [
+                        "timestamp",
+                        "step",
+                        "model_version",
+                        "checkpoint_file",
+                        "model_sha256",
+                        "opening_idx",
+                        "engine_is_white",
+                        "result",
+                        "seed",
+                        "stockfish_elo",
+                        "stockfish_nodes",
+                        "mcts_sims",
+                        "search_mode",
+                        "plies",
+                    ]
+                )
 
         # Per-game durability ledger: one row per completed match game.
         if not self.match_games_csv_path.exists():
@@ -825,13 +951,14 @@ class Phase4Orchestrator:
             f.flush()
             os.fsync(f.fileno())
 
-    def _promotion_gate(self, match_res: dict) -> tuple[bool, str]:
-        """Strength gate for best_eval.pt promotion (R-07).
+    def _promotion_gate(self, match_res: dict, puzzle_rate: Optional[float] = None) -> tuple[bool, str]:
+        """Strength gate for best_eval.pt promotion (R-07, hardened per EV-01/EV-04).
 
         A 100-game match has an Elo confidence interval of roughly ±90-140 Elo, and the
         composite score weights it at 0.7, so a purely luckier match can out-score a
-        stronger engine. Require both a real sample and a real score before promoting.
-        An interrupted/partial match must never read as a promotion signal (Stage A §7).
+        stronger engine. Require a real sample, a real score, a COMPLETE match record
+        (an interrupted/failed eval must never read as a promotion signal), and that
+        the candidate still retains baseline supervised puzzle strength.
         """
         if match_res.get("interrupted"):
             return (
@@ -851,7 +978,81 @@ class Phase4Orchestrator:
                 False,
                 f"engine score {score:.3f} < required {self.promotion_min_score:.3f}",
             )
+        if match_res.get("interrupted"):
+            return (False, "match interrupted before completion (record incomplete)")
+        if match_res.get("completed_games", games) < games:
+            return (
+                False,
+                f"match record incomplete ({match_res.get('completed_games')} of {games} games persisted)",
+            )
+        # Baseline retention (EV-01/B4): a candidate that loses the warm-start's
+        # supervised puzzle strength must not promote on a lucky match score.
+        baseline = self._baseline_puzzle_rate
+        if baseline is not None and puzzle_rate is not None:
+            retention_band = max(2.0 * self.puzzle_noise_band, 0.03)
+            if puzzle_rate < baseline - retention_band:
+                return (
+                    False,
+                    f"puzzle solve rate {puzzle_rate:.3f} below baseline retention "
+                    f"({baseline:.3f} - band {retention_band:.3f})",
+                )
         return True, f"{games} games, engine score {score:.3f}"
+
+    def _run_promotion_sprt(self, candidate_ckpt: Path, openings: int) -> tuple[str, str]:
+        """Bounded SPRT of the candidate against the current promotion baseline.
+
+        The baseline is the current ``best_eval.pt`` when one exists, otherwise
+        the run's warm-start checkpoint. Returns ``(decision, detail)``; only
+        ``ACCEPT_H1`` promotes (EV-03: threshold passes can be noise, and an
+        INCONCLUSIVE result must not promote either).
+        """
+        import shutil
+        import tempfile
+
+        base_path = self.checkpoint_dir / "best_eval.pt"
+        baseline_label = "best_eval"
+        if not base_path.exists():
+            ws = str(getattr(self, "_active_checkpoint_path", "") or "")
+            if not ws or ws == "random_init":
+                return "UNAVAILABLE", "no best_eval and no warm-start baseline to test against"
+            base_path = Path(ws)
+            baseline_label = "warm-start"
+        if not base_path.exists():
+            return "UNAVAILABLE", f"baseline checkpoint missing: {base_path}"
+
+        with tempfile.TemporaryDirectory(prefix="sprt_promotion_") as td:
+            cand_copy = Path(td) / "candidate.pt"
+            base_copy = Path(td) / "base.pt"
+            shutil.copyfile(candidate_ckpt, cand_copy)
+            shutil.copyfile(base_path, base_copy)
+            try:
+                from scripts.run_sprt import SprtMatchRunner
+
+                runner = SprtMatchRunner(
+                    candidate_checkpoint=str(cand_copy),
+                    base_checkpoint=str(base_copy),
+                    device=self.device,
+                    sims=self.eval_sims if self.eval_sims else 400,
+                    workers=8,
+                )
+                result = runner.run_sprt(
+                    f"promotion_step{self.trainer.step_num}",
+                    {"c_puct": 2.0, "fpu_reduction": 0.2},
+                    {"c_puct": 2.0, "fpu_reduction": 0.2},
+                    Path(td) / "out",
+                    max_games=self.promotion_sprt_max_games,
+                )
+            except Exception as e:
+                logger.exception("Promotion SPRT failed; refusing to promote on failure")
+                return "FAILED", f"{type(e).__name__}: {e}"
+        s = result["sprt"]
+        detail = (
+            f"{s['n']} games W{s['wins']}/D{s['draws']}/L{s['losses']} vs {baseline_label}, "
+            f"LLR {s['llr']:+.2f} bounds [{s['lower_bound']:.2f}, {s['upper_bound']:.2f}]"
+        )
+        logger.info("[PROMOTION SPRT] %s — %s", result["final_status"], detail)
+        self._event("PROMOTION_SPRT", f"{result['final_status']}: {detail}")
+        return result["final_status"], detail
 
     def _save_best_eval_state(self, **fields: object) -> None:
         payload = dict(fields)
@@ -912,7 +1113,7 @@ class Phase4Orchestrator:
         self._known_ckpt_names.add(ckpt_name)
         self._event("CHECKPOINT", f"saved {ckpt_path} sha={short_hash(str(ckpt_path))} (eval)")
 
-        # 1. Evaluate Puzzles
+        # 1. Evaluate Puzzles (policy top-1) — a policy metric, never a rating.
         logger.info(
             f"[EVAL CYCLE] Evaluating {len(self.puzzles) if not max_puzzles else max_puzzles} puzzles..."
         )
@@ -922,14 +1123,38 @@ class Phase4Orchestrator:
         )
         puzzle_res = evaluator.evaluate_policy(batch_size=128)
         solve_rate = puzzle_res["solve_rate"]
+        # 1b. Search-aware puzzle evaluation (EV-04): the policy head alone is
+        # insensitive to search regressions; the MCTS path measures the whole
+        # play pipeline on the same fixed certified set.
+        mcts_eval_sims = 50 if self.is_verify_mode else 200
+        try:
+            mcts_res = evaluator.evaluate_mcts(num_simulations=mcts_eval_sims)
+            mcts_rate = float(mcts_res.get("solve_rate", 0.0))
+            mcts_solved = int(mcts_res.get("solved", 0))
+            mcts_total = int(mcts_res.get("total", 0))
+            logger.info(
+                f"[EVAL CYCLE] MCTS-{mcts_eval_sims} puzzle solve rate: {mcts_rate * 100:.2f}% "
+                f"({mcts_solved}/{mcts_total})"
+            )
+        except Exception as e:
+            logger.exception("MCTS puzzle evaluation failed; recording as unavailable")
+            mcts_rate, mcts_solved, mcts_total = None, 0, 0
         self._event(
             "EVAL",
             f"puzzles solve_rate={solve_rate * 100:.2f}% "
-            f"({puzzle_res['solved']}/{puzzle_res['total']})",
+            f"({puzzle_res['solved']}/{puzzle_res['total']}) "
+            f"mcts_{mcts_eval_sims}={mcts_rate if mcts_rate is not None else 'unavailable'}",
         )
         logger.info(
             f"[EVAL CYCLE] Puzzle solve rate: {solve_rate * 100:.2f}% ({puzzle_res['solved']}/{puzzle_res['total']})"
         )
+
+        if self._baseline_puzzle_rate is None:
+            # First completed eval of this run anchors baseline retention: at
+            # run start (or --skip-baseline-eval absent) this IS the warm
+            # start's supervised strength.
+            self._baseline_puzzle_rate = solve_rate
+            logger.info(f"[EVAL CYCLE] Baseline puzzle rate anchored at {solve_rate:.4f}")
 
         # Persist the completed puzzle phase BEFORE the potentially long engine
         # match (Stage A §7): an interrupted match must not lose the puzzle row.
@@ -950,11 +1175,17 @@ class Phase4Orchestrator:
         eval_sims = (
             self.eval_sims if self.eval_sims is not None else (10 if self.is_verify_mode else 400)
         )
+        elo_note = f", UCI_Elo {self.stockfish_elo}" if self.stockfish_elo else ", full strength"
+        logger.info(
+            f"[EVAL CYCLE] Running {openings * 2}-game match vs Stockfish "
+            f"({self.stockfish_nodes} nodes{elo_note})..."
+        )
         match_runner = MatchRunner(
             model=self.trainer.model,
             device=self.device,
             stockfish_path=self.stockfish_path,
             stockfish_nodes=self.stockfish_nodes,
+            stockfish_elo=self.stockfish_elo,
             mcts_sims=eval_sims,
             c_puct=2.0,
             openings_path=self.openings_path,
@@ -1046,6 +1277,18 @@ class Phase4Orchestrator:
             )
         )
         row.extend([model_sha, stockfish_sha16, self._run_commit, int(partial)])
+        # Opponent provenance + search-aware puzzle metric (append-only).
+        row.extend(
+            [
+                engine_info.get("engine_name", "unknown"),
+                self.stockfish_elo if self.stockfish_elo else "full",
+                int(bool(engine_info.get("elo_verified"))),
+                mcts_eval_sims,
+                mcts_solved,
+                mcts_total,
+                round(mcts_rate, 4) if mcts_rate is not None else "unavailable",
+            ]
+        )
         self._append_eval_row(row)
 
         # Log to TensorBoard
@@ -1079,7 +1322,15 @@ class Phase4Orchestrator:
         # Promotion gate: save models/checkpoints_rl/best_eval.pt only when the candidate
         # is demonstrably strong, then only when it improves on the previous best score.
         comp_score = float(match_res["engine_score"]) * 0.7 + float(solve_rate) * 0.3
-        eligible, gate_reason = self._promotion_gate(match_res)
+        eligible, gate_reason = self._promotion_gate(match_res, puzzle_rate=solve_rate)
+        if eligible and self.promotion_sprt_max_games > 0:
+            # Sequential-testing protocol (EV-03): a threshold pass alone can be
+            # noise; when enabled, promotion additionally requires an SPRT
+            # decision (never an INCONCLUSIVE or REJECT_H1 result).
+            sprt_decision, sprt_detail = self._run_promotion_sprt(ckpt_path, openings)
+            if sprt_decision != "ACCEPT_H1":
+                eligible = False
+                gate_reason = f"SPRT {sprt_decision}: {sprt_detail}"
         previous_best = self._best_eval_comp_score
         if not eligible:
             logger.info(
@@ -1152,11 +1403,13 @@ class Phase4Orchestrator:
                 "_warned_false_resign",
                 "TRIGGER",
                 f"false-resign rate {false_resign_rate * 100:.1f}% > 5% threshold "
-                f"(LOG-ONLY, resign stays off)",
+                f"(LOG-ONLY; measured on games where resignation was disabled for calibration)",
             )
             logger.warning(
                 f"SAFETY TRIGGER (LOG-ONLY): False-resign rate exceeded 5% (currently {false_resign_rate * 100:.1f}% "
-                f"over {self.metrics_tracker.total_would_have_resigned} calibration games; resignation is disabled)."
+                f"over {self.metrics_tracker.total_would_have_resigned} calibration games — resignation "
+                f"runs disabled in {int(round(getattr(self, 'disable_resign_prob', 0.15) * 100))}% "
+                "of games for exactly this measurement)."
             )
 
         # Check 3: Policy entropy collapse (> 35% drop from baseline)
@@ -1226,7 +1479,14 @@ class Phase4Orchestrator:
             ("CONC", f"requested={self._requested_concurrency} effective={conc}{conc_mark} (C)"),
             ("TEMP", "cutoff plies 15-30 (C)"),
             ("NOISE", "dirichlet alpha=0.3 weight=0.25 (C, search defaults)"),
-            ("RESIGN", "off (C, passive would_resign logged)"),
+            (
+                "RESIGN",
+                f"on t={self.worker.resign_threshold} k={self.worker.consecutive_resign_moves} "
+                f"ply>={self.worker.min_resign_ply}; "
+                f"{int(round((1 - self.disable_resign_prob) * 100))}% of games resign, "
+                f"{int(round(self.disable_resign_prob * 100))}% run disabled for "
+                "false-resign calibration (RL-02)",
+            ),
             ("TABLEBASE", tb),
             ("REUSE_CAP", f"{self.max_reuse_ratio}{'*' if self.max_reuse_ratio != 16 else ''} (C)"),
             ("MIN_FILL", f"{min_fill}{'*' if self.min_buffer_fill not in (0, 500) else ''} (C)"),
@@ -1682,10 +1942,13 @@ class Phase4Orchestrator:
                         self.run_eval_cycle(max_puzzles=1000, match_openings=self.eval_openings)
                     self.last_eval_time = time.time()
 
-                # Pacing: Avoid runaway training steps that starve self-play workers
-                target_max_step = max(
-                    500,
-                    int((self.buffer.total_added * self.max_reuse_ratio) / self.trainer.batch_size),
+                # Pacing: Avoid runaway training steps that starve self-play workers.
+                # The gate compares THIS RUN's RL steps (trainer.step_num, reset to 0
+                # on warm start) against buffer production of THIS RUN — an inherited
+                # supervised counter must never hold the gate closed (PR-03: the Oct 26
+                # run idled ~100 minutes before its first step on exactly this bug).
+                target_max_step = pacing_target_step(
+                    self.buffer.total_added, self.trainer.batch_size, self.max_reuse_ratio
                 )
                 if self.trainer.step_num > target_max_step:
                     self._maybe_status()
@@ -1742,6 +2005,7 @@ class Phase4Orchestrator:
                 time.sleep(0.001)
 
         except SafetyTriggerException as ste:
+            self._status_for_checkpoint = "SAFETY_STOP"
             self.stop()
             emit_error(
                 error_block(
@@ -1757,25 +2021,15 @@ class Phase4Orchestrator:
         except KeyboardInterrupt:
             logger.info("KeyboardInterrupt received. Stopping run cleanly...")
             self._event("SHUTDOWN", "Ctrl+C received; stopping cleanly")
+            self._status_for_checkpoint = "INTERRUPTED"
             self.stop()
             self._print_summary("INTERRUPTED")
             self._exit_reason = "interrupted"
             return 0
         except Exception as e:
-            logger.exception("Unhandled exception in Phase 4 training loop")
-            self.stop()
-            emit_error(
-                error_block(
-                    f"unexpected failure: {e}",
-                    "unhandled exception in self-play, training, or evaluation",
-                    "see LOG traceback, fix the cause, resume with the same command",
-                    str(self.log_dir / "phase4_rl.log"),
-                )
-            )
-            self._print_summary("FAILED")
-            self._exit_reason = "error"
-            return 1
+            return self._handle_unexpected_error(e)
         else:
+            self._status_for_checkpoint = "SUCCESS"
             self.stop()
             self._print_summary("SUCCESS")
             self._exit_reason = "ok"
@@ -1783,21 +2037,41 @@ class Phase4Orchestrator:
         finally:
             self.stop()
 
+    def _handle_unexpected_error(self, e: Exception) -> int:
+        """Clean up after an unhandled exception and report it (always logs the traceback)."""
+        logger.exception("Phase 4 run failed: %s", e)
+        self._status_for_checkpoint = "FAILED"
+        self.stop()
+        emit_error(
+            error_block(
+                f"unexpected failure: {e}",
+                "unhandled exception in self-play, training, or evaluation",
+                "see LOG traceback, fix the cause, resume with the same command",
+                str(self.log_dir / "phase4_rl.log"),
+            )
+        )
+        self._print_summary("FAILED")
+        self._exit_reason = "error"
+        return 1
+
     def _print_summary(self, status: str) -> None:
         """Exit/SIGINT summary: totals from counters + standard footer."""
         elapsed = time.time() - self.start_time
         games = self.metrics_tracker.total_games
-        self._emit(
-            status_line(
-                [
-                    ("games", games),
-                    ("positions", self.buffer.total_added),
-                    ("steps", self.trainer.step_num),
-                    ("model_v", self.server.model_version),
-                    ("evals", len(self.puzzle_solve_history)),
-                ]
-            )
-        )
+        # Counters are labeled explicitly (PR-04): "steps" alone was ambiguous
+        # after a warm start (Run B logged steps=6000 — an inherited supervised
+        # counter — and looked like progress).
+        fields = [
+            ("games", games),
+            ("positions", self.buffer.total_added),
+            ("rl_steps", self.trainer.step_num),
+            ("run_steps", self._steps_this_run),
+            ("model_v", self.server.model_version),
+            ("evals", len(self.puzzle_solve_history)),
+        ]
+        if getattr(self.trainer, "inherited_step_num", 0):
+            fields.append(("inherited_supervised_steps", self.trainer.inherited_step_num))
+        self._emit(status_line(fields))
         exit_code = 0 if status in ("SUCCESS", "INTERRUPTED") else 1
         self._emit(summary_block(status, elapsed, self._warnings, exit_code))
 
@@ -1809,6 +2083,16 @@ class Phase4Orchestrator:
         self._event("SHUTDOWN", "stopping workers and saving final checkpoint")
         logger.info("Shutting down Phase 4 orchestrator...")
         self.stop_event.set()
+        # Stamp the termination status into the final checkpoint so a structurally
+        # valid checkpoint from a failed run can never masquerade as a completed
+        # training run (the Oct 26 Run B failure mode).
+        try:
+            self.trainer.run_metadata["run_status"] = getattr(
+                self, "_status_for_checkpoint", "unknown"
+            )
+            self.trainer.run_metadata["terminated_at_unix"] = time.time()
+        except AttributeError:
+            pass
         try:
             self.worker.stop()
             final_ckpt = self.trainer.save_checkpoint(
@@ -1975,6 +2259,40 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--allow-unverified-warm-start",
+        action="store_true",
+        help=(
+            "Operator override: start RL from a checkpoint that is absent from the "
+            "checkpoint registry or not designated as a warm start. The decision is "
+            "logged loudly; without this flag such starts are rejected (F-11/F-12)."
+        ),
+    )
+    parser.add_argument(
+        "--stockfish-elo",
+        type=int,
+        default=1500,
+        help=(
+            "Limit the eval/promotion opponent with UCI_LimitStrength at this UCI_Elo "
+            "(1320-3190). Default 1500 = the calibrated baseline cell; the match score "
+            "is otherwise a floor against full-strength Stockfish."
+        ),
+    )
+    parser.add_argument(
+        "--stockfish-full-strength",
+        action="store_true",
+        help="Explicitly disable the UCI_Elo limit (legacy full-strength opponent).",
+    )
+    parser.add_argument(
+        "--promotion-sprt-max-games",
+        type=int,
+        default=0,
+        help=(
+            "Bounded SPRT games required before promotion (0 = threshold gate only). "
+            "When >0, promotion additionally requires an ACCEPT_H1 decision vs "
+            "best_eval.pt (or the warm start) at H0=0/H1=+30."
+        ),
+    )
+    parser.add_argument(
         "--device", type=str, default=None, help="Execution device (default: auto cuda/cpu)"
     )
     parser.add_argument(
@@ -2135,6 +2453,8 @@ def main() -> None:
             watchdog_free_ram_gb=args.watchdog_free_ram_gb,
             max_wait_ms=args.max_wait_ms,
             stockfish_nodes=args.stockfish_nodes,
+            stockfish_elo=None if args.stockfish_full_strength else args.stockfish_elo,
+            promotion_sprt_max_games=args.promotion_sprt_max_games,
             base_lr=args.base_lr,
             min_lr=args.min_lr,
             tactical_mix=args.tactical_mix,
@@ -2183,6 +2503,8 @@ def main() -> None:
             watchdog_free_ram_gb=args.watchdog_free_ram_gb,
             max_wait_ms=args.max_wait_ms,
             stockfish_nodes=args.stockfish_nodes,
+            stockfish_elo=None if args.stockfish_full_strength else args.stockfish_elo,
+            promotion_sprt_max_games=args.promotion_sprt_max_games,
             base_lr=args.base_lr,
             min_lr=args.min_lr,
             tactical_mix=args.tactical_mix,

@@ -25,6 +25,10 @@ struct MCTSConfig {
     bool reuse_tree = false;
     size_t max_nodes = 25000;
     int batch_size = 1;
+    // Per-instance cap on NN-evaluation cache entries. Defaults to NN_CACHE_CAP;
+    // play workloads (UCI/match) can lower it to bound memory in long sessions
+    // (a full 4,672-float policy is ~18.7 KB per entry).
+    size_t nn_cache_cap = 0;  // 0 = use NN_CACHE_CAP
 };
 
 struct SearchResult {
@@ -46,6 +50,12 @@ using BatchEvaluator = std::function<std::vector<std::pair<std::vector<float>, f
 using RawBatchEvaluator =
     std::function<std::pair<std::vector<float>, std::vector<float>>(const std::vector<float>&, int)>;
 
+// Abort predicate: polled periodically during search (approximately every 32
+// simulations in the serial path, once per batch in the batched paths). Return
+// true to stop the search early; the tree built so far is aggregated and
+// returned, so partial results are always valid best-effort results.
+using AbortFn = std::function<bool()>;
+
 class MCTS {
 public:
     // Upper bound on cached NN evaluations. When the cache reaches this size, the
@@ -64,16 +74,27 @@ public:
         const Game& root_state,
         int num_simulations,
         const Evaluator& evaluator,
-        const BatchEvaluator& batch_evaluator = nullptr
+        const BatchEvaluator& batch_evaluator = nullptr,
+        const AbortFn& abort_fn = nullptr
     );
     SearchResult search_batched(
         const Game& root_state,
         int num_simulations,
         const RawBatchEvaluator& batch_eval,
-        int batch_size
+        int batch_size,
+        const AbortFn& abort_fn = nullptr
     );
     size_t cache_size() const { return nn_cache_.size(); }
     const MCTSConfig& get_config() const { return config_; }
+
+    // NN-cache key: position hash mixed with the game's draw-relevant history
+    // (halfmove clock, repetition flag). Two transpositions with different
+    // draw status therefore never share an evaluation (SR-02).
+    static uint64_t cache_key(const Game& state) {
+        uint64_t h = state.get_hash();
+        h ^= state.draw_history_key() * 0xBF58476D1CE4E5B9ULL + 0x9E3779B97F4A7C15ULL;
+        return h;
+    }
 
     // Subtree reuse API
     bool advance_root(int my_action, int opp_action, const Game& new_state);

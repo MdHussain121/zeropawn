@@ -200,7 +200,11 @@ def test_puzzle_decline_noise_band():
     jitter = [0.5000, 0.4996, 0.4992, 0.4988]
     assert old(jitter) is True  # before: trips on noise
     assert new(jitter) is False  # after: band absorbs it
-    slide = [0.50, 0.49, 0.48, 0.47]
+    # 0.01/step (1 pp) is within the recalibrated band (0.015 ≈ 1σ of the
+    # certified 1,000-puzzle set at p≈0.64) — measured-noise, must not trip.
+    noise_1pp = [0.50, 0.49, 0.48, 0.47]
+    assert old(noise_1pp) is True and new(noise_1pp) is False
+    slide = [0.50, 0.48, 0.46, 0.44]  # 0.02/step: real decline, still trips
     assert old(slide) is True and new(slide) is True
     flat = [0.50, 0.50, 0.50, 0.50]
     assert old(flat) is False and new(flat) is False

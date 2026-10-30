@@ -233,6 +233,67 @@ def compute_policy_entropy(logits: torch.Tensor) -> float:
         return float(entropy.item())
 
 
+_LABEL_SMOOTHING = 0.05
+_warned_unmasked = False
+
+
+def legal_masked_policy_loss(
+    logits: torch.Tensor,
+    moves: torch.Tensor,
+    legal_mask: Optional[torch.Tensor],
+    label_smoothing: float = _LABEL_SMOOTHING,
+) -> torch.Tensor:
+    """Policy cross-entropy with label smoothing restricted to LEGAL actions (SL-01).
+
+    With mask: the target distribution is ``(1-s)`` on the played move plus
+    ``s`` spread uniformly over the position's legal actions, so no probability
+    mass is ever spent teaching the model that impossible moves are plausible.
+    Without mask: legacy full-vocabulary smoothing (the pre-remediation
+    behavior), loudly logged once — capability is opt-in by dataset schema,
+    never silently skipped.
+
+    Illegal training labels are a data-integrity error and raise.
+    """
+    global _warned_unmasked
+    if legal_mask is None:
+        if not _warned_unmasked:
+            logger.warning(
+                "Batch has NO legal-mask stream: falling back to full-vocabulary "
+                "label smoothing over all 4672 actions (pre-remediation behavior). "
+                "Rebuild the dataset with a schema-2 builder to enable legal-move "
+                "masking (SL-01)."
+            )
+            _warned_unmasked = True
+        return F.cross_entropy(logits, moves, label_smoothing=label_smoothing)
+
+    if legal_mask.dtype != torch.bool:
+        legal_mask = legal_mask.bool()
+    legal_counts = legal_mask.sum(dim=1)
+    if int((legal_counts == 0).sum().item()):
+        bad = int((legal_counts == 0).sum().item())
+        raise ValueError(
+            f"legal-mask stream contains {bad} position(s) with zero legal actions"
+        )
+
+    # Data-integrity gate: the stored label must be a legal action.
+    label_legal = legal_mask.gather(1, moves.unsqueeze(1)).squeeze(1)
+    illegal = (~label_legal).sum().item()
+    if illegal:
+        idx = torch.nonzero(~label_legal, as_tuple=True)[0][:5].tolist()
+        raise ValueError(
+            f"Illegal training label(s): {illegal} move(s) in this batch are not in "
+            f"the position's legal-action set (first indices {idx}). This is a "
+            "data-integrity error, not something to smooth over."
+        )
+
+    log_probs = F.log_softmax(logits.float(), dim=-1)
+    natural = -log_probs.gather(1, moves.unsqueeze(1)).squeeze(1)
+    # Mean log-probability over legal actions only (per row).
+    legal_mean = -(log_probs * legal_mask).sum(dim=1) / legal_counts
+    s = float(label_smoothing)
+    return ((1.0 - s) * natural + s * legal_mean).mean()
+
+
 def train_step(
     model: nn.Module,
     batch: dict[str, torch.Tensor],
@@ -264,8 +325,12 @@ def train_step(
     with autocast_context:
         policy_logits, wdl_logits = model(planes)
 
-        # Policy loss: Cross-Entropy with 0.05 label smoothing
-        policy_loss = F.cross_entropy(policy_logits, moves, label_smoothing=0.05)
+        # Policy loss: legal-move-masked CE with smoothing over legal actions
+        # only (SL-01); falls back to full-vocabulary smoothing when the batch
+        # carries no mask stream (logged once).
+        policy_loss = legal_masked_policy_loss(
+            policy_logits, moves, batch.get("legal_mask"), label_smoothing=0.05
+        )
 
         # Value loss: Cross-Entropy with soft WDL targets + mask for first 10 plies
         log_wdl = F.log_softmax(wdl_logits, dim=-1)
@@ -373,9 +438,13 @@ def evaluate(
 
             with autocast_context:
                 policy_logits, wdl_logits = model(planes)
-                policy_loss = F.cross_entropy(
-                    policy_logits, moves, label_smoothing=0.05, reduction="sum"
+                # Evaluation keeps the same objective as training (masked when
+                # the batch carries a mask stream), summed per-sample for
+                # exact averaging over the split.
+                per_sample_policy = legal_masked_policy_loss(
+                    policy_logits, moves, batch.get("legal_mask"), label_smoothing=0.05
                 )
+                policy_loss = per_sample_policy * batch_sz
                 log_wdl = F.log_softmax(wdl_logits, dim=-1)
                 ce_wdl = -(value_targets * log_wdl).sum(dim=-1)
                 val_mask = ((plies >= 10) & (value_targets.sum(dim=-1) > 0)).float()

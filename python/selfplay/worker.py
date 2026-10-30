@@ -46,13 +46,12 @@ _PLANE_LAYOUTS: Dict[int, Tuple[int, int, int]] = {
 
 
 class InferenceError(RuntimeError):
-    """A genuine leaf-evaluation failure (model/inference error), not a draw.
+    """Raised when an NN inference request cannot be served.
 
-    Raised into waiting simulations when a batched inference call fails, so a
-    transient CUDA/driver error aborts the affected search instead of silently
-    substituting uniform policies and 0.0 values (audit M-3). Shutdown wake-ups
-    use the same error so partially played games are discarded rather than
-    recorded with fabricated evaluations.
+    A failed inference is NOT a neutral evaluation: handing back a uniform
+    policy and value 0.0 silently poisons the search statistics of that game
+    and the resulting training samples. Games that hit this error must be
+    flagged invalid and excluded from the training data.
     """
 
 
@@ -123,6 +122,7 @@ class GameSummary:
     cut_ply: Optional[int] = None
     cut_piece_count: Optional[int] = None
     raw_wdl: Optional[int] = None
+    would_have_resigned_side_white: Optional[bool] = None  # side that would have resigned
 
 
 class WorkerBatchAggregator:
@@ -155,6 +155,8 @@ class WorkerBatchAggregator:
         self.flush_timeout_count = 0
         self.flush_capacity_count = 0
         self.inference_failure_count = 0
+        self.failed_flushes = 0
+        self.failed_eval_requests = 0
         self.total_gil_eval_sec = 0.0
         self.total_gil_wait_sec = 0.0
         self.total_gil_dispatch_sec = 0.0
@@ -206,10 +208,16 @@ class WorkerBatchAggregator:
 
         t_before_wait = time.perf_counter()
         if not evt.wait(timeout=60):
-            raise TimeoutError("Timed out waiting for batched inference result")
+            raise InferenceError("Timed out waiting for batched inference result")
         t_after_wait = time.perf_counter()
         res0, res1, err = res_box[0], res_box[1], res_box[2]
         t_end = time.perf_counter()
+        if isinstance(res0, BaseException):
+            # Fail closed: the flush already logged the underlying error. This
+            # game's search statistics are unusable; the caller must discard it.
+            with self._window_lock:
+                self.failed_eval_requests += 1
+            raise res0
 
         if err is not None:
             raise InferenceError(f"Leaf evaluation failed: {err}") from err
@@ -224,6 +232,56 @@ class WorkerBatchAggregator:
             self.total_eval_calls += 1
         return res0, res1
 
+    def evaluate_games_batch(
+        self, games: List[Any]
+    ) -> List[Tuple[np.ndarray, float]]:
+        """Batch evaluator for the canonical ``search(batch_evaluator=...)`` contract.
+
+        Encodes each game, submits every leaf through the same cross-game
+        batching pipeline as ``evaluate_game_state``, and returns results in
+        input order (the C++ batched path indexes results by input position).
+        """
+        if not games:
+            return []
+        entries: List[Tuple[Any, List[Any], threading.Event]] = []
+        need_flush = False
+        with self.lock:
+            for g in games:
+                if hasattr(g, "num_planes") and g.num_planes() == 3:
+                    state = g.encode_state()
+                else:
+                    state = zeropawn_cpp.encode_state(g)
+                res_box: List[Any] = [None, None, None]  # [policy, scalar_val, error]
+                evt = threading.Event()
+                if not self.pending:
+                    self.first_arrival_time = time.perf_counter()
+                self.pending.append((state, res_box, evt))
+                entries.append((state, res_box, evt))
+                if len(self.pending) >= self.max_batch_size:
+                    need_flush = True
+                    self.first_arrival_time = None
+            if not need_flush and len(self.pending) == len(entries):
+                self.cond.notify()
+        if need_flush:
+            with self._window_lock:
+                self.flush_capacity_count += 1
+            self._flush_locked()
+
+        results: List[Tuple[np.ndarray, float]] = []
+        for _, res_box, evt in entries:
+            if not evt.wait(timeout=60):
+                raise InferenceError("Timed out waiting for batched inference result")
+            res0, res1, err = res_box[0], res_box[1], res_box[2]
+            if isinstance(res0, BaseException):
+                # Fail closed: the flush already logged the underlying error.
+                with self._window_lock:
+                    self.failed_eval_requests += 1
+                raise res0
+            if err is not None:
+                raise InferenceError(f"Leaf evaluation failed: {err}") from err
+            results.append((res0, res1))
+        return results
+
     def get_window_queue_wait_ms(self) -> float:
         """Returns and resets average queue wait time in ms since last call."""
         with self._window_lock:
@@ -234,6 +292,24 @@ class WorkerBatchAggregator:
         if count == 0:
             return 0.0
         return (time_sec / count) * 1000.0
+
+    def _fail_batch(self, batch: List[Any], exc: Exception) -> None:
+        """Deliver an inference failure to every waiter in ``batch``.
+
+        Genuine failures abort the affected searches with ``InferenceError``
+        (audit M-3) instead of fabricating uniform policies and 0.0 values
+        inside a running search: a failed inference must be distinguishable
+        from a valid neutral evaluation so the affected games can be excluded
+        from training data.
+        """
+        self.inference_failure_count += 1
+        with self._window_lock:
+            self.failed_flushes += 1
+        for item in batch:
+            item[1][0] = None
+            item[1][1] = None
+            item[1][2] = exc
+            item[2].set()
 
     def _flush_locked(self) -> None:
         """Flush all pending requests to inference client synchronously.
@@ -250,20 +326,6 @@ class WorkerBatchAggregator:
             self.pending = []
             self.first_arrival_time = None
         self._flush_batch(batch)
-
-    def _fail_batch(self, batch: List[Any], exc: Exception) -> None:
-        """Deliver an inference failure to every waiter in ``batch``.
-
-        Genuine failures abort the affected searches with ``InferenceError``
-        (audit M-3) instead of fabricating uniform policies and 0.0 values
-        inside a running search.
-        """
-        self.inference_failure_count += 1
-        for item in batch:
-            item[1][0] = None
-            item[1][1] = None
-            item[1][2] = exc
-            item[2].set()
 
     def _flush_batch(self, batch: List[Any]) -> None:
         """Evaluate one snapshot batch and deliver results to its waiters."""
@@ -575,10 +637,20 @@ class SelfPlayGame:
         self.resign_threshold = resign_threshold
         self.consecutive_resign_moves = consecutive_resign_moves
         self.min_resign_ply = min_resign_ply
-        if allow_resignation is not None:
-            self.allow_resignation = allow_resignation
-        else:
+        # Resignation semantics (RL-02): `allow_resignation` is the FEATURE
+        # switch; `disable_resign_prob` is the per-game calibration fraction
+        # that must keep working when the feature is ON — otherwise the
+        # false-resign instrumentation is dead code (the Oct 26 audit
+        # finding). Per game:
+        #   feature off  -> resignation never fires; every game logs
+        #                   would-have-resigned (diagnostic mode),
+        #   feature on   -> this game resigns unless sampled into the
+        #                   calibration fraction (disable_resign_prob).
+        self.resign_feature_enabled = bool(allow_resignation)
+        if self.resign_feature_enabled:
             self.allow_resignation = self._rng.random() >= disable_resign_prob
+        else:
+            self.allow_resignation = False
         self.max_plies = max_plies
         self.ply_hook = ply_hook
         self.tablebase_path = tablebase_path
@@ -634,6 +706,11 @@ class SelfPlayGame:
         self.mcts_config.dirichlet_alpha = dirichlet_alpha
         self.mcts_config.dirichlet_weight = dirichlet_weight
         self.mcts_config.seed = mcts_seed
+        # LRU-bounded per-game cache (SR-03): replaces the old wholesale
+        # clear() at 2048 entries — same memory envelope (~2048 x 18.7 KB per
+        # game), but eviction is least-recently-used instead of forgetting
+        # everything, so priors survive within a game.
+        self.mcts_config.nn_cache_cap = 2048
         self.mcts = zeropawn_cpp.MCTS(self.mcts_config)
 
         # Game state
@@ -724,14 +801,6 @@ class SelfPlayGame:
                                     white_won = None
                                     game_result = "1/2-1/2"
                                 termination_reason = "tablebase_adjudication"
-
-                        # Bound MCTS cache growth (same as normal path)
-                        if hasattr(self.mcts, "cache_size") and hasattr(self.mcts, "clear"):
-                            try:
-                                if self.mcts.cache_size() > 2048:
-                                    self.mcts.clear()
-                            except Exception:
-                                pass
 
                         if adjudicated:
                             break
@@ -846,14 +915,6 @@ class SelfPlayGame:
 
             self.game.apply_action(chosen_action)
             self.ply += 1
-
-            # Bound C++ MCTS cache growth during long games
-            if hasattr(self.mcts, "cache_size") and hasattr(self.mcts, "clear"):
-                try:
-                    if self.mcts.cache_size() > 2048:
-                        self.mcts.clear()
-                except Exception:
-                    pass
 
             # Tablebase adjudication check (after move applied)
             if (
@@ -980,6 +1041,7 @@ class SelfPlayGame:
             resigned=resigned,
             resigned_side_white=resigned_side_white,
             would_have_resigned=self.would_have_resigned,
+            would_have_resigned_side_white=self.would_have_resigned_side_white,
             is_false_resign=is_false_resign,
             duration_sec=duration,
             total_simulations=self.total_simulations,
@@ -1101,6 +1163,7 @@ class SelfPlayWorker:
         self.game_counter = self.worker_id * 1_000_000
         self.threads: List[threading.Thread] = []
         self.total_games_played = 0
+        self.invalid_games = 0
         self.total_positions_generated = 0
         self.total_simulations = 0
         self.live_simulations = 0
@@ -1180,13 +1243,32 @@ class SelfPlayWorker:
 
             try:
                 positions, summary = game.play_game()
-            except (TimeoutError, InferenceError):
-                # Timed-out wait or failed inference: on shutdown this is the
-                # normal wake-up path (discard the partial game); otherwise the
-                # failure must surface instead of being silently swallowed.
+            except (TimeoutError, InferenceError) as e:
+                # Fail closed (audit M-3): the game's samples are contaminated
+                # by a failed or never-completed inference, so discard it and
+                # keep the worker alive. On shutdown this is the normal
+                # wake-up path. Persistent failures stay visible through the
+                # aggregator's inference_failure_count/failed_flushes and the
+                # invalid_games counter.
+                with self.counter_lock:
+                    self.invalid_games += 1
                 if not self.running:
                     break
-                raise
+                logger.warning(
+                    "Game %d marked invalid after %s: %s",
+                    game_id,
+                    type(e).__name__,
+                    e,
+                )
+                continue
+            except Exception:
+                # Unexpected errors must not silently emit partial samples either.
+                with self.counter_lock:
+                    self.invalid_games += 1
+                if not self.running:
+                    break
+                logger.exception("Game %d raised unexpected error; marked invalid", game_id)
+                continue
             finally:
                 with self.counter_lock:
                     self.active_games.pop(thread_id, None)

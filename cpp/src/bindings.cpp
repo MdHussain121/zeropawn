@@ -104,7 +104,8 @@ PYBIND11_MODULE(zeropawn_cpp, m) {
         .def_readwrite("seed", &zeropawn::MCTSConfig::seed)
         .def_readwrite("reuse_tree", &zeropawn::MCTSConfig::reuse_tree)
         .def_readwrite("max_nodes", &zeropawn::MCTSConfig::max_nodes)
-        .def_readwrite("batch_size", &zeropawn::MCTSConfig::batch_size);
+        .def_readwrite("batch_size", &zeropawn::MCTSConfig::batch_size)
+        .def_readwrite("nn_cache_cap", &zeropawn::MCTSConfig::nn_cache_cap);
 
     // Search Result
     py::class_<zeropawn::SearchResult>(m, "SearchResult")
@@ -142,7 +143,16 @@ PYBIND11_MODULE(zeropawn_cpp, m) {
         .def_static("total_freed_nodes", &zeropawn::MCTS::total_freed_nodes)
         .def_static("reset_node_alloc_stats", &zeropawn::MCTS::reset_node_alloc_stats)
         .def("search", [](zeropawn::MCTS& mcts, const zeropawn::Game& game, int num_simulations,
-                          py::function eval_fn, py::object batch_eval_fn = py::none()) {
+                          py::function eval_fn, py::object batch_eval_fn = py::none(),
+                          py::object abort_fn_obj = py::none()) {
+            zeropawn::AbortFn abort = nullptr;
+            if (!abort_fn_obj.is_none()) {
+                py::function afn = abort_fn_obj.cast<py::function>();
+                abort = [afn]() -> bool {
+                    py::gil_scoped_acquire acquire;
+                    return afn().cast<bool>();
+                };
+            }
             zeropawn::Evaluator evaluator = [&eval_fn, &game](const zeropawn::Game& g) -> std::pair<std::vector<float>, float> {
                 py::gil_scoped_acquire acquire;
                 py::object res = eval_fn(&g);
@@ -211,10 +221,11 @@ PYBIND11_MODULE(zeropawn_cpp, m) {
                 };
             }
 
-            return mcts.search(game, num_simulations, evaluator, batch_evaluator);
+            return mcts.search(game, num_simulations, evaluator, batch_evaluator, abort);
         }, py::arg("game"), py::arg("num_simulations"), py::arg("evaluator"),
-           py::arg("batch_evaluator") = py::none(), py::call_guard<py::gil_scoped_release>())
-        .def("search_batched", [](zeropawn::MCTS& mcts, const zeropawn::Game& game, int num_simulations, py::object arg3, py::object arg4) {
+           py::arg("batch_evaluator") = py::none(), py::arg("abort_fn") = py::none(),
+           py::call_guard<py::gil_scoped_release>())
+        .def("search_batched", [](zeropawn::MCTS& mcts, const zeropawn::Game& game, int num_simulations, py::object arg3, py::object arg4, py::object abort_fn_obj = py::none()) {
             // Legacy search_batched builds a fresh root per call and never
             // touches the retained tree, so a reuse_tree config would be a
             // silent no-op here (audit M-2). Refuse the unsupported
@@ -226,6 +237,14 @@ PYBIND11_MODULE(zeropawn_cpp, m) {
                     "fresh root per call and silently ignores subtree reuse). Use the internal-batched "
                     "path instead: set MCTSConfig.batch_size > 1 and call search() with the same "
                     "MCTS instance.");
+            }
+            zeropawn::AbortFn abort = nullptr;
+            if (!abort_fn_obj.is_none()) {
+                py::function afn = abort_fn_obj.cast<py::function>();
+                abort = [afn]() -> bool {
+                    py::gil_scoped_acquire acquire;
+                    return afn().cast<bool>();
+                };
             }
             py::function batch_fn;
             int batch_size = 16;
@@ -271,8 +290,9 @@ PYBIND11_MODULE(zeropawn_cpp, m) {
                     return {std::move(policy), std::move(values)};
                 };
                 py::gil_scoped_release release;
-                result = mcts.search_batched(game, num_simulations, batch_eval, batch_size);
+                result = mcts.search_batched(game, num_simulations, batch_eval, batch_size, abort);
             }
             return result;
-        }, py::arg("game"), py::arg("num_simulations"), py::arg("arg3"), py::arg("arg4"));
+        }, py::arg("game"), py::arg("num_simulations"), py::arg("arg3"), py::arg("arg4"),
+           py::arg("abort_fn") = py::none());
 }

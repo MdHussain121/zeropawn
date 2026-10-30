@@ -37,6 +37,13 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# Version stamped on GPU-cache rows whose model version is genuinely unknown
+# (added without version info, e.g. pre-population from a restored buffer
+# before any weight push). Negative so it can never collide with a real
+# monotonic version counter starting at 1; the staleness sampler treats
+# unknown provenance as untrusted rather than as fresh data.
+UNKNOWN_MODEL_VERSION = -1
+
 
 class ReplayBatchDict(TypedDict):
     planes: torch.Tensor
@@ -58,6 +65,12 @@ class ReplayMetaDict(TypedDict):
 
 class GpuResidentReplayCache:
     """High-throughput circular GPU tensor cache in VRAM for zero-PCIe sampling."""
+
+    # Weight pushes a row may lag the freshest row before the sampler stops
+    # drawing it. Relative to the current max version, so it is armed from the
+    # first push (the old absolute `max_ver > 20` gate let the early run train
+    # on arbitrarily old restored rows).
+    STALENESS_WINDOW = 20
 
     def __init__(
         self,
@@ -132,7 +145,13 @@ class GpuResidentReplayCache:
         full_search: Union[np.ndarray, torch.Tensor],
         versions: Optional[Union[np.ndarray, torch.Tensor]] = None,
     ) -> None:
-        """Add batch of positions directly to GPU cache."""
+        """Add batch of positions directly to GPU cache.
+
+        Rows added without version information are stamped
+        ``UNKNOWN_MODEL_VERSION`` (-1): the staleness sampler treats unknown
+        provenance as untrusted (excluded while known rows are available)
+        instead of as fresh data.
+        """
         n = len(planes)
         if n == 0 or self.capacity == 0:
             return
@@ -155,7 +174,9 @@ class GpuResidentReplayCache:
                     self.device, non_blocking=True
                 )
                 if versions is not None
-                else None
+                else torch.full((n,), UNKNOWN_MODEL_VERSION, dtype=torch.int32).to(
+                    self.device, non_blocking=True
+                )
             )
         else:
             p_t = planes.to(dtype=torch.float32, device=self.device, non_blocking=True)
@@ -165,7 +186,7 @@ class GpuResidentReplayCache:
             ver_t = (
                 versions.to(dtype=torch.int32, device=self.device, non_blocking=True)
                 if versions is not None
-                else None
+                else torch.full((n,), UNKNOWN_MODEL_VERSION, dtype=torch.int32, device=self.device)
             )
 
         if n >= self.capacity:
@@ -173,8 +194,7 @@ class GpuResidentReplayCache:
             self.gpu_visits.copy_(v_t[-self.capacity :])
             self.gpu_outcomes.copy_(o_t[-self.capacity :])
             self.gpu_full_search.copy_(f_t[-self.capacity :])
-            if ver_t is not None:
-                self.gpu_versions.copy_(ver_t[-self.capacity :])
+            self.gpu_versions.copy_(ver_t[-self.capacity :])
             self.write_head = 0
             self.size = self.capacity
             self.total_added += n
@@ -188,8 +208,7 @@ class GpuResidentReplayCache:
                 self.gpu_visits[start:end].copy_(v_t)
                 self.gpu_outcomes[start:end].copy_(o_t)
                 self.gpu_full_search[start:end].copy_(f_t)
-                if ver_t is not None:
-                    self.gpu_versions[start:end].copy_(ver_t)
+                self.gpu_versions[start:end].copy_(ver_t)
             else:
                 part1 = self.capacity - start
                 part2 = n - part1
@@ -197,15 +216,13 @@ class GpuResidentReplayCache:
                 self.gpu_visits[start : self.capacity].copy_(v_t[:part1])
                 self.gpu_outcomes[start : self.capacity].copy_(o_t[:part1])
                 self.gpu_full_search[start : self.capacity].copy_(f_t[:part1])
-                if ver_t is not None:
-                    self.gpu_versions[start : self.capacity].copy_(ver_t[:part1])
+                self.gpu_versions[start : self.capacity].copy_(ver_t[:part1])
 
                 self.gpu_planes[:part2].copy_(p_t[part1:])
                 self.gpu_visits[:part2].copy_(v_t[part1:])
                 self.gpu_outcomes[:part2].copy_(o_t[part1:])
                 self.gpu_full_search[:part2].copy_(f_t[part1:])
-                if ver_t is not None:
-                    self.gpu_versions[:part2].copy_(ver_t[part1:])
+                self.gpu_versions[:part2].copy_(ver_t[part1:])
 
             self.write_head = (start + n) % self.capacity
             self.size = min(self.capacity, self.size + n)
@@ -218,21 +235,24 @@ class GpuResidentReplayCache:
         with self._lock:
             if self.size == 0:
                 raise ValueError("GPU cache is empty.")
-            # Staleness filter: exclude versions > 20 pushes behind current max
+            # Staleness filter (always armed): exclude rows more than
+            # STALENESS_WINDOW weight pushes behind the freshest row, and rows
+            # of unknown provenance (version < 0). For a fresh monotonic run
+            # this is a no-op — it only bites restored/stale/unknown rows.
             cur_versions = self.gpu_versions[: self.size]
             max_ver = int(cur_versions.max().item()) if self.size > 0 else 0
-            if max_ver > 20:
-                valid_mask = cur_versions >= (max_ver - 20)
-                valid_count = int(valid_mask.sum().item())
-                if valid_count >= batch_size:
-                    valid_indices = torch.nonzero(valid_mask, as_tuple=True)[0]
-                    rand_sub = torch.randint(
-                        0, len(valid_indices), (batch_size,), device=self.device
-                    )
-                    indices = valid_indices[rand_sub]
-                else:
-                    indices = torch.randint(0, self.size, (batch_size,), device=self.device)
+            valid_mask = (cur_versions >= (max_ver - self.STALENESS_WINDOW)) & (cur_versions >= 0)
+            valid_count = int(valid_mask.sum().item())
+            if valid_count >= batch_size:
+                valid_indices = torch.nonzero(valid_mask, as_tuple=True)[0]
+                rand_sub = torch.randint(
+                    0, len(valid_indices), (batch_size,), device=self.device
+                )
+                indices = valid_indices[rand_sub]
             else:
+                # Not enough known-fresh rows (e.g. a cache restored without
+                # version info): fall back to sampling everything, but never
+                # pretend unknown rows were fresh.
                 indices = torch.randint(0, self.size, (batch_size,), device=self.device)
             out = {
                 "planes": self.gpu_planes[indices].clone(),
@@ -849,7 +869,10 @@ class ReplayBuffer:
             device=dev,
         )
 
-        # Pre-populate GPU cache with recent positions from buffer if available
+        # Pre-populate GPU cache with recent positions from buffer if available.
+        # Real model versions are carried over so restored rows keep their
+        # provenance (a wholesale version 0 would mark every restored row
+        # "fresh" / or "unknown" and corrupt staleness filtering).
         if self.size > 0:
             fill_n = min(self.size, capacity)
             if self.size < self.capacity:
@@ -860,6 +883,7 @@ class ReplayBuffer:
                     visits=np.array(self.visits[start_idx:end_idx]),
                     outcomes=np.array(self.outcomes[start_idx:end_idx]),
                     full_search=np.array(self.full_search[start_idx:end_idx]),
+                    versions=np.array(self.versions[start_idx:end_idx]),
                 )
             else:
                 recent_indices = [
@@ -870,6 +894,7 @@ class ReplayBuffer:
                     visits=np.array(self.visits[recent_indices]),
                     outcomes=np.array(self.outcomes[recent_indices]),
                     full_search=np.array(self.full_search[recent_indices]),
+                    versions=np.array(self.versions[recent_indices]),
                 )
 
         logger.info(f"Enabled GPU-resident replay cache with capacity {capacity} on {dev}")
@@ -1242,6 +1267,7 @@ class ReplayBuffer:
                 visits=np.expand_dims(pos.visits, 0),
                 outcomes=np.array([pos.outcome], dtype=np.int64),
                 full_search=np.array([pos.is_full_search], dtype=np.bool_),
+                versions=np.array([pos.model_version], dtype=np.int32),
             )
 
     def add_positions(self, positions: List[SavedPosition]) -> None:
