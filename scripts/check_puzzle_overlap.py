@@ -32,6 +32,8 @@ import csv
 import hashlib
 import json
 import sys
+
+import numpy as np
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -39,6 +41,39 @@ from typing import Iterable, Sequence
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
+
+# The C++ extension lives in a build directory that is not on sys.path for
+# direct script runs (pytest's conftest.py handles this for the test suite),
+# and on Windows/MinGW its runtime DLLs need an explicit DLL search directory.
+import os as _os
+
+for _build_candidate in (
+    _REPO_ROOT / "build_zeropawn" / "cpp",
+    _REPO_ROOT / "build" / "cpp",
+    _REPO_ROOT / "build" / "cmake" / "cpp",
+):
+    if _build_candidate.is_dir() and str(_build_candidate) not in sys.path:
+        sys.path.insert(0, str(_build_candidate))
+if _os.name == "nt":
+    _local_app = _os.environ.get("LOCALAPPDATA", "")
+    for _cdir in (
+        Path(_local_app)
+        / "Microsoft"
+        / "WinGet"
+        / "Packages"
+        / "BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe"
+        / "mingw64"
+        / "bin"
+        if _local_app
+        else None,
+        Path("C:/mingw64/bin"),
+        Path("C:/msys64/mingw64/bin"),
+    ):
+        if _cdir and _cdir.is_dir():
+            try:
+                _os.add_dll_directory(str(_cdir))
+            except OSError:
+                pass
 
 
 def _resolve(path: str | Path) -> Path:
@@ -91,6 +126,72 @@ def load_overlap_keys(paths: Sequence[Path]) -> tuple[set[str], set[str]]:
                 ids.add(row["PuzzleId"])
             fens.add(position_key(row["FEN"]))
     return ids, fens
+
+
+def _plane_key(planes) -> bytes:
+    """Digest of the color-invariant position identity from a 19x8x8 plane set.
+
+    Planes 0-16 (own pieces, opponent pieces, castling, en-passant) fully
+    determine the checker's position identity up to color: the encoding is
+    side-to-move oriented, so two positions identical except for which side
+    moves hash the same. This is deliberately conservative for a CONTAMINATION
+    check. Planes 17 (halfmove clock) and 18 (repetition flag) are excluded:
+    they do not change the position's identity and are not recoverable from an
+    evaluation FEN alone.
+    """
+    import hashlib as _hl
+
+    h = _hl.blake2b(digest_size=16)
+    h.update(np.ascontiguousarray(planes[:17], dtype=np.float32).tobytes())
+    return h.digest()
+
+
+def load_shard_keys(shard_dirs: Sequence[Path]) -> set[bytes]:
+    """Position-key digests for every row of binary training shards."""
+    keys: set[bytes] = set()
+    for d in shard_dirs:
+        planes_path = d / "planes.bin"
+        meta_path = d / "metadata.json"
+        if not planes_path.is_file():
+            print(f"WARNING: no planes.bin in {d}; skipped", file=sys.stderr)
+            continue
+        n = None
+        if meta_path.is_file():
+            try:
+                n = int(json.loads(meta_path.read_text(encoding="utf-8"))["num_samples"])
+            except (ValueError, KeyError, json.JSONDecodeError):
+                n = None
+        size = planes_path.stat().st_size
+        row_bytes = 19 * 8 * 8 * 4
+        inferred = size // row_bytes
+        if n is None:
+            n = inferred
+        if n != inferred:
+            print(
+                f"WARNING: {planes_path}: metadata says {n} rows, file size implies "
+                f"{inferred}; using the smaller",
+                file=sys.stderr,
+            )
+            n = min(n, inferred)
+        mm = np.memmap(planes_path, dtype=np.float32, mode="r", shape=(n, 19, 8, 8))
+        chunk = 4096
+        for start in range(0, n, chunk):
+            block = np.asarray(mm[start : start + chunk])
+            for row in block:
+                keys.add(_plane_key(row))
+        del mm
+    return keys
+
+
+def eval_plane_keys(eval_rows: Sequence[dict[str, str]]) -> list[bytes]:
+    """Digest keys for each eval puzzle FEN (encoded through the shared C++ encoder)."""
+    import zeropawn_cpp
+
+    keys: list[bytes] = []
+    for row in eval_rows:
+        game = zeropawn_cpp.ChessGame(row["FEN"])
+        keys.append(_plane_key(zeropawn_cpp.encode_state(game)))
+    return keys
 
 
 def evaluate(
@@ -158,6 +259,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         help="Tactics training CSV to check against (repeatable)",
     )
+    p.add_argument(
+        "--train-shards",
+        action="append",
+        default=[],
+        help=(
+            "Directory of binary training shards (planes.bin + metadata.json) to check "
+            "against — e.g. the full dataset_tactics corpus. Positions are matched by "
+            "a digest of the color-invariant planes (0-16), which is conservative: "
+            "positions identical except for side-to-move also count as overlaps."
+        ),
+    )
     p.add_argument("--output", default=None, help="Write a certified disjoint eval CSV here")
     p.add_argument("--max-puzzles", type=int, default=None, help="Cap the certified set size")
     p.add_argument("--min-rating", type=int, default=None, help="Minimum puzzle rating")
@@ -175,16 +287,17 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     eval_paths = [_resolve(p) for p in args.eval_csv]
     train_paths = [_resolve(p) for p in args.train_csv]
+    shard_dirs = [_resolve(p) for p in args.train_shards]
     if args.paths:
         positional = [_resolve(p) for p in args.paths]
         if not eval_paths:
             eval_paths = [positional[0]]
         train_paths.extend(positional[1:])
 
-    if not eval_paths or not train_paths:
+    if not eval_paths or (not train_paths and not shard_dirs):
         print(
-            "ERROR: need at least one eval CSV and one train CSV "
-            "(positional: EVAL TRAIN..., or --eval-csv/--train-csv)",
+            "ERROR: need at least one eval CSV and one train CSV or shard dir "
+            "(positional: EVAL TRAIN..., or --eval-csv/--train-csv/--train-shards)",
             file=sys.stderr,
         )
         return 2
@@ -193,22 +306,42 @@ def main(argv: Iterable[str] | None = None) -> int:
         if not path.is_file():
             print(f"ERROR: file not found: {path}", file=sys.stderr)
             return 2
+    for d in shard_dirs:
+        if not (d / "planes.bin").is_file():
+            print(f"ERROR: no planes.bin under: {d}", file=sys.stderr)
+            return 2
 
     eval_rows: list[dict[str, str]] = []
     for path in eval_paths:
         eval_rows.extend(read_rows(path))
     train_ids, train_fens = load_overlap_keys(train_paths)
 
+    plane_keys: list[bytes] | None = None
+    shard_key_count = 0
+    if shard_dirs:
+        shard_keys = load_shard_keys(shard_dirs)
+        shard_key_count = len(shard_keys)
+        plane_keys = eval_plane_keys(eval_rows)
+
     stats = evaluate(eval_rows, train_ids, train_fens)
+    if plane_keys is not None:
+        plane_hits = sum(1 for k in plane_keys if k in shard_keys)
+        stats["shard_planes"] = plane_hits
+        stats["either"] = max(stats["either"], plane_hits)
     pct = (100.0 * stats["either"] / stats["total"]) if stats["total"] else 0.0
     print("=" * 68)
     print("PUZZLE EVAL CONTAMINATION REPORT")
     print("=" * 68)
     print(f"  eval files   : {', '.join(str(p) for p in eval_paths)}")
     print(f"  train files  : {', '.join(str(p) for p in train_paths)}")
+    print(f"  train shards : {', '.join(str(d) for d in shard_dirs)}")
+    if shard_key_count:
+        print(f"  shard positions hashed: {shard_key_count}")
     print(f"  eval puzzles : {stats['total']}")
     print(f"  overlap by PuzzleId : {stats['id']}")
     print(f"  overlap by FEN      : {stats['fen']}")
+    if plane_keys is not None:
+        print(f"  overlap by shard planes : {stats['shard_planes']}")
     print(f"  overlap (either)    : {stats['either']}  ({pct:.2f}%)")
     print("=" * 68)
 

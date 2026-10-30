@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import logging
 import os
+import pickle
+import queue
 import random
 import shutil
 import time
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, Dict, Optional, Union
 
 import numpy as np
 import torch
@@ -66,6 +68,76 @@ def _legal_move_mask(visits: torch.Tensor) -> torch.Tensor:
     return mask
 
 
+def classify_optimizer_state(ckpt: Dict[str, Any]) -> str:
+    """Classify a checkpoint's optimizer state without loading it into an optimizer.
+
+    Returns one of ``"SGD"``, ``"AdamW"`` (any Adam-family state), ``"empty"``
+    (optimizer present but no per-parameter state yet — always safe), or
+    ``"unknown"``. A stamped ``_optimizer_type`` wins; otherwise the per-param
+    state keys decide (``exp_avg``/``exp_avg_sq`` are Adam-family,
+    ``momentum_buffer`` is SGD). ``None``/absent optimizer state is ``"empty"``.
+    """
+    opt_state = ckpt.get("optimizer")
+    if opt_state is None:
+        return "empty"
+    stamped = ckpt.get("_optimizer_type")
+    if isinstance(stamped, str) and stamped:
+        return stamped
+    state = opt_state.get("state") if isinstance(opt_state, dict) else None
+    if not isinstance(state, dict) or not state:
+        return "empty"
+    saw_any_keys = False
+    for per_param in state.values():
+        if isinstance(per_param, dict):
+            keys = set(per_param.keys())
+            if keys & {"exp_avg", "exp_avg_sq", "max_exp_avg_sq"}:
+                return "AdamW"
+            if "momentum_buffer" in keys:
+                return "SGD"
+            saw_any_keys = saw_any_keys or bool(keys)
+    return "unknown" if saw_any_keys else "empty"
+
+
+def inspect_rl_checkpoint(path: Union[str, Path]) -> Optional[Dict[str, Any]]:
+    """Read an RL checkpoint's metadata cheaply, or return None if unusable.
+
+    Used by auto-resume selection: a file that cannot be opened, lacks model
+    weights, or fails the architecture header is never a resume candidate.
+    The heavy state is memory-mapped so only metadata tensors are materialized.
+    """
+    p = Path(path)
+    if not p.is_file():
+        return None
+    try:
+        try:
+            ckpt = torch.load(p, map_location="cpu", weights_only=True, mmap=True)
+        except TypeError:  # older torch without mmap
+            ckpt = torch.load(p, map_location="cpu", weights_only=True)
+    except (OSError, RuntimeError, KeyError, ValueError, EOFError, pickle.UnpicklingError) as e:
+        logger.warning("Skipping unreadable checkpoint %s: %s", p, e)
+        return None
+    if not isinstance(ckpt, dict) or "model" not in ckpt:
+        logger.warning("Skipping checkpoint %s: no 'model' weights", p)
+        return None
+    blocks = ckpt.get("num_blocks")
+    filters = ckpt.get("num_filters")
+    if blocks is not None and filters is not None and (int(blocks), int(filters)) != (12, 128):
+        logger.warning(
+            "Skipping checkpoint %s: architecture %sx%s does not match the project 12x128",
+            p,
+            blocks,
+            filters,
+        )
+        return None
+    return {
+        "path": str(p),
+        "step": int(ckpt.get("step", 0) or 0),
+        "optimizer_class": classify_optimizer_state(ckpt),
+        "model_version": ckpt.get("model_version"),
+        "buffer_write_head": ckpt.get("buffer_write_head"),
+        "last_push_step": ckpt.get("last_push_step"),
+        "mtime": p.stat().st_mtime,
+    }
 class RLTrainer:
     """Continuous RL trainer for self-play experience.
 
@@ -154,6 +226,12 @@ class RLTrainer:
         # learner-to-actor loop is visible in metrics, not just in logs.
         self.push_success_count = 0
         self.push_failure_count = 0
+        # Provenance for warm starts (set by load_checkpoint): the supervised
+        # checkpoint this run started from is metadata, NOT RL progress —
+        # step_num must only ever count this run's own SGD updates.
+        self.inherited_step_num = 0
+        self.warm_start_path: Optional[str] = None
+        self.warm_start_step: Optional[int] = None
 
         # Dedicated non-default CUDA stream for training pipeline
         if self.device.type == "cuda":
@@ -218,14 +296,85 @@ class RLTrainer:
             min_lr=self.min_lr,
         )
 
+    # Keys torch re-derives on load or shares across optimizer families.
+    _COMMON_OPTIMIZER_KEYS = frozenset(
+        {
+            "lr",
+            "weight_decay",
+            "maximize",
+            "foreach",
+            "fused",
+            "differentiable",
+            "capturable",
+            "nesterov",
+            "initial_lr",
+        }
+    )
+
+    def _optimizer_state_compatible(
+        self,
+        opt_state: Dict[str, Any],
+        saved_type: Optional[str],
+        path: Union[str, Path],
+    ) -> bool:
+        """Return True only when optimizer state may be restored without poisoning this trainer.
+
+        Restoring a foreign optimizer's state_dict (e.g. supervised AdamW state into the
+        RL SGD optimizer) silently replaces SGD's hyperparameters and crashes on the
+        first step with ``KeyError: 'momentum'``. Per the optimizer-isolation decision,
+        model weights are always restored; foreign optimizer state is discarded.
+        """
+        current_type = type(self.optimizer).__name__
+        if saved_type is not None:
+            if saved_type == current_type:
+                return True
+            logger.warning(
+                "Checkpoint optimizer (%s) differs from configured optimizer (%s); "
+                "restoring model weights only (optimizer state discarded): %s",
+                saved_type,
+                current_type,
+                path,
+            )
+            return False
+        current_keys: set = set()
+        for group in self.optimizer.param_groups:
+            current_keys.update(group.keys())
+        for group in opt_state.get("param_groups") or []:
+            extra = (
+                {k for k in group if k not in current_keys}
+                - self._COMMON_OPTIMIZER_KEYS
+                - {"params"}
+            )
+            if extra:
+                logger.warning(
+                    "Checkpoint optimizer state (unexpected keys %s) does not match "
+                    "configured optimizer (%s); restoring model weights only "
+                    "(optimizer state discarded): %s",
+                    sorted(extra),
+                    current_type,
+                    path,
+                )
+                return False
+        return True
+
     def load_checkpoint(
         self,
         path: Union[str, Path],
         scheduler_override: bool = True,
+        reset_step: bool = False,
         warm_start: bool = False,
     ) -> int:
-        """Resume training from a verified RL checkpoint."""
+        """Resume training from a checkpoint.
+
+        ``reset_step=True`` (Stage A alias: ``warm_start=True``) marks a *warm
+        start*: model weights are adopted but the checkpoint's step counter,
+        push counter, and LR-schedule position belong to a foreign
+        (supervised) run, so RL progress restarts at 0 and the inherited
+        counter is kept only as provenance metadata. Resuming this run's own
+        checkpoint uses the default.
+        """
         path_str = str(path)
+        reset_step = bool(reset_step or warm_start)
         try:
             ckpt = torch.load(path, map_location=self.device, weights_only=True)
         except (OSError, RuntimeError, KeyError) as e:
@@ -236,9 +385,9 @@ class RLTrainer:
         _validate_arch(ckpt, self.model, getattr(self.model, "num_blocks", 12), getattr(self.model, "num_filters", 128), path_str)
 
         self.model.load_state_dict(ckpt.get("model"))
-        _validate_checkpoint_optimizer_compatibility(ckpt, path_str, warm_start=warm_start)
+        _validate_checkpoint_optimizer_compatibility(ckpt, path_str, warm_start=reset_step)
 
-        if warm_start:
+        if reset_step:
             # Weights-only warm start (audit R-09): never adopt foreign
             # optimizer/scheduler state, and restart the RL schedule from
             # step 0 — the checkpointed step belongs to the source trainer
@@ -246,6 +395,10 @@ class RLTrainer:
             inherited_step = int(ckpt.get("step", 0) or 0)
             self.step_num = 0
             self.last_push_step = 0
+            self.inherited_step_num = inherited_step
+            self.warm_start_path = path_str
+            self.warm_start_step = inherited_step
+            self.scheduler.step(0)
             logger.info(
                 "Warm start from '%s': weights loaded; optimizer/scheduler state "
                 "ignored; RL step counter reset to 0 (inherited source step %d).",
@@ -254,13 +407,15 @@ class RLTrainer:
             )
             return self.step_num
 
-        if ckpt.get("optimizer") is not None:
-            try:
-                self.optimizer.load_state_dict(ckpt["optimizer"])
-            except (RuntimeError, KeyError, ValueError) as e:
-                raise RuntimeError(
-                    f"Failed to load RL optimizer state from '{path_str}': {e}"
-                ) from e
+        opt_state = ckpt.get("optimizer")
+        if opt_state is not None:
+            if self._optimizer_state_compatible(opt_state, ckpt.get("_optimizer_type"), path_str):
+                try:
+                    self.optimizer.load_state_dict(opt_state)
+                except (RuntimeError, KeyError, ValueError) as e:
+                    raise RuntimeError(
+                        f"Checkpoint '{path_str}' has an incompatible optimizer state: {e}"
+                    ) from e
 
         if ckpt.get("scheduler") is not None and hasattr(self.scheduler, "load_state_dict"):
             try:
@@ -375,6 +530,7 @@ class RLTrainer:
         state = {
             "checkpoint_type": "rl",
             "checkpoint_format": 1,
+            "_optimizer_type": type(self.optimizer).__name__,
             "model": self.model.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "scheduler": getattr(self.scheduler, "state_dict", lambda: {})(),

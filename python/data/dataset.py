@@ -267,6 +267,22 @@ class BinaryChessDataset(Dataset):
         else:
             self.dtz_targets = None
 
+        # Optional packed legal-action masks: (N, 584) uint8, bit-packed over
+        # 4672 actions (schema_version 2 datasets). A size mismatch is a hard
+        # error — silently ignoring a corrupt mask stream would corrupt the
+        # masked loss in subtle ways.
+        self.masks = None
+        masks_path = self.data_dir / "masks.bin"
+        packed_bytes = (4672 + 7) // 8
+        if masks_path.exists():
+            _check_st_size(masks_path, self.num_samples * packed_bytes)
+            self.masks = np.memmap(
+                masks_path,
+                dtype=np.uint8,
+                mode="r",
+                shape=(self.num_samples, packed_bytes),
+            )
+
     def __len__(self) -> int:
         return self.num_samples
 
@@ -294,6 +310,10 @@ class BinaryChessDataset(Dataset):
             "ply": torch.tensor(0 if self.is_tactical else ply, dtype=torch.long),
             "is_tactical": torch.tensor(is_tac, dtype=torch.bool),
         }
+
+        if self.masks is not None:
+            unpacked = np.unpackbits(np.array(self.masks[idx]), count=4672)
+            sample["legal_mask"] = torch.from_numpy(unpacked.astype(np.bool_))
 
         if is_tac:
             # Tactical positions have masked value target [0, 0, 0]

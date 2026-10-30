@@ -9,6 +9,7 @@ from pathlib import Path
 # Add potential CMake build directories to sys.path
 _repo_root = Path(__file__).resolve().parent.parent
 _build_candidates = [
+    _repo_root / "build_zeropawn_dev" / "cpp",
     _repo_root / "build" / "cpp",
     _repo_root / "build_zeropawn" / "cpp",
     _repo_root / "build_zeropawn",

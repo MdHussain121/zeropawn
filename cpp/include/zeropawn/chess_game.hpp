@@ -34,6 +34,11 @@ public:
     bool is_50_move_rule() const;
     bool is_insufficient_material() const;
     int half_move_clock() const;
+    // Halfmove clock + 2-fold repetition flag packed into one key (SR-02).
+    uint64_t draw_history_key() const override {
+        return (static_cast<uint64_t>(half_move_clock()) << 1)
+             | static_cast<uint64_t>(is_repetition(1) ? 1u : 0u);
+    }
     int full_move_number() const;
     // Number of moves applied in this game object (exact ply count, unlike the
     // halfmove-clock estimate derived from a FEN).

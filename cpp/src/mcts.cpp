@@ -146,7 +146,10 @@ void MCTS::sample_dirichlet(int k, float alpha, std::vector<float>& out_noise) {
 std::unique_ptr<MCTS::Node> MCTS::create_node_from_eval(
     const Game& state, bool is_root, const std::vector<float>& full_policy, float eval_val) {
     auto node = std::make_unique<Node>();
-    node->state_hash = state.get_hash();
+    // Node identity includes draw-relevant history: a tree built for a
+    // position must not validate against a transposition with a different
+    // halfmove clock / repetition state (SR-02).
+    node->state_hash = MCTS::cache_key(state);
     node->legal_actions = state.legal_actions();
     int k = static_cast<int>(node->legal_actions.size());
 
@@ -208,7 +211,7 @@ std::unique_ptr<MCTS::Node> MCTS::create_node(const Game& state, bool is_root, c
         return create_node_from_eval(state, is_root, {}, 0.0f);
     }
 
-    uint64_t h = state.get_hash();
+    const uint64_t h = MCTS::cache_key(state);
     if (const CachedEval* cached = cache_lookup(h)) {
         return create_node_from_eval(state, is_root, cached->policy, cached->value);
     }
@@ -289,7 +292,7 @@ bool MCTS::advance_root(int my_action, int opp_action, const Game& new_state) {
     Node* grandchild = child->children[opp_idx].get();
 
     // 3. Verify state integrity
-    if (grandchild->state_hash != new_state.get_hash() ||
+    if (grandchild->state_hash != MCTS::cache_key(new_state) ||
         grandchild->is_terminal != new_state.is_terminal() ||
         grandchild->legal_actions != new_state.legal_actions()) {
         reset_root();
@@ -330,7 +333,7 @@ bool MCTS::advance_root(int action, const Game& new_state) {
     }
     Node* child = root_->children[idx].get();
 
-    if (child->state_hash != new_state.get_hash() ||
+    if (child->state_hash != MCTS::cache_key(new_state) ||
         child->is_terminal != new_state.is_terminal() ||
         child->legal_actions != new_state.legal_actions()) {
         reset_root();
@@ -350,7 +353,7 @@ bool MCTS::advance_root(int action, const Game& new_state) {
     return true;
 }
 
-SearchResult MCTS::search(const Game& root_state, int num_simulations, const Evaluator& evaluator, const BatchEvaluator& batch_evaluator) {
+SearchResult MCTS::search(const Game& root_state, int num_simulations, const Evaluator& evaluator, const BatchEvaluator& batch_evaluator, const AbortFn& abort_fn) {
     SearchResult result;
     result.action_visits.resize(root_state.num_actions(), 0.0f);
     result.batch_size = config_.batch_size;
@@ -358,7 +361,7 @@ SearchResult MCTS::search(const Game& root_state, int num_simulations, const Eva
     int retained_visits = 0;
     if (config_.reuse_tree && root_ != nullptr) {
         // Validate that retained root_ matches root_state
-        if (root_->state_hash != root_state.get_hash() ||
+        if (root_->state_hash != MCTS::cache_key(root_state) ||
             root_->is_terminal != root_state.is_terminal() ||
             root_->legal_actions != root_state.legal_actions() ||
             live_node_count() > config_.max_nodes) {
@@ -388,6 +391,7 @@ SearchResult MCTS::search(const Game& root_state, int num_simulations, const Eva
         return result;
     }
 
+    int sims_performed_total = 0;
     if (config_.batch_size <= 1) {
         // Serial simulation path (exact baseline implementation)
         struct SimulationVirtualLossGuard {
@@ -408,11 +412,24 @@ SearchResult MCTS::search(const Game& root_state, int num_simulations, const Eva
         };
 
         try {
+            int sims_performed = 0;
             for (int sim = 0; sim < num_simulations; ++sim) {
+                // Poll the abort predicate periodically (approximately every 32
+                // simulations) so UCI clock deadlines and stop requests are
+                // honored during the search instead of only after it.
+                if (abort_fn && (sim % 32) == 0 && abort_fn()) {
+                    break;
+                }
                 Node* curr_node = root_.get();
                 auto sim_state = root_state.clone();
                 std::vector<std::pair<Node*, int>> search_path;
                 SimulationVirtualLossGuard vl_guard(search_path, config_.virtual_loss);
+                // Root FPU: parent_q starts at a constant 0.0 at the root, so
+                // unvisited root children score -(fpu_reduction) + U regardless
+                // of the root evaluation. At every deeper level parent_q is the
+                // negated mean action value of the visited child (-Q_child).
+                // (The DEF-01 record's "-root_eval at root" description does not
+                // match this implementation; see docs/LOGIC_CORRECTNESS_AUDIT.md.)
                 float parent_q = 0.0f;
 
                 // Selection
@@ -457,7 +474,9 @@ SearchResult MCTS::search(const Game& root_state, int num_simulations, const Eva
                     node->visit_counts[act_idx] += 1;
                 }
                 vl_guard.committed = true;
+                ++sims_performed;
             }
+            sims_performed_total = sims_performed;
         } catch (...) {
             if (!config_.reuse_tree) {
                 reset_root();
@@ -510,6 +529,11 @@ SearchResult MCTS::search(const Game& root_state, int num_simulations, const Eva
         int sims_done = 0;
         try {
             while (sims_done < num_simulations) {
+                // Abort polling once per batch (batched iteration granularity;
+                // the serial path polls every 32 simulations).
+                if (abort_fn && abort_fn()) {
+                    break;
+                }
                 int target_batch = std::min(config_.batch_size, num_simulations - sims_done);
                 std::vector<Candidate> candidates;
                 candidates.reserve(target_batch);
@@ -566,7 +590,7 @@ SearchResult MCTS::search(const Game& root_state, int num_simulations, const Eva
                                 cand.needs_eval = false;
                                 cand.leaf_val = 0.0f;
                             } else {
-                                uint64_t h = cand.sim_state->get_hash();
+                                const uint64_t h = MCTS::cache_key(*cand.sim_state);
                                 if (const CachedEval* cached = cache_lookup(h)) {
                                     cand.needs_eval = false;
                                     cand.leaf_val = cached->value;
@@ -617,7 +641,7 @@ SearchResult MCTS::search(const Game& root_state, int num_simulations, const Eva
                         auto& eval_res = batch_results[k];
                         cand.leaf_val = eval_res.second;
 
-                        uint64_t h = cand.sim_state->get_hash();
+                        const uint64_t h = MCTS::cache_key(*cand.sim_state);
                         cand.parent_node->children[cand.action_idx] = create_node_from_eval(
                             *cand.sim_state, false, eval_res.first, cand.leaf_val
                         );
@@ -632,7 +656,7 @@ SearchResult MCTS::search(const Game& root_state, int num_simulations, const Eva
                                 *cand.sim_state, false, {}, cand.leaf_val
                             );
                         } else {
-                            uint64_t h = cand.sim_state->get_hash();
+                            const uint64_t h = MCTS::cache_key(*cand.sim_state);
                             const CachedEval* cached = cache_lookup(h);
                             cand.parent_node->children[cand.action_idx] = create_node_from_eval(
                                 *cand.sim_state, false,
@@ -659,6 +683,7 @@ SearchResult MCTS::search(const Game& root_state, int num_simulations, const Eva
                 vl_guard.committed = true;
                 sims_done += static_cast<int>(candidates.size());
             }
+            sims_performed_total = sims_done;
         } catch (...) {
             if (!config_.reuse_tree) {
                 reset_root();
@@ -692,7 +717,9 @@ SearchResult MCTS::search(const Game& root_state, int num_simulations, const Eva
     result.best_action = best_act;
     result.root_value = (total_visits > 0) ? (sum_q / total_visits) : 0.0f;
     result.retained_visits = retained_visits;
-    result.new_simulations = num_simulations;
+    // Actual simulations completed; an aborted search returns the best move
+    // from the tree built so far rather than the requested budget.
+    result.new_simulations = sims_performed_total;
     last_retained_visits_ = retained_visits;
 
     // Normalize action visits to distribution
@@ -795,7 +822,8 @@ void MCTS::cache_insert(uint64_t h, std::vector<float> policy, float value) {
         it->second.lru_it = nn_cache_lru_.begin();
         return;
     }
-    if (nn_cache_.size() >= MCTS::NN_CACHE_CAP) {
+    const size_t cap = (config_.nn_cache_cap > 0) ? config_.nn_cache_cap : NN_CACHE_CAP;
+    if (nn_cache_.size() >= cap) {
         cache_evict_lru();
     }
     nn_cache_lru_.push_front(h);
@@ -838,13 +866,14 @@ SearchResult MCTS::aggregate(const Node& root, int num_legal, int num_actions) c
 }
 
 SearchResult MCTS::search_batched(const Game& root_state, int num_simulations,
-                                  const RawBatchEvaluator& batch_eval, int batch_size) {
+                                  const RawBatchEvaluator& batch_eval, int batch_size,
+                                  const AbortFn& abort_fn) {
     const int B = batch_size > 0 ? batch_size : 1;
     const int state_size = root_state.state_size();
     const int num_actions = root_state.num_actions();
 
     // Root evaluation (single-element batch if not in cache)
-    uint64_t root_h = root_state.get_hash();
+    const uint64_t root_h = MCTS::cache_key(root_state);
     const CachedEval* root_cached = cache_lookup(root_h);
     auto root = create_unscored_node(root_state);
     int num_legal = static_cast<int>(root->legal_actions.size());
@@ -883,6 +912,10 @@ SearchResult MCTS::search_batched(const Game& root_state, int num_simulations,
     flat.reserve(static_cast<size_t>(B) * static_cast<size_t>(state_size));
 
     while (sims_done < num_simulations) {
+        // Abort polling once per batch iteration.
+        if (abort_fn && abort_fn()) {
+            break;
+        }
         std::vector<PendingLeaf> batch;
         batch.reserve(static_cast<size_t>(B));
         std::unordered_map<Node*, size_t> pending_index;
@@ -948,7 +981,7 @@ SearchResult MCTS::search_batched(const Game& root_state, int num_simulations,
                 continue;
             }
 
-            uint64_t h = sim_state->get_hash();
+            const uint64_t h = MCTS::cache_key(*sim_state);
             if (const CachedEval* cached = cache_lookup(h)) {
                 set_priors(*curr_node, cached->policy.data(),
                            static_cast<int>(cached->policy.size()), num_actions, false);
@@ -1010,7 +1043,10 @@ SearchResult MCTS::search_batched(const Game& root_state, int num_simulations,
         }
     }
 
-    return aggregate(*root, num_legal, num_actions);
+    SearchResult result = aggregate(*root, num_legal, num_actions);
+    result.batch_size = B;
+    result.new_simulations = sims_done;
+    return result;
 }
 
 

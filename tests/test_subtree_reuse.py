@@ -307,6 +307,8 @@ def test_uci_reuse_tree_option_and_replay():
         sys.stdout = buf
         engine.handle_line("position startpos")
         engine.handle_line("go nodes 20")
+        if engine._search_thread is not None:
+            engine._search_thread.join(timeout=30)  # async go: wait for bestmove
         bestmove_line = [l for l in buf.getvalue().splitlines() if l.startswith("bestmove")]
         assert len(bestmove_line) == 1
         first_engine_move = bestmove_line[0].split()[1]
@@ -391,6 +393,8 @@ def test_uci_weights_reload_invalidation(tmp_path):
     # Perform a search so mcts populates cache and retains tree
     engine.handle_line("position startpos")
     engine.handle_line("go nodes 20")
+    if engine._search_thread is not None:
+        engine._search_thread.join(timeout=30)  # async go: wait for bestmove
     assert engine.mcts.cache_size() > 0, "NN cache must have entries after search"
     assert engine.mcts.has_retained_root() is True, "Root must be retained"
     assert engine.last_engine_action is not None
@@ -409,6 +413,8 @@ def test_uci_weights_reload_invalidation(tmp_path):
     # Search after reload succeeds and populates fresh cache with new weights
     engine.handle_line("position startpos")
     engine.handle_line("go nodes 20")
+    if engine._search_thread is not None:
+        engine._search_thread.join(timeout=30)  # async go: wait for bestmove
     assert engine.mcts.cache_size() > 0
 
 
@@ -424,6 +430,8 @@ def test_uci_weights_reload_failure_preserves_engine(tmp_path):
 
     engine.handle_line("position startpos")
     engine.handle_line("go nodes 10")
+    if engine._search_thread is not None:
+        engine._search_thread.join(timeout=30)  # async go: wait for bestmove
     cache_before = engine.mcts.cache_size()
     assert cache_before > 0
 
