@@ -4,18 +4,22 @@ import zeropawn_cpp
 
 
 def test_forced_underpromotions():
+    # The target king must stay outside every swept pawn's forward-attack zone:
+    # a pawn on rank 7 (or 2) checks any king on rank 8 (or 1) for at least one
+    # from_file, and rule-illegal positions are rejected at the FEN boundary
+    # (audit C-1). E4 is safe from both ranks and never adjacent to E1/E8.
     for side in (chess.WHITE, chess.BLACK):
         for from_file in range(8):
             b = chess.Board(None)
             if side == chess.WHITE:
                 b.set_piece_at(chess.square(from_file, 6), chess.Piece(chess.PAWN, chess.WHITE))
                 b.set_piece_at(chess.E1, chess.Piece(chess.KING, chess.WHITE))
-                b.set_piece_at(chess.E8, chess.Piece(chess.KING, chess.BLACK))
+                b.set_piece_at(chess.E4, chess.Piece(chess.KING, chess.BLACK))
                 b.turn = chess.WHITE
             else:
                 b.set_piece_at(chess.square(from_file, 1), chess.Piece(chess.PAWN, chess.BLACK))
                 b.set_piece_at(chess.E8, chess.Piece(chess.KING, chess.BLACK))
-                b.set_piece_at(chess.E1, chess.Piece(chess.KING, chess.WHITE))
+                b.set_piece_at(chess.E4, chess.Piece(chess.KING, chess.WHITE))
                 b.turn = chess.BLACK
 
             eng = zeropawn_cpp.ChessGame(b.fen())

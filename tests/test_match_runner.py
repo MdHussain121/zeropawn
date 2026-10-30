@@ -523,12 +523,17 @@ def test_orchestrator_eval_persistence_helpers(tmp_path):
     )
     orch._append_eval_row(
         [1.0, 0.1, 7, 3, dummy_ckpt.name, 0.5, 5, 10, 0.75, 3, 1, 0, 0.25, 4, 0,
-         "cfg", "serial", 0, -381.7, -500.0, -250.0, "abc123", "sf123", "testcommit", 0]
+         "cfg", "serial", 0, -381.7, -500.0, -250.0, "abc123", "sf123", "testcommit", 0,
+         "stockfish", 1500, 1, 200, 4, 10, 0.4]
     )
 
     # eval_history: header + one row, with the partial/provenance columns.
     lines = orch.eval_csv_path.read_text(encoding="utf-8").strip().splitlines()
-    assert lines[0].endswith(",model_sha256,stockfish_sha256_16,commit,partial")
+    assert lines[0].endswith(
+        ",model_sha256,stockfish_sha256_16,commit,partial,"
+        "sf_engine,sf_elo,sf_elo_verified,mcts_puzzle_sims,"
+        "mcts_puzzle_solved,mcts_puzzle_total,mcts_puzzle_rate"
+    )
     assert len(lines) == 2
     # match_games ledger: header + one per-game row.
     mg_lines = orch.match_games_csv_path.read_text(encoding="utf-8").strip().splitlines()
