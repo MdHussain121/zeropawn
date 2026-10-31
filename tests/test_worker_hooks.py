@@ -30,9 +30,10 @@ class MockInferenceClient:
 def run_seeded_game(
     game_id: int, seed: int, hook_fn=None
 ) -> tuple[List[str], GameSummary, List[Dict[str, Any]]]:
-    random.seed(seed)
-    np.random.seed(seed)
-
+    # Seeding contract after the SR-12 fix: reproducibility comes from the
+    # PER-GAME seed (documented master_seed + game_id flow), not from seeding
+    # the process-global RNG modules — unseeded games no longer share or
+    # mutate global random state, so global seeding cannot drive them.
     client = MockInferenceClient()
     aggregator = WorkerBatchAggregator(client=client, max_batch_size=1, max_wait_ms=1.0)
 
@@ -55,6 +56,7 @@ def run_seeded_game(
         max_plies=20,  # Short games for parity testing
         ply_hook=wrapped_hook if hook_fn is not None else None,
         use_book=False,
+        seed=seed,
     )
 
     saved_positions, summary = game.play_game()

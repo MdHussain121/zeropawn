@@ -272,8 +272,6 @@ def test_resignation_disabled_parity_deterministic():
     seed = 42
 
     def run_game():
-        random.seed(seed)
-        np.random.seed(seed)
         client = MockInferenceClient()
         aggregator = WorkerBatchAggregator(client=client, max_batch_size=1, max_wait_ms=1.0)
         game = SelfPlayGame(
@@ -287,6 +285,9 @@ def test_resignation_disabled_parity_deterministic():
             min_resign_ply=30,
             tablebase_path=None,
             max_plies=20,
+            # Reproducibility comes from the per-game seed contract (SR-12);
+            # global RNG seeding no longer drives unseeded games.
+            seed=seed,
         )
         _, summary = game.play_game()
         return summary

@@ -340,7 +340,16 @@ def run_inference_server_process(
     max_wait_ms: float = 3.0,
     device: Optional[str] = None,
 ) -> None:
-    """Standalone worker process entry point for Shared Memory Inference Server."""
+    """LEGACY multiprocessing entry point for the Shared-Memory Inference Server.
+
+    Status (audit SR-17): not production-reachable. The active runtime uses the
+    in-process ``InferenceServer`` + ``DirectInferenceClient`` pair; nothing in
+    ``scripts/`` or ``python/cli/`` starts this process, and its worker-side
+    counterpart (``worker.run_worker_process``) is equally unused. Retained
+    deliberately together with ``python/selfplay/ipc.py``; reviving the path
+    requires the concurrency tests in
+    ``tests/test_selfplay_replay_remediation.py`` to cover it first.
+    """
     logger.info("Initializing SharedMemoryPool inside inference server process...")
     shm_pool = SharedMemoryPool(
         name_prefix=shm_pool_prefix,

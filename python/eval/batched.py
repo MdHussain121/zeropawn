@@ -4,6 +4,13 @@ Replaces the one-forward-per-simulation callback with a single forward pass
 per mini-batch of leaves. Same math (softmax policy, WDL win-minus-loss
 value), far fewer Python/CUDA round-trips.
 
+Status (audit SR-17): DEAD module, retained. Zero consumers exist — the
+batched search path in production goes through
+``WorkerBatchAggregator.evaluate_planes_batch`` (worker.py). Kept (rather than
+deleted) because it documents the batched binding protocol and deleting
+infrastructure without proof of obsolescence is riskier than flagging it;
+the regression suite pins that no production module imports it.
+
 Protocol with C++ ``MCTS.search_batched``:
     input:  float32 numpy array of shape (N, state_size)  [1216 for chess]
     output: (policy (N, 4672) float32, values (N,) float32)

@@ -54,13 +54,47 @@ def check_search_mode(search_mode: str) -> str:
     return search_mode
 
 
-def require_serial_search(search_mode: str, caller: str) -> None:
-    """Validate search mode support."""
+def assert_search_mode_supported(search_mode: str, caller: str) -> None:
+    """Assert the configured search mode is SUPPORTED by this build.
+
+    Audit SR-14: the previous name (``require_serial_search``) implied an
+    enforcement it never performed — it only checked that ``batched`` is
+    backed by ``zeropawn_cpp.search_batched`` and accepted ``serial``
+    unconditionally. Callers that need the mode to be supported (self-play,
+    match, puzzle, UCI paths) now say so explicitly.
+    """
     if search_mode == "batched":
         if not hasattr(zeropawn_cpp.MCTS, "search_batched"):
             raise RuntimeError(
                 f"{caller}: search_mode='batched' requested but zeropawn_cpp does not export search_batched."
             )
+
+
+def enforce_serial_search(search_mode: str, caller: str) -> None:
+    """Enforce the Stage-2 locked serial contract: raise unless mode is 'serial'.
+
+    Provided for callers that genuinely require serial search (the locked
+    Stage-2 configuration, and any future path where batching is known to be
+    unsupported at runtime). No current production caller enforces serial —
+    ``serial`` remains the default everywhere, and ``batched`` is an explicit
+    opt-in whose support is checked by :func:`assert_search_mode_supported`.
+    """
+    if search_mode != "serial":
+        raise RuntimeError(
+            f"{caller}: serial search is required by this code path, got search_mode={search_mode!r}."
+        )
+
+
+def require_serial_search(search_mode: str, caller: str) -> None:
+    """Backward-compatible alias for :func:`assert_search_mode_supported`.
+
+    Kept because external callers (``python/cli/commands_match.py``,
+    ``python/uci/uci_engine.py``, tests) import this name; its behavior is
+    unchanged from before the SR-14 split (support check only). New code should
+    call ``assert_search_mode_supported`` (support check) or
+    ``enforce_serial_search`` (actual serial enforcement).
+    """
+    assert_search_mode_supported(search_mode, caller)
 
 
 def engine_outcome(board_result: str, engine_is_white: bool) -> str:

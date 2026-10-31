@@ -90,14 +90,28 @@ def resolve_opening_book_path(book_path: Optional[Union[str, Path]] = None) -> s
 
 @dataclass
 class SavedPosition:
-    """Record of a single position visited during self-play."""
+    """Record of a single position visited during self-play.
+
+    Field naming contract (audit SR-15): ``visits`` holds the **normalized root
+    visit distribution** of the MCTS search at this position (a probability
+    vector summing to ~1.0), *not* raw visit counts. The shard that stores it is
+    historically also named ``visits`` (``visits.bin``); renaming either would
+    break buffer compatibility, so the semantic contract is documented here and
+    enforced by insertion-time validation (finite, non-negative, sum ~= 1.0).
+    """
 
     planes: np.ndarray  # shape: (C, H, W) float32
-    visits: np.ndarray  # shape: (num_actions,) float32
+    visits: np.ndarray  # shape: (num_actions,) float32, normalized visit distribution
     outcome: int  # 0=Win, 1=Draw, 2=Loss (from side-to-move's perspective)
     is_full_search: bool  # bool
     model_version: int  # int
     game_id: int  # uint64
+
+
+# Explicit termination taxonomy (audit SR-16). "draw_other" is reserved for a
+# position that is genuinely terminal but matches no enumerated draw rule; it
+# must never be used for a game that was cut short (see "aborted").
+TERMINATION_ABORTED = "aborted"
 
 
 @dataclass
@@ -106,7 +120,7 @@ class GameSummary:
 
     game_id: int
     length_plies: int
-    result: str  # "1-0", "0-1", "1/2-1/2"
+    result: str  # "1-0", "0-1", "1/2-1/2", or "*" for aborted (no result)
     resigned: bool
     resigned_side_white: Optional[bool]
     would_have_resigned: (
@@ -123,6 +137,16 @@ class GameSummary:
     cut_piece_count: Optional[int] = None
     raw_wdl: Optional[int] = None
     would_have_resigned_side_white: Optional[bool] = None  # side that would have resigned
+    # Explicit completion state (audit SR-01): True only when the game was cut
+    # short by worker/aggregator shutdown before reaching a genuine end. An
+    # aborted game has NO result, produces NO saved positions, and must never be
+    # sunk into the replay buffer or counted as a draw.
+    aborted: bool = False
+
+    @property
+    def completed(self) -> bool:
+        """True when the game reached a genuine termination (not aborted)."""
+        return not self.aborted
 
 
 class WorkerBatchAggregator:
@@ -580,6 +604,49 @@ class WorkerBatchAggregator:
         return policies, values
 
 
+def outcomes_from_result(
+    raw_positions: List[Dict[str, Any]],
+    white_won: Optional[bool],
+    game_id: int,
+) -> List[SavedPosition]:
+    """Propagate one game result to its positions, mover-relative (audit SR-16).
+
+    Exact contract (verified end-to-end by the 2026-10-31 self-play audit and
+    pinned here as a pure, independently testable function):
+
+    - ``white_won is None``  -> outcome 1 (Draw) for every position;
+    - ``white_won == pos_is_white`` -> outcome 0 (Win for the side to move at
+      that position);
+    - otherwise -> outcome 2 (Loss for the side to move at that position).
+
+    ``raw_positions`` entries must carry ``planes``, ``visits``, ``is_white``,
+    ``is_full_search`` and ``model_version`` captured in the same iteration as
+    the search at that position. The terminal position is never present (no
+    move was made from it).
+    """
+    saved: List[SavedPosition] = []
+    for raw in raw_positions:
+        pos_is_white = raw["is_white"]
+        if white_won is None:
+            outcome = 1  # Draw
+        elif white_won == pos_is_white:
+            outcome = 0  # Win for side to move
+        else:
+            outcome = 2  # Loss for side to move
+
+        saved.append(
+            SavedPosition(
+                planes=raw["planes"],
+                visits=raw["visits"],
+                outcome=outcome,
+                is_full_search=raw["is_full_search"],
+                model_version=raw["model_version"],
+                game_id=game_id,
+            )
+        )
+    return saved
+
+
 class SelfPlayGame:
     """Simulates a single full self-play game with MCTS, temperature, and resignation."""
 
@@ -625,13 +692,21 @@ class SelfPlayGame:
         self.full_search_prob = full_search_prob
         self.seed = seed
         if seed is not None:
+            # Seeded run: the audited game-seed contract is
+            # ``master_seed + game_id`` (worker._game_seed) — preserved exactly.
             self._rng = random.Random(seed)
             self._np_rng = np.random.default_rng(seed)
             mcts_seed = seed
         else:
-            self._rng = random
-            self._np_rng = np.random
-            mcts_seed = random.randint(1, 2**31 - 1)
+            # Unseeded run (audit SR-12): per-game entropy-seeded streams.
+            # Previously this aliased the global ``random``/``np.random``
+            # module state, which every one of the 24 concurrent game threads
+            # shared and mutated — games were not independent and one game's
+            # draws shifted another's. Dedicated instances give each game its
+            # own stream without affecting the seeded path.
+            self._rng = random.Random()
+            self._np_rng = np.random.default_rng()
+            mcts_seed = self._rng.randint(1, 2**31 - 1)
 
         self.temp_cutoff = self._rng.randint(temp_cutoff_range[0], temp_cutoff_range[1])
         self.resign_threshold = resign_threshold
@@ -673,7 +748,9 @@ class SelfPlayGame:
             try:
                 from python.data.opening_book import OpeningBook
 
-                book_seed = self.seed if self.seed is not None else random.randint(1, 2**31 - 1)
+                # Book RNG comes from the game's own stream (SR-12): the
+                # global module RNG is never consumed by game threads.
+                book_seed = self.seed if self.seed is not None else self._rng.randint(1, 2**31 - 1)
                 self.opening_book = OpeningBook(
                     book_path=self.book_path,
                     policy=self.book_policy,
@@ -732,10 +809,10 @@ class SelfPlayGame:
         self.moves_uci: List[str] = []
 
     def play_game(self) -> Tuple[List[SavedPosition], GameSummary]:
-        """Play the full game to completion or resignation."""
-        from python.eval.match_runner import require_serial_search
+        """Play the full game to completion, resignation, or shutdown abort."""
+        from python.eval.match_runner import assert_search_mode_supported
 
-        require_serial_search(self.search_mode, "SelfPlayGame.play_game")
+        assert_search_mode_supported(self.search_mode, "SelfPlayGame.play_game")
         start_time = time.perf_counter()
         resigned = False
         resigned_side_white = None
@@ -942,8 +1019,31 @@ class SelfPlayGame:
                     termination_reason = "tablebase_adjudication"
                     break
 
+        # ── Shutdown/abort detection (audit SR-01) ─────────────────────────
+        # The play loop also exits when the aggregator stops serving
+        # evaluations (aggregator.running == False) — the normal shutdown
+        # path, most reliably triggered during the book phase where no
+        # evaluation is awaited. Such a game has played < max_plies plies and
+        # is not terminal: it has NO result. Before this guard it fell through
+        # to the `draw_other` branch and its partial positions were sunk as
+        # draw-labeled experience. A game that is already terminal or has
+        # reached the ply cap when the stop arrives genuinely finished and
+        # keeps its real result.
+        aborted = bool(
+            not resigned
+            and not adjudicated
+            and not self.aggregator.running
+            and not self.game.is_terminal()
+            and self.ply < self.max_plies
+        )
+
         # Determine terminal result if not resigned and not adjudicated
-        if resigned:
+        if aborted:
+            # Explicit abort state: no result string exists for an unfinished
+            # game ("*" is the standard PGN marker for "no result").
+            termination_reason = TERMINATION_ABORTED
+            game_result = "*"
+        elif resigned:
             termination_reason = "resignation"
         elif adjudicated:
             termination_reason = "tablebase_adjudication"
@@ -997,9 +1097,10 @@ class SelfPlayGame:
                     game_result = "1/2-1/2"
                     termination_reason = "connect4_draw"
 
-        # Check false-resignation rate
+        # Check false-resignation rate (only meaningful for games that reached
+        # a genuine end; an aborted game has no outcome to be false about).
         is_false_resign = False
-        if self.would_have_resigned:
+        if self.would_have_resigned and not aborted:
             # If the side that would have resigned ended up drawing or winning
             if self.would_have_resigned_side_white:
                 # White would have resigned
@@ -1010,28 +1111,12 @@ class SelfPlayGame:
                 if white_won is False or white_won is None:
                     is_false_resign = True
 
-        # Assign outcome to each position from THAT position's side-to-move perspective
-        # 0 = Win, 1 = Draw, 2 = Loss
-        saved_positions: List[SavedPosition] = []
-        for raw in self.raw_positions:
-            pos_is_white = raw["is_white"]
-            if white_won is None:
-                outcome = 1  # Draw
-            elif white_won == pos_is_white:
-                outcome = 0  # Win for side to move
-            else:
-                outcome = 2  # Loss for side to move
-
-            saved_positions.append(
-                SavedPosition(
-                    planes=raw["planes"],
-                    visits=raw["visits"],
-                    outcome=outcome,
-                    is_full_search=raw["is_full_search"],
-                    model_version=raw["model_version"],
-                    game_id=self.game_id,
-                )
-            )
+        # Assign outcome to each position from THAT position's side-to-move
+        # perspective (0 = Win, 1 = Draw, 2 = Loss). An aborted game yields NO
+        # saved positions: partial-game experience must never enter the buffer.
+        saved_positions: List[SavedPosition] = (
+            [] if aborted else outcomes_from_result(self.raw_positions, white_won, self.game_id)
+        )
 
         duration = time.perf_counter() - start_time
         summary = GameSummary(
@@ -1052,6 +1137,7 @@ class SelfPlayGame:
             cut_ply=cut_ply,
             cut_piece_count=cut_piece_count,
             raw_wdl=raw_wdl,
+            aborted=aborted,
         )
 
         return saved_positions, summary
@@ -1164,11 +1250,31 @@ class SelfPlayWorker:
         self.threads: List[threading.Thread] = []
         self.total_games_played = 0
         self.invalid_games = 0
+        # Shutdown-aborted games (audit SR-01): counted separately so an
+        # operator can see how much of a stop's in-flight work was discarded.
+        self.aborted_games = 0
         self.total_positions_generated = 0
         self.total_simulations = 0
         self.live_simulations = 0
         self.counter_lock = threading.Lock()
+        self._stop_lock = threading.Lock()
+        self._stopped = False
         self.active_games: Dict[int, SelfPlayGame] = {}
+
+    @staticmethod
+    def accepts_for_sink(summary: GameSummary) -> bool:
+        """Sink admission guard (audit SR-01, defense in depth).
+
+        Only genuinely completed games may be sunk into the experience sink /
+        replay buffer. An aborted game (shutdown mid-game) carries no result
+        and no valid experience, so it is refused here even if a caller
+        bypasses the runner-level counter check.
+        """
+        if getattr(summary, "aborted", False):
+            return False
+        if getattr(summary, "termination_reason", "") == TERMINATION_ABORTED:
+            return False
+        return True
 
     def get_live_cache_stats(self) -> Dict[str, Any]:
         """Query real-time C++ NN cache entries across all active games."""
@@ -1277,6 +1383,21 @@ class SelfPlayWorker:
                 except Exception:
                     pass
 
+            # Shutdown-aborted game (audit SR-01): the positions list is empty
+            # by contract and the summary carries no result — it is NOT sunk,
+            # NOT counted as a played game, and NEVER recorded as a draw.
+            if not self.accepts_for_sink(summary):
+                with self.counter_lock:
+                    self.aborted_games += 1
+                logger.info(
+                    "Game %d aborted by shutdown (%d plies, %d recorded positions discarded); "
+                    "experience discarded",
+                    game_id,
+                    summary.length_plies,
+                    len(getattr(game, "raw_positions", [])),
+                )
+                continue
+
             with self.counter_lock:
                 self.total_games_played += 1
                 self.total_positions_generated += len(positions)
@@ -1287,9 +1408,9 @@ class SelfPlayWorker:
 
     def start(self) -> None:
         """Start batch aggregator and all concurrent game threads."""
-        from python.eval.match_runner import require_serial_search
+        from python.eval.match_runner import assert_search_mode_supported
 
-        require_serial_search(self.search_mode, "SelfPlayWorker.start")
+        assert_search_mode_supported(self.search_mode, "SelfPlayWorker.start")
         logger.info(
             "SelfPlayWorker %d starting: %d games [search_mode=%s]",
             self.worker_id,
@@ -1310,7 +1431,17 @@ class SelfPlayWorker:
             self.threads.append(t)
 
     def stop(self) -> None:
-        """Signal all threads to stop."""
+        """Signal all threads to stop.
+
+        Idempotent and thread-safe (audit SR-01): repeated or concurrent
+        shutdown requests (e.g. safety-stop + finally, or Ctrl+C racing the
+        watchdog) must not double-join threads, re-wake the aggregator, or
+        corrupt counters. The first caller performs the shutdown.
+        """
+        with self._stop_lock:
+            if self._stopped:
+                return
+            self._stopped = True
         self.running = False
         self.aggregator.stop()
         for t in self.threads:
@@ -1333,7 +1464,23 @@ def run_worker_process(
     fast_search_sims: int = 150,
     full_search_prob: float = 0.25,
 ) -> None:
-    """Multiprocessing entry point for a self-play worker process."""
+    """LEGACY multiprocessing entry point for a self-play worker process.
+
+    Status (audit SR-17, retained intentionally): production runs a
+    single-process, thread-based worker pool; nothing in ``scripts/`` or
+    ``python/cli/`` constructs this entry point or the shared-memory client it
+    depends on (``python.selfplay.ipc.SharedMemoryPool`` /
+    ``python.selfplay.client.ShmInferenceClient``). It is kept — with its
+    fail-closed semantics (games are discarded on inference failure, and the
+    SR-01 abort guard applies here too) — because deleting live-looking
+    infrastructure without proof of obsolescence is riskier than documenting
+    it. If it is ever wired up again it must first be exercised by the
+    concurrency tests in ``tests/test_selfplay_replay_remediation.py``.
+    """
+    logger.warning(
+        "run_worker_process is a legacy, unexercised multiprocessing path "
+        "(audit SR-17); production uses the in-process SelfPlayWorker"
+    )
     shm_pool = SharedMemoryPool(name_prefix=shm_prefix, capacity=capacity, create=False)
     client = ShmInferenceClient(
         worker_id=worker_id,

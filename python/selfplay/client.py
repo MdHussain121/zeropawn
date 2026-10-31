@@ -1,6 +1,12 @@
 """Inference clients used by self-play workers to request neural evaluations.
 
 Provides both SharedMemory-based IPC client and Direct (in-process) client.
+
+Status (audit SR-17): ``DirectInferenceClient`` is the ACTIVE production
+client (used by the orchestrator, UCI engine, match runner and self-play
+worker). ``ShmInferenceClient`` is part of the retained-but-unexercised
+multiprocessing path (see ``python/selfplay/ipc.py``); it is not constructed
+anywhere in production code.
 """
 
 from __future__ import annotations

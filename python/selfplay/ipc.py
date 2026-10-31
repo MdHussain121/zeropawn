@@ -2,6 +2,14 @@
 
 This module provides high-performance zero-copy shared memory tensor buffers
 between the GPU inference server and multiple self-play worker processes on Windows/Linux.
+
+Status (audit SR-17): LEGACY, not production-reachable. Production self-play
+runs a single process with thread-based workers and the in-process
+``DirectInferenceClient``; nothing in ``scripts/`` or ``python/cli/``
+constructs a ``SharedMemoryPool``. The multiprocessing worker path
+(``worker.run_worker_process``) and this pool are retained deliberately (its
+fail-closed semantics are correct and documented) but are unexercised; if the
+path is ever revived it must first be covered by concurrency tests.
 """
 
 from __future__ import annotations
