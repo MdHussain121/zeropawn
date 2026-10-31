@@ -76,6 +76,29 @@ def merge_datasets(selection: list[dict], merge_dir: Path) -> tuple[Path, Path]:
             src = ds["dir"] / split
             meta = json.loads((src / "metadata.json").read_text(encoding="utf-8"))
             total += int(meta.get("num_samples", 0))
+        # Optional schema-2 sidecars: every input must either carry the
+        # sidecar or the merged output must drop it LOUDLY — a silent drop
+        # would strip the legal-mask stream (the SLQ-05 root-cause pattern)
+        # and the side-to-move record (SLQ-13) from the merged artifact.
+        schema2_files: dict[str, tuple[np.dtype, Any]] = {}
+        for fname, dtype, shape_fn in (
+            ("masks.bin", np.uint8, lambda n: (n, (4672 + 7) // 8)),
+            ("stm.bin", np.uint8, lambda n: (n,)),
+        ):
+            inputs_with = [
+                ds for ds in selection if (ds["dir"] / split / fname).is_file()
+            ]
+            if inputs_with and len(inputs_with) != len(selection):
+                raise ValueError(
+                    f"merge aborted: {fname} exists on only {len(inputs_with)}/{len(selection)} "
+                    f"input datasets for split '{split}' (e.g. missing in "
+                    f"{[d['name'] for d in selection if d not in inputs_with][:3]}). Merging "
+                    "would silently produce a dataset whose sidecar stream does not cover "
+                    "all rows; rebuild the inputs with a schema-2 builder first."
+                )
+            if inputs_with:
+                schema2_files[fname] = (dtype, shape_fn)
+
         # stream-copy each bin file
         for fname in _BIN_FILES:
             dtypes = {
@@ -84,15 +107,19 @@ def merge_datasets(selection: list[dict], merge_dir: Path) -> tuple[Path, Path]:
                 "outcomes.bin": np.uint8,
                 "game_ids.bin": np.uint64,
                 "plies.bin": np.int16,
+                **{name: spec[0] for name, spec in schema2_files.items()},
             }
+            if fname not in dtypes:
+                continue
             dtype = dtypes[fname]
             if fname == "planes.bin":
                 out_mm = np.memmap(
                     merge_dir / split / fname, dtype=dtype, mode="w+", shape=(total, 19, 8, 8)
                 )
             else:
+                shape = schema2_files[fname][1](total) if fname in schema2_files else (total,)
                 out_mm = np.memmap(
-                    merge_dir / split / fname, dtype=dtype, mode="w+", shape=(total,)
+                    merge_dir / split / fname, dtype=dtype, mode="w+", shape=shape
                 )
             offset = 0
             for ds in selection:
@@ -101,6 +128,10 @@ def merge_datasets(selection: list[dict], merge_dir: Path) -> tuple[Path, Path]:
                 n = int(meta.get("num_samples", 0))
                 if fname == "planes.bin":
                     in_mm = np.memmap(src, dtype=dtype, mode="r", shape=(n, 19, 8, 8))
+                elif fname in schema2_files:
+                    in_mm = np.memmap(
+                        src, dtype=dtype, mode="r", shape=schema2_files[fname][1](n)
+                    )
                 else:
                     in_mm = np.memmap(src, dtype=dtype, mode="r", shape=(n,))
                 out_mm[offset : offset + n] = in_mm[:]
@@ -120,6 +151,10 @@ def merge_datasets(selection: list[dict], merge_dir: Path) -> tuple[Path, Path]:
             "dtype_plies": "int16",
             "merged_from": [ds["name"] for ds in selection],
         }
+        if "masks.bin" in schema2_files:
+            meta["dtype_masks"] = "uint8-bitpacked-4672"
+        if "stm.bin" in schema2_files:
+            meta["dtype_stm"] = "uint8 (1 = white to move, 0 = black)"
         (merge_dir / split / "metadata.json").write_text(
             json.dumps(meta, indent=2), encoding="utf-8"
         )
