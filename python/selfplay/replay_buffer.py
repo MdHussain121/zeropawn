@@ -7,6 +7,26 @@ Contract Specifications:
   starts at 25%, tapers to 5% over configurable step count.
 - Logs and reports the actual mix ratio per mini-batch.
 - Resumable: state (size, write_head, step) persists across restarts.
+
+Record schema contract (self-play ring, audit SR-07/SR-10/SR-15):
+
+| shard          | shape                 | dtype   | content                                    |
+|----------------|-----------------------|---------|--------------------------------------------|
+| planes.bin     | (capacity, 19, 8, 8)  | float32 | side-to-move-relative encoding, values {0,1} |
+| visits.bin     | (capacity, 4672)      | float32 | normalized root visit distribution (sum~=1)  |
+| outcomes.bin   | (capacity,)           | int64   | 0=Win, 1=Draw, 2=Loss (mover-relative)       |
+| game_ids.bin   | (capacity,)           | uint64  | producing game id (> 0)                      |
+| versions.bin   | (capacity,)           | int32   | model version at record time (>= 0)          |
+| full_search.bin| (capacity,)           | bool_   | playout-cap randomization flag               |
+
+``meta.json`` carries ``schema_version`` (see ``SCHEMA_VERSION``), a ``shards``
+byte-layout contract, the ``generation`` of the physical shard set, a
+``buffer_id`` identifying the directory, and optional ``checksums``. Loading
+validates metadata strictly, verifies exact shard byte sizes, and validates
+the scalar domains of every live record; it fails closed (raises
+``BufferIntegrityError``) rather than loading a state it cannot validate.
+Insertion validates every record before writing (``add_positions`` raises
+``ReplayRecordValidationError`` and commits nothing).
 """
 
 from __future__ import annotations
@@ -44,6 +64,167 @@ logger = logging.getLogger(__name__)
 # unknown provenance as untrusted rather than as fresh data.
 UNKNOWN_MODEL_VERSION = -1
 
+# Game-id sentinel for sampled rows that have no producing game (human dataset
+# and tactical-pool rows) or whose provenance was genuinely unavailable.
+# Self-play records always carry game_id > 0 (enforced at insertion).
+NO_GAME_ID = 0
+
+# ---------------------------------------------------------------------------
+# Schema / integrity / validation contract (audit SR-05..SR-13)
+# ---------------------------------------------------------------------------
+
+# 1 = legacy layout (six shards + meta without schema_version/shards/checksums);
+# 2 = current: meta carries schema_version, shards layout, generation, buffer_id
+#     and optional checksums; insertion validates records; scalar domains are
+#     verified at load. Version 1 buffers load unchanged (missing field = 1).
+SCHEMA_VERSION = 2
+
+# Weight pushes a row may lag the freshest row before the staleness filter
+# stops drawing it. Relative to the current max version (dormant for a
+# single-version buffer, active once weights start moving). One constant is
+# shared by the ring sampler and the GPU cache so both paths apply identical
+# eligibility semantics (audit SR-05).
+STALENESS_WINDOW = 20
+
+# Tolerance for "the visit vector is a normalized distribution, not raw counts"
+# (audit SR-15). Stored rows are empirically exact (sum == 1.000000).
+POLICY_SUM_TOLERANCE = 1e-3
+
+# Planes are binary indicators; allow a hair of float error without letting a
+# genuinely different encoder change through silently.
+PLANES_RANGE_TOLERANCE = 1e-6
+
+
+class ReplayRecordValidationError(ValueError):
+    """A record failed insertion-time validation; nothing was written (SR-07)."""
+
+
+class BufferIntegrityError(ValueError):
+    """Buffer metadata or shards violate the schema contract; load fails closed."""
+
+
+def _shard_nbytes(shape: Tuple[int, ...], dtype: np.dtype) -> int:
+    return int(np.prod(shape)) * int(np.dtype(dtype).itemsize)
+
+
+def validate_records_arrays(
+    planes: np.ndarray,
+    visits: np.ndarray,
+    outcomes: np.ndarray,
+    full_search: np.ndarray,
+    versions: np.ndarray,
+    game_ids: np.ndarray,
+    *,
+    in_channels: int = 19,
+    height: int = 8,
+    width: int = 8,
+    num_actions: int = 4672,
+) -> None:
+    """Vectorized insertion-time validation of one flush (audit SR-07).
+
+    Raises :class:`ReplayRecordValidationError` with a precise diagnostic when
+    any record is malformed. The checks run on the stacked arrays (one pass per
+    field, no per-record Python loop) and use min/max/sum rather than
+    ``np.isfinite``: NaN and +/-Inf propagate into min/max/sum, so a
+    comparison-based check rejects non-finite values as well — a non-finite
+    value can never satisfy both a min and a max bound.
+
+    Contract enforced (see module docstring for the full schema):
+
+    - shapes ``(n, C, H, W)`` / ``(n, A)`` / ``(n,)`` and matching lengths;
+    - planes finite, within [0, 1];
+    - visits finite, non-negative, each row summing to 1 within
+      ``POLICY_SUM_TOLERANCE`` (they are normalized distributions, not counts);
+    - outcomes in {0, 1, 2} (mover-relative WDL; the 255 sentinel belongs to
+      human/tactical pools and must never enter the self-play ring);
+    - versions >= 0; game_ids > 0 (uint64 producing-game identity).
+    """
+    n = int(planes.shape[0]) if getattr(planes, "ndim", 0) else 0
+    expected_shapes = [
+        ("planes", planes, (n, in_channels, height, width)),
+        ("visits", visits, (n, num_actions)),
+        ("outcomes", outcomes, (n,)),
+        ("full_search", full_search, (n,)),
+        ("versions", versions, (n,)),
+        ("game_ids", game_ids, (n,)),
+    ]
+    for name, arr, want in expected_shapes:
+        if tuple(getattr(arr, "shape", ())) != want:
+            raise ReplayRecordValidationError(
+                f"record field {name!r} has shape {tuple(getattr(arr, 'shape', ()))}; expected {want}"
+            )
+    if n == 0:
+        return
+
+    # planes: finite and in [0, 1] (NaN/Inf fail both bounds)
+    if not (float(np.min(planes)) >= -PLANES_RANGE_TOLERANCE):
+        raise ReplayRecordValidationError(
+            "planes contain values below 0 (or non-finite values); the encoder emits indicators in [0, 1]"
+        )
+    if not (float(np.max(planes)) <= 1.0 + PLANES_RANGE_TOLERANCE):
+        raise ReplayRecordValidationError(
+            "planes contain values above 1 (or non-finite values); the encoder emits indicators in [0, 1]"
+        )
+
+    # visits: finite, non-negative, normalized distribution per row
+    if not (float(np.min(visits)) >= 0.0):
+        raise ReplayRecordValidationError(
+            "visits contain negative (or non-finite) entries; visits must be a probability distribution"
+        )
+    row_sums = visits.sum(axis=1, dtype=np.float64)
+    bad = np.nonzero(
+        (row_sums < 1.0 - POLICY_SUM_TOLERANCE) | (row_sums > 1.0 + POLICY_SUM_TOLERANCE)
+    )[0]
+    if bad.size:
+        raise ReplayRecordValidationError(
+            f"visits row {int(bad[0])} sums to {float(row_sums[bad[0]]):.6f}; expected a normalized "
+            f"distribution (1.0 +/- {POLICY_SUM_TOLERANCE}). Raw visit counts are not valid targets."
+        )
+
+    # outcomes: {0,1,2}; NaN can never equal an integer class
+    unique_out = np.unique(outcomes)
+    invalid_out = unique_out[~np.isin(unique_out, (0, 1, 2))]
+    if invalid_out.size:
+        raise ReplayRecordValidationError(
+            f"outcomes contain invalid class value(s) {invalid_out[:5].tolist()}; expected 0=Win, "
+            "1=Draw, 2=Loss (255 is an unavailable-target sentinel valid only in human/tactical pools)"
+        )
+
+    # versions: >= 0 for ring records (negative versions are cache-only markers)
+    if not (float(np.min(versions)) >= 0.0):
+        raise ReplayRecordValidationError(
+            "versions contain negative values; ring records must carry a real model version (>= 0)"
+        )
+
+    # game_ids: > 0 (producing game identity; 0 is the "no game" sentinel)
+    if not (float(np.min(game_ids)) > 0.0):
+        raise ReplayRecordValidationError(
+            "game_ids contain 0 or non-finite values; self-play records must carry the producing game id (> 0)"
+        )
+
+
+def validate_position_record(
+    pos: Any,
+    *,
+    in_channels: int = 19,
+    height: int = 8,
+    width: int = 8,
+    num_actions: int = 4672,
+) -> None:
+    """:func:`validate_records_arrays` for a single :class:`SavedPosition`."""
+    validate_records_arrays(
+        np.expand_dims(np.asarray(pos.planes, dtype=np.float32), 0),
+        np.expand_dims(np.asarray(pos.visits, dtype=np.float32), 0),
+        np.asarray([pos.outcome], dtype=np.int64),
+        np.asarray([pos.is_full_search], dtype=np.bool_),
+        np.asarray([pos.model_version], dtype=np.int32),
+        np.asarray([pos.game_id], dtype=np.uint64),
+        in_channels=in_channels,
+        height=height,
+        width=width,
+        num_actions=num_actions,
+    )
+
 
 class ReplayBatchDict(TypedDict):
     planes: torch.Tensor
@@ -64,13 +245,32 @@ class ReplayMetaDict(TypedDict):
 
 
 class GpuResidentReplayCache:
-    """High-throughput circular GPU tensor cache in VRAM for zero-PCIe sampling."""
+    """High-throughput circular GPU tensor cache in VRAM for zero-PCIe sampling.
+
+    Coverage contract (audit SR-06): the cache is a velocity layer whose
+    contents are the newest ``capacity`` ring rows (pre-population takes the
+    newest rows; live inserts append). When the disk ring holds more records
+    than the cache, the cache alone would only map the newest
+    ``cache_capacity / ring_size`` fraction of the eligible population — a
+    sampling bias. ``ReplayBuffer`` therefore splits each self-play request
+    between the cache and the ring proportionally to that coverage
+    (``selfplay_sampling_policy="ring_uniform"``, the default) so the combined
+    distribution is uniform over the whole ring; ``"cache_uniform"`` restores
+    the historical newest-rows-only behavior for comparison.
+
+    Staleness semantics are shared with the ring path via
+    ``STALENESS_WINDOW``: rows more than that many weight pushes behind the
+    freshest row, and rows of unknown provenance (version < 0), are excluded
+    while enough fresh rows exist; if not enough fresh rows exist the sampler
+    falls back to sampling all rows (documented, counted in
+    ``staleness_fallback_count``) rather than returning fewer rows than asked.
+    """
 
     # Weight pushes a row may lag the freshest row before the sampler stops
     # drawing it. Relative to the current max version, so it is armed from the
     # first push (the old absolute `max_ver > 20` gate let the early run train
-    # on arbitrarily old restored rows).
-    STALENESS_WINDOW = 20
+    # on arbitrarily old restored rows). Shared constant (audit SR-05).
+    STALENESS_WINDOW = STALENESS_WINDOW
 
     def __init__(
         self,
@@ -124,6 +324,19 @@ class GpuResidentReplayCache:
             dtype=torch.int32,
             device=self.device,
         )
+        # Producing-game identity travels with the row (audit SR-13). Rows added
+        # without an explicit id are stamped NO_GAME_ID (0 = provenance
+        # genuinely unavailable, e.g. a cache restored before ids existed) and
+        # can always be told apart from real ids, which are > 0.
+        self.gpu_game_ids = torch.zeros(
+            (self.capacity,),
+            dtype=torch.int64,
+            device=self.device,
+        )
+        # Rows more than the staleness window behind the freshest row, or of
+        # unknown provenance, that had to be included because too few fresh
+        # rows existed (telemetry for the documented fallback).
+        self.staleness_fallback_count = 0
 
     @property
     def write_head(self) -> int:
@@ -144,13 +357,15 @@ class GpuResidentReplayCache:
         outcomes: Union[np.ndarray, torch.Tensor],
         full_search: Union[np.ndarray, torch.Tensor],
         versions: Optional[Union[np.ndarray, torch.Tensor]] = None,
+        game_ids: Optional[Union[np.ndarray, torch.Tensor]] = None,
     ) -> None:
         """Add batch of positions directly to GPU cache.
 
         Rows added without version information are stamped
         ``UNKNOWN_MODEL_VERSION`` (-1): the staleness sampler treats unknown
         provenance as untrusted (excluded while known rows are available)
-        instead of as fresh data.
+        instead of as fresh data. Rows added without game ids are stamped
+        ``NO_GAME_ID`` (0); real self-play ids are always > 0 (audit SR-13).
         """
         n = len(planes)
         if n == 0 or self.capacity == 0:
@@ -178,6 +393,15 @@ class GpuResidentReplayCache:
                     self.device, non_blocking=True
                 )
             )
+            gid_t = (
+                torch.from_numpy(np.ascontiguousarray(game_ids, dtype=np.int64)).to(
+                    self.device, non_blocking=True
+                )
+                if game_ids is not None
+                else torch.full((n,), NO_GAME_ID, dtype=torch.int64).to(
+                    self.device, non_blocking=True
+                )
+            )
         else:
             p_t = planes.to(dtype=torch.float32, device=self.device, non_blocking=True)
             v_t = visits.to(dtype=torch.float32, device=self.device, non_blocking=True)
@@ -188,6 +412,11 @@ class GpuResidentReplayCache:
                 if versions is not None
                 else torch.full((n,), UNKNOWN_MODEL_VERSION, dtype=torch.int32, device=self.device)
             )
+            gid_t = (
+                game_ids.to(dtype=torch.int64, device=self.device, non_blocking=True)
+                if game_ids is not None
+                else torch.full((n,), NO_GAME_ID, dtype=torch.int64, device=self.device)
+            )
 
         if n >= self.capacity:
             self.gpu_planes.copy_(p_t[-self.capacity :])
@@ -195,6 +424,7 @@ class GpuResidentReplayCache:
             self.gpu_outcomes.copy_(o_t[-self.capacity :])
             self.gpu_full_search.copy_(f_t[-self.capacity :])
             self.gpu_versions.copy_(ver_t[-self.capacity :])
+            self.gpu_game_ids.copy_(gid_t[-self.capacity :])
             self.write_head = 0
             self.size = self.capacity
             self.total_added += n
@@ -209,6 +439,7 @@ class GpuResidentReplayCache:
                 self.gpu_outcomes[start:end].copy_(o_t)
                 self.gpu_full_search[start:end].copy_(f_t)
                 self.gpu_versions[start:end].copy_(ver_t)
+                self.gpu_game_ids[start:end].copy_(gid_t)
             else:
                 part1 = self.capacity - start
                 part2 = n - part1
@@ -217,28 +448,36 @@ class GpuResidentReplayCache:
                 self.gpu_outcomes[start : self.capacity].copy_(o_t[:part1])
                 self.gpu_full_search[start : self.capacity].copy_(f_t[:part1])
                 self.gpu_versions[start : self.capacity].copy_(ver_t[:part1])
+                self.gpu_game_ids[start : self.capacity].copy_(gid_t[:part1])
 
                 self.gpu_planes[:part2].copy_(p_t[part1:])
                 self.gpu_visits[:part2].copy_(v_t[part1:])
                 self.gpu_outcomes[:part2].copy_(o_t[part1:])
                 self.gpu_full_search[:part2].copy_(f_t[part1:])
                 self.gpu_versions[:part2].copy_(ver_t[part1:])
+                self.gpu_game_ids[:part2].copy_(gid_t[part1:])
 
             self.write_head = (start + n) % self.capacity
             self.size = min(self.capacity, self.size + n)
             self.total_added += n
 
     def sample_batch(self, batch_size: int) -> Dict[str, torch.Tensor]:
-        """Sample mini-batch directly on GPU with zero PCIe overhead."""
+        """Sample mini-batch directly on GPU with zero PCIe overhead.
+
+        Staleness filter (always armed, identical to the ring path): exclude
+        rows more than ``STALENESS_WINDOW`` weight pushes behind the freshest
+        row and rows of unknown provenance (version < 0). For a fresh monotonic
+        run this is a no-op — it only bites restored/stale/unknown rows. If too
+        few fresh rows exist the sampler falls back to sampling every row
+        (documented; counted in ``staleness_fallback_count``) rather than
+        returning fewer rows than requested. Sampling is uniform with
+        replacement. ``game_ids`` travels with every returned row (SR-13).
+        """
         if batch_size <= 0:
             raise ValueError(f"batch_size must be > 0, got {batch_size}")
         with self._lock:
             if self.size == 0:
                 raise ValueError("GPU cache is empty.")
-            # Staleness filter (always armed): exclude rows more than
-            # STALENESS_WINDOW weight pushes behind the freshest row, and rows
-            # of unknown provenance (version < 0). For a fresh monotonic run
-            # this is a no-op — it only bites restored/stale/unknown rows.
             cur_versions = self.gpu_versions[: self.size]
             max_ver = int(cur_versions.max().item()) if self.size > 0 else 0
             valid_mask = (cur_versions >= (max_ver - self.STALENESS_WINDOW)) & (cur_versions >= 0)
@@ -253,12 +492,14 @@ class GpuResidentReplayCache:
                 # Not enough known-fresh rows (e.g. a cache restored without
                 # version info): fall back to sampling everything, but never
                 # pretend unknown rows were fresh.
+                self.staleness_fallback_count += 1
                 indices = torch.randint(0, self.size, (batch_size,), device=self.device)
             out = {
                 "planes": self.gpu_planes[indices].clone(),
                 "visits": self.gpu_visits[indices].clone(),
                 "outcomes": self.gpu_outcomes[indices].clone(),
                 "is_full_search": self.gpu_full_search[indices].clone(),
+                "game_ids": self.gpu_game_ids[indices].clone(),
             }
         return out
 
@@ -443,6 +684,7 @@ class ReplayBuffer:
         tactical_cache_size: int = 20_000,
         data_role: Optional[str] = None,
         allow_uncertified_data: bool = False,
+        selfplay_sampling_policy: str = "ring_uniform",
     ) -> None:
         self.buffer_dir = Path(buffer_dir)
         self.buffer_dir.mkdir(parents=True, exist_ok=True)
@@ -463,6 +705,29 @@ class ReplayBuffer:
             torch.device(gpu_device) if gpu_device is not None else None
         )
 
+        if selfplay_sampling_policy not in ("ring_uniform", "cache_uniform"):
+            raise ValueError(
+                f"Unknown selfplay_sampling_policy {selfplay_sampling_policy!r}; expected "
+                "'ring_uniform' (unbiased; default) or 'cache_uniform' (historical newest-rows bias)."
+            )
+        # Sampling policy (audit SR-06). "ring_uniform" splits each self-play
+        # request between the GPU cache and the ring proportionally to the
+        # cache's coverage of the ring, which makes the combined distribution
+        # uniform over the whole ring. "cache_uniform" keeps the historical
+        # behavior (whenever the cache is large enough, every self-play row
+        # comes from it — i.e. uniformly over the newest `cache_capacity` rows
+        # only) and is retained for comparison runs.
+        self.selfplay_sampling_policy = selfplay_sampling_policy
+        # Telemetry for the unified staleness fallback (rows older than the
+        # window, or of unknown provenance, sampled because too few fresh rows
+        # existed) and for the last self-play sampling shape.
+        self.staleness_fallback_count = 0
+        self.last_selfplay_rows = 0
+        self.last_selfplay_source: Optional[str] = None
+        # Records rejected by insertion validation (telemetry; a nonzero value
+        # means a producer bug was caught before it could enter the buffer).
+        self.rejected_records = 0
+
         self._write_head = 0
         self.size = 0
         self.total_added = 0
@@ -471,6 +736,17 @@ class ReplayBuffer:
         self._games_since_meta = 0
         self._meta_throttle_games = 10
         self._meta_throttle_secs = 30.0
+
+        # Schema/provenance bookkeeping (audit SR-04, SR-07, SR-10).
+        self.schema_version = SCHEMA_VERSION
+        # Generation of the physical shard set: incremented when a buffer
+        # directory is re-created (--reset-buffer) so a checkpoint that
+        # references an older generation can never be paired silently.
+        self.generation = 1
+        self._shard_checksums: Dict[str, str] = {}
+        # Stable identity of this buffer directory (used by the
+        # checkpoint<->buffer consistency contract).
+        self.buffer_id = self._compute_buffer_id()
 
         # Human dataset cache (resides in GPU VRAM if CUDA available, or host RAM as fallback)
         self._human_cache_size = 0
@@ -516,6 +792,14 @@ class ReplayBuffer:
         if not create_new and self.paths["meta"].exists():
             self._load_meta()
         else:
+            if create_new:
+                # A reset starts a NEW generation of the physical shard set.
+                # Stale bytes beyond `size` may remain in the preallocated files
+                # (invisible by construction: bounds are [0, size) and every
+                # write starts at `write_head`), but any checkpoint that
+                # references the previous generation must fail consistency
+                # verification rather than pair silently (audit SR-04).
+                self.generation = self._read_existing_generation() + 1
             self._create_empty_files()
             self._save_meta()
 
@@ -694,7 +978,15 @@ class ReplayBuffer:
             "size": self.size,
             "total_added": self.total_added,
             "tactical_pool_size": getattr(self, "tactical_pool_size", 0),
+            # Schema/integrity contract (audit SR-07, SR-10, SR-04).
+            "schema_version": int(getattr(self, "schema_version", SCHEMA_VERSION)),
+            "generation": int(getattr(self, "generation", 1)),
+            "buffer_id": getattr(self, "buffer_id", None),
+            "shards": self._expected_shard_layout(),
         }
+        checksums = getattr(self, "_shard_checksums", None)
+        if checksums:
+            meta["checksums"] = dict(checksums)
         meta_path = self.paths["meta"]
         tmp_path = meta_path.with_suffix(".tmp")
         with open(tmp_path, "w", encoding="utf-8") as f:
@@ -764,12 +1056,380 @@ class ReplayBuffer:
             raise ValueError(f"Meta size {size} out of range [0, {capacity}]")
         if total_added < 0:
             raise ValueError(f"Meta total_added {total_added} < 0")
+
+        # ── Schema contract (audit SR-07/SR-10): fail closed on anything the
+        # metadata describes but cannot validate. A missing schema_version
+        # means the legacy format 1 buffer (e.g. the 2026-10-26 96,067-record
+        # artifact); a version NEWER than this code understands is refused
+        # rather than misinterpreted. ──
+        schema_version = int(meta.get("schema_version", 1))
+        if schema_version > SCHEMA_VERSION:
+            raise BufferIntegrityError(
+                f"Replay meta at {meta_path} declares schema_version {schema_version}, but this "
+                f"code understands up to {SCHEMA_VERSION}. Refusing to load a newer format "
+                "(no silent downgrade)."
+            )
+        self.schema_version = schema_version
+        self.generation = int(meta.get("generation", 1))
+        declared_buffer_id = meta.get("buffer_id")
+        if declared_buffer_id is not None and declared_buffer_id != self.buffer_id:
+            # Same directory should hash to the same id; a difference means the
+            # meta was copied from another location. Not fatal (the records are
+            # still this directory's records), but the checkpoint contract must
+            # know: report it and record the mismatch.
+            logger.warning(
+                "[BUFFER] Meta buffer_id %s does not match this directory's id %s "
+                "(meta copied between directories?); using the on-disk id",
+                declared_buffer_id,
+                self.buffer_id,
+            )
+        checksums = meta.get("checksums")
+        if isinstance(checksums, dict):
+            self._shard_checksums = {str(k): str(v) for k, v in checksums.items()}
+
+        # Exact per-shard byte-size verification (audit SR-10): undersized
+        # shards would raise at memmap open, but OVERSIZED ones open silently
+        # with the extra bytes ignored, and a wrong-size file means the shard
+        # does not belong to this meta. Both directions fail closed here.
+        self._verify_shard_sizes(meta_path)
+
+        # Scalar-domain verification of every live record (audit SR-10): a
+        # right-sized but foreign/zero-filled/garbled scalar shard alongside a
+        # valid meta must not load silently.
+        self._verify_scalar_contract(meta_path, size=size)
+
         self.write_head = write_head
         self.size = size
         self.total_added = total_added
         if "tactical_pool_size" in meta:
             self.saved_tactical_pool_size = int(meta["tactical_pool_size"])
             self.tactical_pool_size = self.saved_tactical_pool_size
+
+    # ── Schema / integrity helpers (audit SR-04, SR-07, SR-10) ─────────────
+
+    def _compute_buffer_id(self) -> str:
+        """Stable identity of this buffer directory (checkpoint pairing)."""
+        import hashlib
+
+        try:
+            resolved = os.path.normcase(str(self.buffer_dir.resolve()))
+        except OSError:
+            resolved = os.path.normcase(str(self.buffer_dir))
+        return hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:16]
+
+    def _expected_shard_layout(self) -> Dict[str, Dict[str, Any]]:
+        """The byte-layout contract written into meta and verified on load."""
+        layout: Dict[str, Dict[str, Any]] = {}
+        for key in ("planes", "visits", "outcomes", "full_search", "versions", "game_ids"):
+            shape = self._get_shape(key)
+            dtype = self._get_dtype(key)
+            layout[key] = {
+                "shape": [int(s) for s in shape],
+                "dtype": str(np.dtype(dtype)),
+                "bytes": _shard_nbytes(shape, np.dtype(dtype)),
+            }
+        return layout
+
+    def _read_existing_generation(self) -> int:
+        """Generation recorded in an existing meta (0 when none/unreadable)."""
+        try:
+            if self.paths["meta"].exists():
+                with open(self.paths["meta"], "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                return int(data.get("generation", 1))
+        except (OSError, ValueError, TypeError):
+            pass
+        return 0
+
+    def _verify_shard_sizes(self, meta_path: Path) -> None:
+        """Verify each shard file exists and has EXACTLY the expected bytes."""
+        expected = self._expected_shard_layout()
+        for key, spec in expected.items():
+            path = self.paths[key]
+            if not path.exists():
+                raise BufferIntegrityError(
+                    f"Replay shard {path} is missing but {meta_path} describes a populated "
+                    "buffer. Refusing to load (no silent re-creation)."
+                )
+            actual = path.stat().st_size
+            if actual != spec["bytes"]:
+                raise BufferIntegrityError(
+                    f"Replay shard {path} has {actual} bytes; expected exactly {spec['bytes']} "
+                    f"({spec['shape']} {spec['dtype']}). The shard does not match the metadata "
+                    "contract (oversized or truncated); refusing to load."
+                )
+
+    def _verify_scalar_contract(self, meta_path: Path, size: Optional[int] = None) -> None:
+        """Validate the scalar domains of every live record at load.
+
+        Cheap (O(size) over four scalar shards; ~a few MB at 500k records),
+        read-only, and fail-closed: outcomes must be {0,1,2}, versions >= 0,
+        game_ids > 0 for every record in [0, size). This also detects a
+        zero-filled or foreign scalar shard that otherwise matches the size
+        contract. ``size`` is passed explicitly because this runs during
+        ``_load_meta`` before ``self.size`` is assigned from the metadata.
+        """
+        size = int(self.size if size is None else size)
+        if size <= 0:
+            return
+        checks = (
+            ("outcomes", np.int64, lambda a: np.isin(a, (0, 1, 2)).all(),
+             "values outside {0=Win, 1=Draw, 2=Loss}"),
+            ("versions", np.int32, lambda a: bool((a >= 0).all()),
+             "negative model versions"),
+            ("game_ids", np.uint64, lambda a: bool((a > 0).all()),
+             "zero game ids"),
+        )
+        for key, dtype, predicate, description in checks:
+            path = self.paths[key]
+            m = np.memmap(path, dtype=dtype, mode="r", shape=(self.capacity,))
+            try:
+                window = np.array(m[:size])
+            finally:
+                try:
+                    m._mmap.close()  # type: ignore[attr-defined]
+                except (AttributeError, ValueError, OSError):
+                    pass
+                del m
+            if not predicate(window):
+                bad = np.nonzero(~np.isin(window, (0, 1, 2)))[0] if key == "outcomes" else None
+                detail = f"first offending index {int(bad[0])}" if bad is not None and bad.size else ""
+                raise BufferIntegrityError(
+                    f"Replay shard {key} contains {description} within [0, {size}) "
+                    f"({detail}); {meta_path} cannot be validated against its data. "
+                    "Refusing to load (fail closed)."
+                )
+
+    def snapshot(self) -> Dict[str, Any]:
+        """Point-in-time state descriptor used by the checkpoint contract.
+
+        A checkpoint stores this dict; a resume compares it against the LIVE
+        buffer via :meth:`checkpoint_consistency` before any training state is
+        adopted (audit SR-04).
+        """
+        return {
+            "buffer_id": self.buffer_id,
+            "capacity": int(self.capacity),
+            "schema_version": int(self.schema_version),
+            "generation": int(self.generation),
+            "size": int(self.size),
+            "write_head": int(self.write_head),
+            "total_added": int(self.total_added),
+        }
+
+    @property
+    def gpu_cache_coverage(self) -> float:
+        """Fraction of the live ring the GPU cache can serve (live-computed).
+
+        Recomputed on access so it stays truthful as records are appended after
+        cache construction: ``min(1, cache_size / ring_size)`` (audit SR-06).
+        """
+        if self.gpu_cache is None or self.size <= 0:
+            return 0.0
+        return min(1.0, float(len(self.gpu_cache)) / float(self.size))
+
+    def checkpoint_consistency(self, snapshot: Optional[Dict[str, Any]]) -> Tuple[str, str]:
+        """Classify a checkpoint's stored buffer snapshot against the live buffer.
+
+        Returns ``(verdict, detail)`` where verdict is one of:
+
+        - ``"match"``   — the checkpoint describes exactly the live state;
+        - ``"ahead"``   — the live buffer verifiably contains the checkpoint
+          state plus a consistent, monotonically appended suffix (the normal
+          crash-recovery case: inserts continued after the checkpoint was
+          written). The live state is authoritative and is NOT rewound;
+        - ``"mismatch"``— any other combination: different buffer directory,
+          capacity, schema, generation, or pointer/count arithmetic that does
+          not correspond to appends. The caller must fail closed unless the
+          operator explicitly overrides.
+
+        The buffer pointer is NEVER rolled backward from a checkpoint: meta is
+        persisted atomically after every insert, so the live state is always at
+        least as fresh as any checkpoint written from it.
+        """
+        if not snapshot:
+            return "mismatch", "checkpoint carries no buffer snapshot (legacy format)"
+
+        def _get(key: str) -> Optional[int]:
+            val = snapshot.get(key)
+            try:
+                return int(val) if val is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        snap_id = snapshot.get("buffer_id")
+        if snap_id is not None and str(snap_id) != self.buffer_id:
+            return (
+                "mismatch",
+                f"different buffer directory (checkpoint {snap_id} != live {self.buffer_id})",
+            )
+        snap_cap = _get("capacity")
+        if snap_cap is not None and snap_cap != self.capacity:
+            return "mismatch", f"capacity {snap_cap} != live {self.capacity}"
+        snap_schema = _get("schema_version")
+        if snap_schema is not None and snap_schema != self.schema_version:
+            return "mismatch", f"schema_version {snap_schema} != live {self.schema_version}"
+        snap_gen = _get("generation")
+        if snap_gen is not None and snap_gen != self.generation:
+            return (
+                "mismatch",
+                f"generation {snap_gen} != live {self.generation} (the buffer was re-created)",
+            )
+
+        snap_size, snap_head, snap_total = (
+            _get("size"),
+            _get("write_head"),
+            _get("total_added"),
+        )
+        live = (self.size, self.write_head, self.total_added)
+
+        if snap_total is None:
+            # Legacy checkpoint (only buffer_size / buffer_write_head existed).
+            if (snap_size, snap_head) == (live[0], live[1]):
+                return "match", f"legacy snapshot matches live state (size={live[0]}, head={live[1]})"
+            return (
+                "mismatch",
+                f"legacy snapshot (size={snap_size}, write_head={snap_head}) does not match live "
+                f"(size={live[0]}, write_head={live[1]}); total_added was never recorded, so "
+                "'ahead' cannot be verified",
+            )
+
+        if (snap_size, snap_head, snap_total) == live:
+            return "match", f"size={live[0]}, write_head={live[1]}, total_added={live[2]}"
+
+        appended = live[2] - snap_total
+        if appended > 0 and snap_size is not None and snap_head is not None:
+            expected_head = (snap_head + appended) % self.capacity
+            if live[1] == expected_head and live[0] == min(self.capacity, snap_size + appended):
+                return (
+                    "ahead",
+                    f"live buffer contains the checkpoint state plus {appended} appended record(s) "
+                    f"(size {snap_size}->{live[0]}, head {snap_head}->{live[1]})",
+                )
+        return (
+            "mismatch",
+            f"snapshot (size={snap_size}, write_head={snap_head}, total_added={snap_total}) is "
+            f"inconsistent with live (size={live[0]}, write_head={live[1]}, total_added={live[2]})",
+        )
+
+    def compute_shard_checksums(self, chunk_bytes: int = 8 * 1024 * 1024) -> Dict[str, str]:
+        """Stream-compute SHA-256 for each shard file.
+
+        O(buffer bytes): ~11.5 GB of reads at capacity 500k. This is a
+        deliberate, explicit operation (data-freeze verification, forensic
+        checks) — it is never run on the hot path and never on load.
+        """
+        import hashlib
+
+        if not self.in_memory:
+            for name in ("planes", "visits", "outcomes", "full_search", "versions", "game_ids"):
+                arr = getattr(self, name, None)
+                if isinstance(arr, np.memmap):
+                    try:
+                        arr.flush()
+                    except (ValueError, OSError):
+                        logger.debug("checksum pre-flush failed for %s", name, exc_info=True)
+        sums: Dict[str, str] = {}
+        for key in ("planes", "visits", "outcomes", "full_search", "versions", "game_ids"):
+            path = self.paths[key]
+            if not path.exists():
+                continue
+            h = hashlib.sha256()
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(chunk_bytes), b""):
+                    h.update(chunk)
+            sums[key] = h.hexdigest()
+        return sums
+
+    def write_shard_checksums(self) -> Dict[str, str]:
+        """Compute and persist shard checksums into meta (atomic)."""
+        sums = self.compute_shard_checksums()
+        self._shard_checksums = sums
+        self._save_meta(force=True)
+        logger.info("[BUFFER] Persisted shard checksums for %d shard(s)", len(sums))
+        return sums
+
+    def verify_shards(self, deep: bool = False) -> Dict[str, Any]:
+        """Integrity verification report for the buffer (audit SR-10).
+
+        Cheap checks (always): shard existence + exact byte sizes, scalar
+        domains of live records, and (report-only) that slots at/after ``size``
+        still carry the zero-fill from preallocation in the current generation.
+
+        Deep checks (``deep=True``): additionally recompute every shard's
+        SHA-256 and compare with the stored ``meta.checksums`` (written by
+        :meth:`write_shard_checksums`). O(buffer bytes).
+
+        Returns ``{"ok": bool, "errors": [...], "warnings": [...],
+        "checks": {...}}``; never raises for data conditions.
+        """
+        report: Dict[str, Any] = {"ok": True, "errors": [], "warnings": [], "checks": {}}
+        # 1. Sizes
+        expected = self._expected_shard_layout()
+        for key, spec in expected.items():
+            path = self.paths[key]
+            if not path.exists():
+                report["ok"] = False
+                report["errors"].append(f"missing shard {key} ({path})")
+                continue
+            actual = path.stat().st_size
+            report["checks"].setdefault("shard_bytes", {})[key] = actual
+            if actual != spec["bytes"]:
+                report["ok"] = False
+                report["errors"].append(
+                    f"shard {key} has {actual} bytes; expected {spec['bytes']}"
+                )
+        # 2. Scalar domains (live records only)
+        if self.size:
+            try:
+                self._verify_scalar_contract(self.paths["meta"])
+                report["checks"]["scalar_domains"] = "ok"
+            except BufferIntegrityError as exc:
+                report["ok"] = False
+                report["errors"].append(str(exc))
+        # 3. Report-only: unused tail must be untouched since preallocation.
+        if self.size < self.capacity and not self.in_memory:
+            tail_hits = []
+            for key in ("outcomes", "versions", "game_ids", "full_search"):
+                arr = getattr(self, key, None)
+                if arr is None:
+                    continue
+                tail = np.asarray(arr[self.size : self.capacity])
+                if tail.size and bool(tail.any()):
+                    tail_hits.append(key)
+            if tail_hits:
+                report["warnings"].append(
+                    "slots at/after size are non-zero in "
+                    f"{tail_hits} (expected after a --reset-buffer over existing files; "
+                    "never sampled because bounds are [0, size))"
+                )
+            report["checks"]["tail_zero"] = "ok" if not tail_hits else "non-zero-stale"
+        # 4. Deep: checksum comparison
+        if deep:
+            stored = dict(self._shard_checksums or {})
+            computed = self.compute_shard_checksums()
+            report["checks"]["checksums_computed"] = True
+            if not stored:
+                report["warnings"].append(
+                    "no stored checksums in meta (write_shard_checksums() was never run); "
+                    "reporting computed hashes without comparison"
+                )
+                report["checks"]["computed_sha256"] = computed
+            else:
+                mismatches = [
+                    key
+                    for key, digest in stored.items()
+                    if key in computed and computed[key] != digest
+                ]
+                missing = [key for key in stored if key not in computed]
+                if mismatches:
+                    report["ok"] = False
+                    report["errors"].append(f"checksum mismatch for shard(s): {sorted(mismatches)}")
+                if missing:
+                    report["ok"] = False
+                    report["errors"].append(f"stores checksums for missing shard(s): {sorted(missing)}")
+                report["checks"]["checksums_verified"] = not (mismatches or missing)
+        return report
 
     def _load_from_disk_to_ram(self) -> None:
         """Load existing disk memmap files into host RAM arrays."""
@@ -884,6 +1544,7 @@ class ReplayBuffer:
                     outcomes=np.array(self.outcomes[start_idx:end_idx]),
                     full_search=np.array(self.full_search[start_idx:end_idx]),
                     versions=np.array(self.versions[start_idx:end_idx]),
+                    game_ids=np.array(self.game_ids[start_idx:end_idx], dtype=np.int64),
                 )
             else:
                 recent_indices = [
@@ -895,9 +1556,23 @@ class ReplayBuffer:
                     outcomes=np.array(self.outcomes[recent_indices]),
                     full_search=np.array(self.full_search[recent_indices]),
                     versions=np.array(self.versions[recent_indices]),
+                    game_ids=np.array(self.game_ids[recent_indices], dtype=np.int64),
                 )
 
-        logger.info(f"Enabled GPU-resident replay cache with capacity {capacity} on {dev}")
+        # Coverage telemetry (audit SR-06): how much of the live ring this
+        # cache can serve, and therefore how much of each self-play request is
+        # split off to the ring under the default "ring_uniform" policy.
+        logger.info(
+            "Enabled GPU-resident replay cache with capacity %d on %s "
+            "(preloaded %d row(s); covers %s of the %d live ring records; self-play sampling "
+            "policy=%s)",
+            capacity,
+            dev,
+            len(self.gpu_cache),
+            f"{self.gpu_cache_coverage * 100:.1f}%",
+            self.size,
+            self.selfplay_sampling_policy,
+        )
 
         # Also migrate human dataset active cache to GPU VRAM if loaded
         if getattr(self, "human_dataset", None) is not None:
@@ -1246,7 +1921,23 @@ class ReplayBuffer:
         self._load_tactical_cache(cache_size=target_size, device=self._tactical_cache_device)
 
     def add_position(self, pos: SavedPosition) -> None:
-        """Insert a single position into the ring buffer."""
+        """Insert a single position into the ring buffer.
+
+        The record is validated before anything is written (audit SR-07); an
+        invalid record raises ``ReplayRecordValidationError`` and leaves the
+        ring, meta and GPU cache untouched.
+        """
+        try:
+            validate_position_record(
+                pos,
+                in_channels=self.in_channels,
+                height=self.height,
+                width=self.width,
+                num_actions=self.num_actions,
+            )
+        except ReplayRecordValidationError:
+            self.rejected_records += 1
+            raise
         with self._lock:
             idx = self.write_head
             self.planes[idx] = pos.planes
@@ -1268,24 +1959,88 @@ class ReplayBuffer:
                 outcomes=np.array([pos.outcome], dtype=np.int64),
                 full_search=np.array([pos.is_full_search], dtype=np.bool_),
                 versions=np.array([pos.model_version], dtype=np.int32),
+                game_ids=np.array([pos.game_id], dtype=np.int64),
             )
 
     def add_positions(self, positions: List[SavedPosition]) -> None:
-        """Insert a batch of positions into the ring buffer (tail-take if n > capacity)."""
+        """Insert a batch of positions into the ring buffer (tail-take if n > capacity).
+
+        Validation is transactional (audit SR-07): the whole flush is validated
+        BEFORE the lock is taken and any byte is written, so a malformed record
+        rejects the entire flush and never leaves a partially committed record
+        or a desynchronized shard. ``total_added`` counts every record offered
+        to the ring, including records dropped by an oversized-flush truncation
+        (audit SR-11), so resetting/pacing arithmetic cannot understate
+        production.
+        """
         if not positions:
             return
 
-        if len(positions) > self.capacity:
-            # Keep only the newest `capacity` entries (consistent with GPU cache).
-            positions = positions[-self.capacity :]
-        n = len(positions)
-        # Vectorized batch insertion
-        planes_arr = np.stack([p.planes for p in positions], axis=0)
-        visits_arr = np.stack([p.visits for p in positions], axis=0)
+        n_offered = len(positions)
+        # Shape pre-check before stacking: a record with an inconsistent
+        # plane/visit shape would otherwise raise a bare numpy stacking error
+        # instead of the validation contract's diagnostic (and must reject the
+        # whole flush, not crash halfway through array assembly).
+        expected_planes = (self.in_channels, self.height, self.width)
+        expected_visits = (self.num_actions,)
+        for idx, p in enumerate(positions):
+            if tuple(np.shape(p.planes)) != expected_planes or tuple(np.shape(p.visits)) != expected_visits:
+                self.rejected_records += n_offered
+                raise ReplayRecordValidationError(
+                    f"record {idx} (game_id={getattr(p, 'game_id', '?')}) has planes shape "
+                    f"{tuple(np.shape(p.planes))} / visits shape {tuple(np.shape(p.visits))}; "
+                    f"expected {expected_planes} / {expected_visits}. Whole flush rejected; "
+                    "no bytes written."
+                )
+        # Vectorized assembly of the full flush (before truncation, so a
+        # malformed record anywhere in the game's experience rejects it).
+        planes_arr = np.stack([np.asarray(p.planes, dtype=np.float32) for p in positions], axis=0)
+        visits_arr = np.stack([np.asarray(p.visits, dtype=np.float32) for p in positions], axis=0)
         outcomes_arr = np.array([p.outcome for p in positions], dtype=np.int64)
         full_search_arr = np.array([p.is_full_search for p in positions], dtype=np.bool_)
         versions_arr = np.array([p.model_version for p in positions], dtype=np.int32)
         game_ids_arr = np.array([p.game_id for p in positions], dtype=np.uint64)
+
+        try:
+            validate_records_arrays(
+                planes_arr,
+                visits_arr,
+                outcomes_arr,
+                full_search_arr,
+                versions_arr,
+                game_ids_arr,
+                in_channels=self.in_channels,
+                height=self.height,
+                width=self.width,
+                num_actions=self.num_actions,
+            )
+        except ReplayRecordValidationError:
+            self.rejected_records += n_offered
+            logger.error(
+                "[BUFFER] Rejected a flush of %d record(s): insertion validation failed; "
+                "no bytes written",
+                n_offered,
+            )
+            raise
+
+        if n_offered > self.capacity:
+            # Keep only the newest `capacity` entries (consistent with GPU cache).
+            logger.warning(
+                "[BUFFER] Oversized flush of %d record(s) exceeds capacity %d; "
+                "keeping the newest %d (total_added still counts all %d)",
+                n_offered,
+                self.capacity,
+                self.capacity,
+                n_offered,
+            )
+            positions = positions[-self.capacity :]
+            planes_arr = planes_arr[-self.capacity :]
+            visits_arr = visits_arr[-self.capacity :]
+            outcomes_arr = outcomes_arr[-self.capacity :]
+            full_search_arr = full_search_arr[-self.capacity :]
+            versions_arr = versions_arr[-self.capacity :]
+            game_ids_arr = game_ids_arr[-self.capacity :]
+        n = len(positions)
 
         with self._lock:
             # Handle potential ring buffer wrap-around
@@ -1319,7 +2074,9 @@ class ReplayBuffer:
 
             self.write_head = (start + n) % self.capacity
             self.size = min(self.capacity, self.size + n)
-            self.total_added += n
+            # Honest accounting (SR-11): records truncated away by an oversized
+            # flush were still produced by self-play and must be counted.
+            self.total_added += n_offered
         self._save_meta(force=True)
 
         if self.gpu_cache is not None:
@@ -1329,6 +2086,7 @@ class ReplayBuffer:
                 outcomes=outcomes_arr,
                 full_search=full_search_arr,
                 versions=versions_arr,
+                game_ids=game_ids_arr,
             )
 
     def get_target_human_mix(self, step: int) -> float:
@@ -1341,6 +2099,67 @@ class ReplayBuffer:
         progress = min(1.0, max(0.0, step / float(self.taper_steps)))
         mix = self.initial_human_mix - progress * (self.initial_human_mix - self.final_human_mix)
         return float(mix)
+
+    def _sample_ring_indices_locked(self, n: int) -> np.ndarray:
+        """Uniform-with-replacement ring indices under the unified staleness contract.
+
+        Caller must hold ``self._lock`` (indices and payload are then read from
+        one consistent snapshot). Single eligibility rule shared with the GPU
+        cache (audit SR-05): a row is eligible while its model version is no
+        more than ``STALENESS_WINDOW`` pushes behind the freshest row in the
+        live ring, and unknown-provenance rows (version < 0) are never
+        eligible. Rows are drawn uniformly with replacement (identical
+        replacement semantics to the cache path). If fewer than ``n`` eligible
+        rows exist the request falls back to sampling every live row —
+        documented, counted in ``staleness_fallback_count``, and rate-limit
+        warned — instead of returning fewer rows or raising.
+        """
+        if self.size <= 0:
+            raise ValueError("Cannot sample self-play batch: replay buffer is empty.")
+        versions_slice = np.array(self.versions[: self.size], dtype=np.int32)
+        if versions_slice.size == 0:
+            raise ValueError("Cannot sample self-play batch: replay buffer is empty.")
+        max_ver = int(versions_slice.max())
+        eligible = np.nonzero(
+            (versions_slice >= (max_ver - STALENESS_WINDOW)) & (versions_slice >= 0)
+        )[0]
+        if eligible.size >= n:
+            return eligible[np.random.randint(0, eligible.size, size=n)]
+        if eligible.size < versions_slice.size:
+            self.staleness_fallback_count += 1
+            now = time.monotonic()
+            if now - getattr(self, "_last_staleness_warn", 0.0) >= 60.0:
+                self._last_staleness_warn = now
+                logger.warning(
+                    "[BUFFER] Staleness fallback: only %d of %d live rows are within the "
+                    "%d-version window; sampling all rows for this request",
+                    int(eligible.size),
+                    int(versions_slice.size),
+                    STALENESS_WINDOW,
+                )
+        return np.random.randint(0, self.size, size=n)
+
+    def _selfplay_source_split(self, num_selfplay: int) -> Tuple[int, int, float]:
+        """Split a self-play request between GPU cache and ring (audit SR-06).
+
+        Returns ``(cache_rows, ring_rows, coverage)`` where ``coverage`` is the
+        cache's share of the live ring. With the default
+        ``selfplay_sampling_policy="ring_uniform"`` the request is split in
+        proportion to coverage, which makes the combined distribution uniform
+        over the whole ring instead of uniform over only the newest
+        ``cache_capacity`` rows. ``"cache_uniform"`` restores the historical
+        behavior (every row from the cache whenever it is large enough).
+        """
+        if self.gpu_cache is None or len(self.gpu_cache) == 0 or self.size <= 0:
+            return 0, num_selfplay, 0.0
+        coverage = min(1.0, float(len(self.gpu_cache)) / float(self.size))
+        if self.selfplay_sampling_policy == "cache_uniform":
+            if len(self.gpu_cache) >= num_selfplay:
+                return num_selfplay, 0, coverage
+            return 0, num_selfplay, coverage
+        cache_rows = int(round(num_selfplay * coverage))
+        cache_rows = max(0, min(num_selfplay, cache_rows))
+        return cache_rows, num_selfplay - cache_rows, coverage
 
     def sample_batch(
         self,
@@ -1398,20 +2217,28 @@ class ReplayBuffer:
         batch_visits = []
         batch_outcomes = []
         batch_full_search = []
+        batch_game_ids = []
 
         # 1. Sample from self-play ring buffer (under lock: writers mutate
-        # these arrays concurrently; copy indices + payload atomically).
+        # these arrays concurrently; copy indices + payload atomically). The
+        # staleness rule is the shared unified contract (audit SR-05): this
+        # path samples uniformly over the ring — the same eligible population
+        # the corrected cache/ring split realizes on the tensor path.
         if num_selfplay > 0 and self.size > 0:
             with self._lock:
-                sp_indices = np.random.randint(0, self.size, size=num_selfplay)
+                sp_indices = self._sample_ring_indices_locked(num_selfplay)
                 sp_planes = np.array(self.planes[sp_indices], dtype=np.float32)
                 sp_visits = np.array(self.visits[sp_indices], dtype=np.float32)
                 sp_outcomes = np.array(self.outcomes[sp_indices], dtype=np.int64)
                 sp_full = np.array(self.full_search[sp_indices], dtype=np.bool_)
+                sp_game_ids = np.array(self.game_ids[sp_indices], dtype=np.int64)
+            self.last_selfplay_source = "ring"
+            self.last_selfplay_rows = num_selfplay
             batch_planes.append(sp_planes)
             batch_visits.append(sp_visits)
             batch_outcomes.append(sp_outcomes)
             batch_full_search.append(sp_full)
+            batch_game_ids.append(sp_game_ids)
 
         # 2. Sample from human dataset
         if num_human > 0 and self.human_dataset is not None:
@@ -1446,6 +2273,7 @@ class ReplayBuffer:
             batch_visits.append(h_visits)
             batch_outcomes.append(h_outcomes)
             batch_full_search.append(h_full_search)
+            batch_game_ids.append(np.full((num_human,), NO_GAME_ID, dtype=np.int64))
 
         # 3. Sample from tactical pool
         if num_tactical > 0 and getattr(self, "_tactical_cache_size", 0) > 0:
@@ -1480,6 +2308,7 @@ class ReplayBuffer:
             batch_visits.append(t_visits)
             batch_outcomes.append(t_outcomes)
             batch_full_search.append(t_full_search)
+            batch_game_ids.append(np.full((num_tactical,), NO_GAME_ID, dtype=np.int64))
 
         if not batch_planes:
             raise ValueError(
@@ -1504,6 +2333,9 @@ class ReplayBuffer:
             if len(batch_full_search) > 1
             else batch_full_search[0]
         )
+        game_ids = (
+            np.concatenate(batch_game_ids, axis=0) if len(batch_game_ids) > 1 else batch_game_ids[0]
+        )
 
         # Shuffle mini-batch to interleave human, tactical, and self-play samples
         perm = np.random.permutation(batch_size)
@@ -1512,6 +2344,7 @@ class ReplayBuffer:
             "visits": visits[perm],
             "outcomes": outcomes[perm],
             "is_full_search": full_search[perm],
+            "game_ids": game_ids[perm],
         }
 
         if return_tactical_mix:
@@ -1574,49 +2407,75 @@ class ReplayBuffer:
         batch_visits = []
         batch_outcomes = []
         batch_full_search = []
+        # Producing-game identity travels with every sampled row (audit
+        # SR-13): self-play rows carry their real game id (> 0); human and
+        # tactical rows carry NO_GAME_ID (0).
+        batch_game_ids: List[torch.Tensor] = []
 
-        # 1. Sample from self-play (GPU cache fast-path or RAM/mmap buffer)
+        # 1. Sample from self-play (GPU cache + ring, split per the documented
+        #    coverage policy — audit SR-05/SR-06)
         if num_selfplay > 0:
-            if (
-                self.gpu_cache is not None
-                and len(self.gpu_cache) >= num_selfplay
-                and self.gpu_cache.device == dev
-            ):
-                sp_batch = self.gpu_cache.sample_batch(num_selfplay)
+            cache_rows, ring_rows, coverage = self._selfplay_source_split(num_selfplay)
+
+            def _to_dev(t: torch.Tensor) -> torch.Tensor:
+                return t if t.device == dev else t.to(dev, non_blocking=True)
+
+            if cache_rows > 0 and self.gpu_cache is not None and self.gpu_cache.device == dev:
+                sp_batch = self.gpu_cache.sample_batch(cache_rows)
                 batch_planes.append(sp_batch["planes"])
                 batch_visits.append(sp_batch["visits"])
                 batch_outcomes.append(sp_batch["outcomes"])
                 batch_full_search.append(sp_batch["is_full_search"])
-            elif self.size > 0:
-                with self._lock:
-                    versions_slice = np.array(self.versions, dtype=np.int32)[: self.capacity]
-                    max_ver = int(versions_slice.max()) if len(versions_slice) > 0 else 0
-                    if max_ver > 20:
-                        valid_mask = versions_slice >= (max_ver - 20)
-                        valid_count = int(valid_mask.sum())
-                        if valid_count >= num_selfplay:
-                            valid_indices = np.nonzero(valid_mask)[0]
-                            sp_indices = np.random.choice(
-                                valid_indices, size=num_selfplay, replace=False
-                            )
-                        else:
-                            sp_indices = np.random.randint(0, self.size, size=num_selfplay)
+                batch_game_ids.append(sp_batch["game_ids"])
+            elif cache_rows > 0:
+                # Cache exists but on another device: the ring path serves the
+                # whole request (uniform over the ring, still unbiased).
+                ring_rows += cache_rows
+                cache_rows = 0
+
+            if ring_rows > 0:
+                if self.size <= 0:
+                    if cache_rows > 0:
+                        # Cache-only state (e.g. restored rows): serve the rest
+                        # from the cache as well.
+                        sp_batch = self.gpu_cache.sample_batch(ring_rows)
+                        batch_planes.append(sp_batch["planes"])
+                        batch_visits.append(sp_batch["visits"])
+                        batch_outcomes.append(sp_batch["outcomes"])
+                        batch_full_search.append(sp_batch["is_full_search"])
+                        batch_game_ids.append(sp_batch["game_ids"])
+                        ring_rows = 0
+                        self.last_selfplay_source = "gpu_cache"
+                        self.last_selfplay_rows = num_selfplay
                     else:
-                        sp_indices = np.random.randint(0, self.size, size=num_selfplay)
-                    sp_planes = np.array(self.planes[sp_indices], dtype=np.float32)
-                    sp_visits = np.array(self.visits[sp_indices], dtype=np.float32)
-                    sp_outcomes = np.array(self.outcomes[sp_indices], dtype=np.int64)
-                    sp_full = np.array(self.full_search[sp_indices], dtype=np.bool_)
+                        raise ValueError("Cannot sample self-play batch: replay buffer is empty.")
+                else:
+                    with self._lock:
+                        sp_indices = self._sample_ring_indices_locked(ring_rows)
+                        sp_planes = np.array(self.planes[sp_indices], dtype=np.float32)
+                        sp_visits = np.array(self.visits[sp_indices], dtype=np.float32)
+                        sp_outcomes = np.array(self.outcomes[sp_indices], dtype=np.int64)
+                        sp_full = np.array(self.full_search[sp_indices], dtype=np.bool_)
+                        sp_game_ids = np.array(self.game_ids[sp_indices], dtype=np.int64)
 
-                def _to_dev(t: torch.Tensor) -> torch.Tensor:
-                    return t if t.device == dev else t.to(dev, non_blocking=True)
+                    batch_planes.append(_to_dev(torch.from_numpy(sp_planes)))
+                    batch_visits.append(_to_dev(torch.from_numpy(sp_visits)))
+                    batch_outcomes.append(_to_dev(torch.from_numpy(sp_outcomes)))
+                    batch_full_search.append(_to_dev(torch.from_numpy(sp_full)))
+                    batch_game_ids.append(_to_dev(torch.from_numpy(sp_game_ids)))
 
-                batch_planes.append(_to_dev(torch.from_numpy(sp_planes)))
-                batch_visits.append(_to_dev(torch.from_numpy(sp_visits)))
-                batch_outcomes.append(_to_dev(torch.from_numpy(sp_outcomes)))
-                batch_full_search.append(_to_dev(torch.from_numpy(sp_full)))
+            if ring_rows == 0 and cache_rows == 0:
+                self.last_selfplay_source = "gpu_cache"
+                self.last_selfplay_rows = num_selfplay
+            elif cache_rows == 0:
+                self.last_selfplay_source = "ring"
+                self.last_selfplay_rows = num_selfplay
+            elif ring_rows == 0:
+                self.last_selfplay_source = "gpu_cache"
+                self.last_selfplay_rows = num_selfplay
             else:
-                raise ValueError("Cannot sample self-play batch: replay buffer is empty.")
+                self.last_selfplay_source = "ring+gpu_cache"
+                self.last_selfplay_rows = num_selfplay
 
         # 2. Sample from human dataset
         if num_human > 0 and self.human_dataset is not None:
@@ -1644,6 +2503,9 @@ class ReplayBuffer:
                 batch_visits.append(h_visits)
                 batch_outcomes.append(h_outcomes)
                 batch_full_search.append(h_full_search)
+                batch_game_ids.append(
+                    torch.full((num_human,), NO_GAME_ID, dtype=torch.int64, device=dev)
+                )
             else:
                 if (
                     getattr(self, "_human_cache_size", 0) > 0
@@ -1700,6 +2562,11 @@ class ReplayBuffer:
                 batch_visits.append(_to_dev2(torch.from_numpy(h_visits_np)))
                 batch_outcomes.append(_to_dev2(torch.from_numpy(h_outcomes_np)))
                 batch_full_search.append(_to_dev2(torch.from_numpy(h_full_search_np)))
+                batch_game_ids.append(
+                    torch.full((int(h_full_search_np.shape[0]),), NO_GAME_ID, dtype=torch.int64).to(
+                        dev, non_blocking=True
+                    )
+                )
 
         # 3. Sample from tactical pool
         if num_tactical > 0 and getattr(self, "_tactical_cache_size", 0) > 0:
@@ -1723,6 +2590,9 @@ class ReplayBuffer:
                 batch_visits.append(t_visits)
                 batch_outcomes.append(t_outcomes)
                 batch_full_search.append(t_full_search)
+                batch_game_ids.append(
+                    torch.full((num_tactical,), NO_GAME_ID, dtype=torch.int64, device=dev)
+                )
             else:
                 if self._tactical_cache_planes is not None:
                     t_indices = np.random.randint(0, self._tactical_cache_size, size=num_tactical)
@@ -1760,6 +2630,11 @@ class ReplayBuffer:
                 batch_visits.append(_to_dev_t(torch.from_numpy(t_visits_np)))
                 batch_outcomes.append(_to_dev_t(torch.from_numpy(t_outcomes_np)))
                 batch_full_search.append(_to_dev_t(torch.from_numpy(t_full_search_np)))
+                batch_game_ids.append(
+                    torch.full((int(t_full_search_np.shape[0]),), NO_GAME_ID, dtype=torch.int64).to(
+                        dev, non_blocking=True
+                    )
+                )
 
         if not batch_planes:
             raise ValueError(
@@ -1784,6 +2659,9 @@ class ReplayBuffer:
             if len(batch_full_search) > 1
             else batch_full_search[0]
         )
+        game_ids = (
+            torch.cat(batch_game_ids, dim=0) if len(batch_game_ids) > 1 else batch_game_ids[0]
+        )
 
         if len(batch_planes) > 1:
             perm = torch.randperm(batch_size, device=dev)
@@ -1791,12 +2669,14 @@ class ReplayBuffer:
             visits = visits[perm]
             outcomes = outcomes[perm]
             full_search = full_search[perm]
+            game_ids = game_ids[perm]
 
         batch = {
             "planes": planes,
             "visits": visits,
             "outcomes": outcomes,
             "is_full_search": full_search,
+            "game_ids": game_ids,
         }
         if return_tactical_mix:
             return batch, actual_human_mix, actual_tactical_mix

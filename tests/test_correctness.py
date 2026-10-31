@@ -182,12 +182,12 @@ def test_correctness_kill_and_resume(tmp_path):
     for i in range(100):
         dummy_positions.append(
             SavedPosition(
-                planes=np.random.randn(19, 8, 8).astype(np.float32),
+                planes=(np.random.rand(19, 8, 8) < 0.5).astype(np.float32),
                 visits=np.ones(4672, dtype=np.float32) / 4672.0,
                 outcome=i % 3,
                 is_full_search=True,
                 model_version=1,
-                game_id=i,
+                game_id=i + 1,
             )
         )
     buffer.add_positions(dummy_positions)

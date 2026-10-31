@@ -42,12 +42,19 @@ def test_seeded_search_deterministic():
 
 
 def _dummy_pos(i: int) -> SavedPosition:
+    # Valid under the insertion-time record contract (audit SR-07): binary
+    # planes, normalized visits, game_id > 0. Row identity travels in the
+    # visits one-hot slot, never in plane magnitude.
     planes = np.zeros((19, 8, 8), dtype=np.float32)
-    planes[0, 0, 0] = float(i)
     visits = np.zeros(4672, dtype=np.float32)
     visits[i % 4672] = 1.0
     return SavedPosition(
-        planes=planes, visits=visits, outcome=i % 3, is_full_search=True, model_version=1, game_id=i
+        planes=planes,
+        visits=visits,
+        outcome=i % 3,
+        is_full_search=True,
+        model_version=1,
+        game_id=i + 1,
     )
 
 

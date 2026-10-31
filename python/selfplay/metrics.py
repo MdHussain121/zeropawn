@@ -36,6 +36,10 @@ from python.selfplay.worker import GameSummary
 
 logger = logging.getLogger(__name__)
 
+# Line terminator used when rewriting the telemetry CSV during a header
+# upgrade (kept as a named constant so the rewrite is explicit).
+CSV_LINE_END = chr(10)
+
 _GPU_CACHE: Tuple[float, Tuple[float, float, float]] = (0.0, (0.0, 0.0, 0.0))
 _GPU_CACHE_TTL_SEC = 5.0
 
@@ -152,39 +156,20 @@ class MetricsTracker:
         self.latest_model_version = 0
         self.latest_buffer_size = 0
         self._has_target_entropy = True
+        # Lifecycle counters (audit SR-08): aborted games are counted
+        # separately and are NEVER folded into draws or completed games.
+        self.total_aborted_games = 0
+        self.total_invalid_games = 0
+        # Extension columns beyond the historical fixed schema (append-only:
+        # old files keep their columns, new columns are appended and old rows
+        # padded); the CSV is assembled by column NAME so a row can never be
+        # written wider/narrower than its header.
+        self.run_id: Optional[str] = None
+        self._extra_rows_last: Dict[str, Any] = {}
 
-    def _init_csv(self) -> None:
-        """Initialize CSV file with header."""
-        if self.csv_path is None:
-            return
-        if self.csv_path.exists():
-            try:
-                with open(self.csv_path, "r", encoding="utf-8") as f:
-                    first_line = f.readline()
-                self._has_target_entropy = ("target_entropy" in first_line) if first_line else False
-                if first_line and "tactical_mix_ratio" not in first_line:
-                    with open(self.csv_path, "r", encoding="utf-8") as f:
-                        lines = f.readlines()
-                    if lines:
-                        old_hdr = lines[0].strip().split(",")
-                        if "human_mix_ratio" in old_hdr:
-                            idx = old_hdr.index("human_mix_ratio") + 1
-                            old_hdr.insert(idx, "tactical_mix_ratio")
-                            new_lines = [",".join(old_hdr) + "\n"]
-                            for line in lines[1:]:
-                                parts = line.strip().split(",")
-                                if len(parts) == len(old_hdr) - 1:
-                                    parts.insert(idx, "0.0")
-                                    new_lines.append(",".join(parts) + "\n")
-                                else:
-                                    new_lines.append(line)
-                            with open(self.csv_path, "w", encoding="utf-8", newline="") as f:
-                                f.writelines(new_lines)
-            except Exception as e:
-                logger.warning("Failed to check CSV header in %s: %s", self.csv_path, e)
-            return
-        self._has_target_entropy = True
-        headers = [
+    def _default_headers(self) -> list:
+        """Canonical telemetry header (append-only; never reorder/rename)."""
+        return [
             "timestamp",
             "step",
             "simulations_per_sec",
@@ -203,16 +188,99 @@ class MetricsTracker:
             "model_version",
             "rss_mb",
             "vram_used_mb",
+            # ── Provenance columns appended by the 2026-10-31 self-play /
+            # replay-buffer remediation (audit SR-08). Append-only: existing
+            # files keep their rows; new columns are appended to the header and
+            # old rows are padded so widths always match the header.
+            "run_id",
+            "games_aborted",
+            "games_invalid",
+            "records_rejected",
+            "buffer_total_added",
+            "buffer_write_head",
+            "buffer_schema_version",
+            "checkpoint_file",
+            "sample_source",
+            "sampled_selfplay_rows",
+            "sampled_unique_games",
+            "staleness_fallbacks",
         ]
+
+    def _init_csv(self) -> None:
+        """Initialize/upgrade the telemetry CSV header and column contract."""
+        if self.csv_path is None:
+            return
+        default = self._default_headers()
+        if not self.csv_path.exists():
+            self._has_target_entropy = True
+            self._csv_columns = list(default)
+            try:
+                with open(self.csv_path, "w", newline="", encoding="utf-8") as f:
+                    csv.writer(f).writerow(self._csv_columns)
+            except (OSError, csv.Error) as e:
+                logger.warning("Failed to init CSV %s: %s", self.csv_path, e)
+            return
         try:
-            with open(self.csv_path, "w", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                writer.writerow(headers)
-        except (OSError, csv.Error) as e:
-            logger.warning("Failed to init CSV %s: %s", self.csv_path, e)
+            # Universal-newline read: CRLF files must not leak a stray
+            # carriage return into the final column name.
+            with open(self.csv_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            existing = lines[0].strip().split(",") if lines else []
+            self._has_target_entropy = ("target_entropy" in existing) if existing else False
+            if not existing:
+                self._csv_columns = list(default)
+                with open(self.csv_path, "w", newline="", encoding="utf-8") as f:
+                    csv.writer(f).writerow(self._csv_columns)
+                return
+            # Historical retrofit: the oldest format predates target_entropy and
+            # tactical_mix_ratio; row data only existed after the header was
+            # written in the same order, so insert placeholders positionally.
+            if "tactical_mix_ratio" not in existing and "human_mix_ratio" in existing:
+                idx = existing.index("human_mix_ratio") + 1
+                existing.insert(idx, "tactical_mix_ratio")
+                upgraded = [",".join(existing) + CSV_LINE_END]
+                for line in lines[1:]:
+                    parts = line.strip().split(",")
+                    if len(parts) == len(existing) - 1:
+                        parts.insert(idx, "0.0")
+                    upgraded.append(",".join(parts) + CSV_LINE_END)
+                lines = upgraded
+            # Append any new default columns, padding older rows with blanks.
+            header = lines[0].strip().split(",") if lines else []
+            missing = [c for c in default if c not in header]
+            if missing:
+                header = header + missing
+                padded = [",".join(header) + CSV_LINE_END]
+                for line in lines[1:]:
+                    parts = line.strip().split(",")
+                    if len(parts) < len(header):
+                        parts = parts + [""] * (len(header) - len(parts))
+                    padded.append(",".join(parts) + CSV_LINE_END)
+                lines = padded
+                logger.info(
+                    "[TELEMETRY] Upgraded %s header with %d provenance column(s)",
+                    self.csv_path,
+                    len(missing),
+                )
+            self._csv_columns = header
+            with open(self.csv_path, "w", encoding="utf-8", newline="") as f:
+                f.writelines(lines)
+        except Exception as e:
+            logger.warning("Failed to check/upgrade CSV header in %s: %s", self.csv_path, e)
+            self._csv_columns = list(default)
 
     def record_game(self, summary: GameSummary) -> None:
-        """Record completed game summary."""
+        """Record completed game summary.
+
+        An aborted game (shutdown mid-game; audit SR-01) has no result and is
+        never counted as a played or drawn game — it increments the dedicated
+        aborted counter and returns.
+        """
+        if getattr(summary, "aborted", False) or getattr(
+            summary, "termination_reason", ""
+        ) == "aborted":
+            self.total_aborted_games += 1
+            return
         self.total_games += 1
         self.total_plies += summary.length_plies
         self.total_simulations += summary.total_simulations
@@ -366,8 +434,24 @@ class MetricsTracker:
         step: int,
         buffer_size: Optional[int] = None,
         model_version: Optional[int] = None,
+        *,
+        buffer_total_added: Optional[int] = None,
+        buffer_write_head: Optional[int] = None,
+        buffer_schema_version: Optional[int] = None,
+        games_aborted: Optional[int] = None,
+        games_invalid: Optional[int] = None,
+        records_rejected: Optional[int] = None,
+        checkpoint_file: Optional[str] = None,
+        sampling: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, float]:
-        """Compute metrics, log to TensorBoard and CSV, and return dictionary."""
+        """Compute metrics, log to TensorBoard and CSV, and return dictionary.
+
+        The CSV row is assembled by column NAME against the file's own header
+        contract, so rows and headers can never drift apart. Provenance columns
+        (audit SR-08) carry game lifecycle counters, buffer insertion state,
+        checkpoint association and sampling statistics; every one of them is
+        optional so older callers keep working unchanged.
+        """
         metrics = self.compute_metrics(buffer_size=buffer_size, model_version=model_version)
 
         # Write to TensorBoard
@@ -378,35 +462,40 @@ class MetricsTracker:
         if self.csv_path is not None:
             rss_mb, _ = query_process_memory()
             _, vram_used_mb, _ = query_gpu_metrics()
-            row = [
-                time.time(),
-                step,
-                metrics["simulations_per_sec"],
-                metrics["games_per_hour"],
-                metrics["gpu_utilization"],
-                metrics["batch_fill_rate"],
-                metrics["draw_rate"],
-                metrics["resign_rate"],
-                metrics["false_resign_rate"],
-                metrics["average_game_length"],
-                metrics["policy_entropy"],
-            ]
-            if getattr(self, "_has_target_entropy", True):
-                row.append(metrics["target_entropy"])
-            row.extend(
-                [
-                    metrics["buffer_size"],
-                    metrics["human_mix_ratio"],
-                    metrics["tactical_mix_ratio"],
-                    int(metrics["model_version"]),
-                    rss_mb,
-                    vram_used_mb,
-                ]
-            )
+            sampling = sampling or {}
+            values: Dict[str, Any] = {
+                "timestamp": time.time(),
+                "step": step,
+                **{name: value for name, value in metrics.items()},
+                "model_version": int(metrics["model_version"]),
+                "rss_mb": rss_mb,
+                "vram_used_mb": vram_used_mb,
+                "run_id": self.run_id or "",
+                "games_aborted": (
+                    games_aborted if games_aborted is not None else self.total_aborted_games
+                ),
+                "games_invalid": (
+                    games_invalid if games_invalid is not None else self.total_invalid_games
+                ),
+                "records_rejected": records_rejected if records_rejected is not None else "",
+                "buffer_total_added": (
+                    buffer_total_added if buffer_total_added is not None else ""
+                ),
+                "buffer_write_head": buffer_write_head if buffer_write_head is not None else "",
+                "buffer_schema_version": (
+                    buffer_schema_version if buffer_schema_version is not None else ""
+                ),
+                "checkpoint_file": checkpoint_file or "",
+                "sample_source": sampling.get("sample_source") or "",
+                "sampled_selfplay_rows": sampling.get("sampled_selfplay_rows", ""),
+                "sampled_unique_games": sampling.get("sampled_unique_games", ""),
+                "staleness_fallbacks": sampling.get("staleness_fallbacks", ""),
+            }
+            columns = getattr(self, "_csv_columns", None) or self._default_headers()
+            row = [values.get(col, "") for col in columns]
             try:
                 with open(self.csv_path, "a", newline="", encoding="utf-8") as f:
-                    writer = csv.writer(f)
-                    writer.writerow(row)
+                    csv.writer(f).writerow(row)
             except (OSError, csv.Error) as e:
                 logger.warning("Failed to append CSV %s: %s", self.csv_path, e)
 

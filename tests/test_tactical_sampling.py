@@ -322,7 +322,6 @@ def test_replay_buffer_tactical_sampling_batch_tensors(tmp_path):
     sp_positions = []
     for i in range(100):
         pl = np.zeros((19, 8, 8), dtype=np.float32)
-        pl[0, 0, 0] = float(i)
         v = np.zeros(4672, dtype=np.float32)
         v[i % 4672] = 1.0
         sp_positions.append(
@@ -332,7 +331,7 @@ def test_replay_buffer_tactical_sampling_batch_tensors(tmp_path):
                 outcome=i % 3,
                 is_full_search=False,
                 model_version=1,
-                game_id=i,
+                game_id=i + 1,
             )
         )
     buf.add_positions(sp_positions)
@@ -402,7 +401,7 @@ def test_replay_buffer_missing_tactical_csv_fallback(tmp_path):
                 outcome=0,
                 is_full_search=True,
                 model_version=1,
-                game_id=i,
+                game_id=i + 1,
             )
         )
     buf.add_positions(sp_positions)

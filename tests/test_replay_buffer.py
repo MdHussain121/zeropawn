@@ -41,18 +41,25 @@ def synthetic_human_dir(tmp_path):
 
 
 def _create_dummy_pos(pos_id: int, full_search: bool = True) -> SavedPosition:
+    # Valid under the insertion-time record contract (audit SR-07): binary
+    # planes, normalized visits, game_id > 0. Row identity is encoded in the
+    # visits one-hot slot (decoded by :func:`_slot_id`).
     planes = np.zeros((19, 8, 8), dtype=np.float32)
-    planes[0, 0, 0] = float(pos_id)
     visits = np.zeros(4672, dtype=np.float32)
-    visits[0] = 1.0
+    visits[pos_id % 4672] = 1.0
     return SavedPosition(
         planes=planes,
         visits=visits,
         outcome=pos_id % 3,
         is_full_search=full_search,
         model_version=1,
-        game_id=pos_id,
+        game_id=pos_id + 1,
     )
+
+
+def _slot_id(buf, slot: int) -> int:
+    """Decode a slot's encoded position id from its visits one-hot slot."""
+    return int(np.argmax(np.asarray(buf.visits[slot])))
 
 
 def test_replay_buffer_ring_overwrite(tmp_path):
@@ -77,10 +84,10 @@ def test_replay_buffer_ring_overwrite(tmp_path):
     assert buf.write_head == 20  # (60 + 60) % 100
 
     # Positions 0..19 should now contain IDs 100..119
-    assert buf.planes[0, 0, 0, 0] == 100.0
-    assert buf.planes[19, 0, 0, 0] == 119.0
+    assert _slot_id(buf, 0) == 100
+    assert _slot_id(buf, 19) == 119
     # Position 20 should contain ID 20
-    assert buf.planes[20, 0, 0, 0] == 20.0
+    assert _slot_id(buf, 20) == 20
 
 
 def test_human_data_taper_schedule(tmp_path, synthetic_human_dir):
@@ -157,8 +164,8 @@ def test_replay_buffer_resumability(tmp_path):
     )
     assert len(buf2) == 75
     assert buf2.write_head == 75
-    assert buf2.planes[0, 0, 0, 0] == 0.0
-    assert buf2.planes[74, 0, 0, 0] == 74.0
+    assert _slot_id(buf2, 0) == 0
+    assert _slot_id(buf2, 74) == 74
 
 
 def test_replay_buffer_in_memory_mode_and_flush(tmp_path):
@@ -192,8 +199,8 @@ def test_replay_buffer_in_memory_mode_and_flush(tmp_path):
     )
     assert len(buf2) == 40
     assert buf2.write_head == 40
-    assert buf2.planes[0, 0, 0, 0] == 0.0
-    assert buf2.planes[39, 0, 0, 0] == 39.0
+    assert _slot_id(buf2, 0) == 0
+    assert _slot_id(buf2, 39) == 39
 
 
 def test_gpu_resident_replay_cache_operations():
@@ -281,10 +288,10 @@ def test_replay_buffer_write_head_modulo_wrap(tmp_path):
     # Slices verify:
     # positions 0..49 were from start=50 part1=50
     # positions 50..79 were from start=0 part2=30
-    assert buf.planes[50, 0, 0, 0] == 0.0
-    assert buf.planes[99, 0, 0, 0] == 49.0
-    assert buf.planes[0, 0, 0, 0] == 50.0
-    assert buf.planes[29, 0, 0, 0] == 79.0
+    assert _slot_id(buf, 50) == 0
+    assert _slot_id(buf, 99) == 49
+    assert _slot_id(buf, 0) == 50
+    assert _slot_id(buf, 29) == 79
 
     # Add 30 more positions to reach capacity 100
     positions_extra = [_create_dummy_pos(i + 80) for i in range(30)]

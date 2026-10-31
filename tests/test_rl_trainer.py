@@ -15,7 +15,9 @@ from python.train.train_rl import RLTrainer, WarmupCosineDecayScheduler, WeightP
 def _create_dummy_positions(n: int, full_prob: float = 0.5) -> list[SavedPosition]:
     positions = []
     for i in range(n):
-        planes = np.random.randn(19, 8, 8).astype(np.float32)
+        # Valid records under the insertion-time contract (audit SR-07):
+        # binary planes, one-hot normalized visits, game_id > 0.
+        planes = (np.random.rand(19, 8, 8) < 0.5).astype(np.float32)
         visits = np.zeros(4672, dtype=np.float32)
         visits[i % 4672] = 1.0
         positions.append(
@@ -25,7 +27,7 @@ def _create_dummy_positions(n: int, full_prob: float = 0.5) -> list[SavedPositio
                 outcome=i % 3,
                 is_full_search=(np.random.rand() < full_prob),
                 model_version=1,
-                game_id=i,
+                game_id=i + 1,
             )
         )
     return positions
