@@ -1077,11 +1077,12 @@ def test_scheduler_explicit_step_pins_counter_and_lr():
     assert abs(lr50 - sched.get_lr(50)) < 1e-12
     assert abs(optimizer.param_groups[0]["lr"] - sched.get_lr(50)) < 1e-12
 
-    # No-arg step still advances by one and applies the legacy warmup formula.
+    # No-arg step advances by one and delegates to get_lr — the single
+    # warmup formula (2026-10-31 SLQ-11 remediation unified the previously
+    # divergent legacy formula base_lr * k / warmup_steps).
     sched.step()
     assert sched.current_step == 51
-    expected_warmup_lr = 0.01 * (51 / 100)
-    assert abs(optimizer.param_groups[0]["lr"] - expected_warmup_lr) < 1e-12
+    assert abs(optimizer.param_groups[0]["lr"] - sched.get_lr(51)) < 1e-12
 
     # Jumping forward into the cosine region matches get_lr there too.
     lr800 = sched.step(800)

@@ -256,6 +256,52 @@ def _add_supervised_arguments(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="RNG seed for reproducible runs (default: None = unseeded)",
     )
+    parser.add_argument(
+        "--data-role",
+        action=ExplicitTrackingAction,
+        choices=("games_wdl", "policy_tactics", "endgame_syzygy", "unified"),
+        default=None,
+        help="Explicit dataset role for train/val (default: resolved from dataset metadata "
+        "declarations; unclassified datasets are refused by the fail-closed data gate)",
+    )
+    parser.add_argument(
+        "--allow-uncertified-data",
+        action=ExplicitTrackingAction,
+        type=lambda v: str(v).strip().lower() in ("1", "true", "yes", "on"),
+        nargs="?",
+        const=True,
+        default=False,
+        help="Consume datasets without a valid validation receipt (loud UNCERTIFIED warning; "
+        "role/label invariants still apply). Default: refuse uncertified datasets",
+    )
+    parser.add_argument(
+        "--verify-identity",
+        action=ExplicitTrackingAction,
+        choices=("full", "stat"),
+        default="full",
+        help="full: re-hash every dataset file against the validation receipt before training; "
+        "stat: cheaper size/mtime staleness check (default: full)",
+    )
+    parser.add_argument(
+        "--resume-weights-only",
+        action=ExplicitTrackingAction,
+        type=lambda v: str(v).strip().lower() in ("1", "true", "yes", "on"),
+        nargs="?",
+        const=True,
+        default=False,
+        help="Load only model weights from --checkpoint/--resume (fresh optimizer, step 0) "
+        "for fine-tuning. Default: full resume of optimizer/scheduler/step state",
+    )
+    parser.add_argument(
+        "--override-schedule",
+        action=ExplicitTrackingAction,
+        type=lambda v: str(v).strip().lower() in ("1", "true", "yes", "on"),
+        nargs="?",
+        const=True,
+        default=False,
+        help="On resume, adopt the CLI's LR/warmup/total-steps geometry instead of the "
+        "checkpoint's original schedule (logged loudly). Default: continue the original schedule",
+    )
 
 
 def register_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -515,8 +561,11 @@ def register_parser(subparsers: argparse._SubParsersAction) -> None:
         ),
     )
     # ────────────────────────────────────────────────────────────────────────
-    _ensure_data_gate_arguments(parser)
+    # Order matters for merge-safety: the supervised argument set may already
+    # register --data-role/--allow-uncertified-data; the idempotent helper runs
+    # afterwards and only adds what is still missing (audit SR-02).
     _add_supervised_arguments(parser)
+    _ensure_data_gate_arguments(parser)
     parser.set_defaults(func=run_training)
 
     train_subparsers = parser.add_subparsers(dest="train_subcommand")
@@ -1038,6 +1087,11 @@ def run_supervised_training(args: argparse.Namespace) -> int:
             tactics_ratio=tactics_ratio,
             tactics_dir=str(tactics_dir) if tactics_dir else None,
             seed=seed,
+            data_role=getattr(args, "data_role", None),
+            allow_uncertified_data=bool(getattr(args, "allow_uncertified_data", False)),
+            verify_identity=getattr(args, "verify_identity", "full"),
+            resume_weights_only=bool(getattr(args, "resume_weights_only", False)),
+            override_schedule=bool(getattr(args, "override_schedule", False)),
         )
         emit_report(
             format_kv_line(

@@ -25,12 +25,25 @@ endif()
 option(ZEROPAWN_BUILD_TESTS   "Build C++ tests"          ON)
 option(ZEROPAWN_BUILD_PYTHON  "Build pybind11 module"    ON)
 
-# Backward-compatibility for legacy option names
-if(DEFINED CHESSRL_BUILD_TESTS AND NOT DEFINED ZEROPAWN_BUILD_TESTS)
-    set(ZEROPAWN_BUILD_TESTS ${CHESSRL_BUILD_TESTS})
+# Backward-compatibility for legacy option names. The value is dereferenced in
+# a message so CMake records the -D flag as used (remediation F-16: a bare
+# if(DEFINED ...) check leaves "manually-specified variables were not used"
+# warnings under CMake 4). Prefer the ZEROPAWN_* flags in new recipes.
+if(DEFINED CHESSRL_BUILD_TESTS)
+    if(NOT DEFINED ZEROPAWN_BUILD_TESTS)
+        set(ZEROPAWN_BUILD_TESTS ${CHESSRL_BUILD_TESTS})
+        message(STATUS "Legacy flag CHESSRL_BUILD_TESTS=${CHESSRL_BUILD_TESTS} mapped to ZEROPAWN_BUILD_TESTS (use ZEROPAWN_BUILD_TESTS instead)")
+    else()
+        message(STATUS "Ignoring legacy CHESSRL_BUILD_TESTS=${CHESSRL_BUILD_TESTS}; ZEROPAWN_BUILD_TESTS is set")
+    endif()
 endif()
-if(DEFINED CHESSRL_BUILD_PYTHON AND NOT DEFINED ZEROPAWN_BUILD_PYTHON)
-    set(ZEROPAWN_BUILD_PYTHON ${CHESSRL_BUILD_PYTHON})
+if(DEFINED CHESSRL_BUILD_PYTHON)
+    if(NOT DEFINED ZEROPAWN_BUILD_PYTHON)
+        set(ZEROPAWN_BUILD_PYTHON ${CHESSRL_BUILD_PYTHON})
+        message(STATUS "Legacy flag CHESSRL_BUILD_PYTHON=${CHESSRL_BUILD_PYTHON} mapped to ZEROPAWN_BUILD_PYTHON (use ZEROPAWN_BUILD_PYTHON instead)")
+    else()
+        message(STATUS "Ignoring legacy CHESSRL_BUILD_PYTHON=${CHESSRL_BUILD_PYTHON}; ZEROPAWN_BUILD_PYTHON is set")
+    endif()
 endif()
 
 # ── Fetch pybind11 ───────────────────────────────────────────────────

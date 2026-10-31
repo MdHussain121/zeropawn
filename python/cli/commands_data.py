@@ -6,6 +6,7 @@ import argparse
 import json
 import shutil
 from pathlib import Path
+from typing import Optional
 
 from rich import box
 from rich.panel import Panel
@@ -232,6 +233,13 @@ def register_parser(subparsers: argparse._SubParsersAction) -> None:
         type=str,
         default="data/dataset_training/val",
         help="Validation split directory",
+    )
+    p_leak.add_argument(
+        "--test-dir",
+        type=str,
+        default=None,
+        help="Optional test split directory; when given, train/test and val/test disjointness "
+        "are checked as well (audit SLQ-09).",
     )
     p_leak.add_argument(
         "--max-positions",
@@ -1022,6 +1030,15 @@ def run_data_check_leakage(args: argparse.Namespace) -> int:
         train_dir = REPO_ROOT / args.train_dir
     if not val_dir.is_dir():
         val_dir = REPO_ROOT / args.val_dir
+    test_dir: Optional[Path] = None
+    test_arg = getattr(args, "test_dir", None)
+    if test_arg:
+        test_dir = Path(test_arg)
+        if not test_dir.is_dir():
+            test_dir = REPO_ROOT / test_arg
+        if not test_dir.is_dir():
+            console.print(f"[bold red]Test directory not found: {test_dir}[/bold red]")
+            return 2
 
     if not train_dir.is_dir() or not val_dir.is_dir():
         console.print(
@@ -1032,7 +1049,8 @@ def run_data_check_leakage(args: argparse.Namespace) -> int:
     exhaustive = args.max_positions is None
     console.print(
         f"[bold cyan]Checking Data Leakage between:[/] [white]{train_dir}[/] and [white]{val_dir}[/] "
-        f"({'exhaustive' if exhaustive else 'BOUNDED'})"
+        + (f"and [white]{test_dir}[/] " if test_dir else "")
+        + f"({'exhaustive' if exhaustive else 'BOUNDED'})"
     )
 
     try:
@@ -1041,6 +1059,7 @@ def run_data_check_leakage(args: argparse.Namespace) -> int:
             val_dir,
             exhaustive_states=exhaustive,
             max_bounded_rows=args.max_positions or 2000,
+            test_dir=test_dir,
         )
     except Exception as e:
         console.print(f"[bold red]Leakage check failed to complete: {e}[/bold red]")

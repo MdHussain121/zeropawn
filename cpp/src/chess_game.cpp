@@ -105,6 +105,12 @@ bool ChessGame::make_move_uci(const std::string& uci) {
         }
     }
     if (!legal) return false;
+    // Reserve before mutating the board (remediation F-13): if the history
+    // push had to reallocate after makeMove, a bad_alloc would desync
+    // board_ and move_history_. With capacity guaranteed up front and
+    // chess-library makeMove being non-throwing, either both mutate or
+    // neither does.
+    move_history_.reserve(move_history_.size() + 1);
     board_.makeMove(m);
     move_history_.push_back(m);
     return true;
@@ -167,6 +173,19 @@ int ChessGame::full_move_number() const {
 }
 
 uint64_t ChessGame::perft(int depth) {
+    // Remediation F-02: validate depth before any recursion. Negative depths
+    // were silently treated as 0 (returning 1) and excessive depths overflowed
+    // the stack (perft(20000) killed the process). perft(0) == 1 remains the
+    // standard convention.
+    if (depth < 0) {
+        throw std::invalid_argument(
+            "ChessGame::perft: depth must be >= 0 (got " + std::to_string(depth) + ")");
+    }
+    if (depth > MAX_PERFT_DEPTH) {
+        throw std::invalid_argument(
+            "ChessGame::perft: depth " + std::to_string(depth) +
+            " exceeds the supported maximum of " + std::to_string(MAX_PERFT_DEPTH));
+    }
     return compute_perft(board_, depth);
 }
 
@@ -187,10 +206,15 @@ std::vector<int> ChessGame::legal_actions() const {
 }
 
 void ChessGame::apply_action(int action) {
-    // Hot path for MCTS/self-play: the action index was produced by
-    // index_to_move()/legal_actions(), so it is already legal. Decoding and applying
-    // it directly avoids regenerating the whole legal move list (which make_move_uci
-    // would do) on every simulation step.
+    // Hot path for MCTS/self-play: the action index is produced by
+    // index_to_move()/legal_actions(), so legitimate callers always pass
+    // legal actions. The index is still validated for legality before any
+    // mutation (remediation F-05): the previous implementation applied any
+    // decodable action, and an in-range-but-illegal index silently corrupted
+    // the game (repro: a pawn teleported a2->a5). The cost is one legal-move
+    // generation per application — negligible next to a real evaluator call,
+    // and callers that need the unvalidated fast path own the legality of
+    // their inputs.
     std::string uci = index_to_move(*this, action);
     if (uci.empty() || action < 0) {
         // An undecodable action must never silently leave the game unchanged:
@@ -207,6 +231,22 @@ void ChessGame::apply_action(int action) {
             "ChessGame::apply_action: action index " + std::to_string(action) +
             " decoded to NO_MOVE");
     }
+    chess::Movelist moves;
+    chess::movegen::legalmoves(moves, board_);
+    bool legal = false;
+    for (const auto& lm : moves) {
+        if (lm == m) {
+            legal = true;
+            break;
+        }
+    }
+    if (!legal) {
+        throw std::invalid_argument(
+            "ChessGame::apply_action: action index " + std::to_string(action) + " (" + uci +
+            ") is not legal in the current position");
+    }
+    // Reserve before mutating the board (see make_move_uci, remediation F-13).
+    move_history_.reserve(move_history_.size() + 1);
     board_.makeMove(m);
     move_history_.push_back(m);
 }

@@ -87,7 +87,24 @@ bool Connect4::check_win_at(int r, int c, int p) const {
 }
 
 void Connect4::apply_action(int col) {
-    if (col < 0 || col >= COLS || heights_[col] >= ROWS || winner_ != 0) return;
+    // Remediation REM-02: previously every rejection (out-of-range column,
+    // full column, finished game) was a silent no-op, asymmetric with
+    // ChessGame::apply_action which raises on invalid input. Silent no-ops let
+    // a caller loop forever on a full column while believing moves applied.
+    // All rejections now raise std::invalid_argument (ValueError through
+    // pybind); the state is never modified.
+    if (col < 0 || col >= COLS) {
+        throw std::invalid_argument(
+            "Connect4::apply_action: column " + std::to_string(col) + " out of range [0," +
+            std::to_string(COLS - 1) + "]");
+    }
+    if (winner_ != 0) {
+        throw std::invalid_argument("Connect4::apply_action: game is already over");
+    }
+    if (heights_[col] >= ROWS) {
+        throw std::invalid_argument(
+            "Connect4::apply_action: column " + std::to_string(col) + " is full");
+    }
 
     int r = heights_[col]++;
     grid_[r][col] = current_player_;
@@ -147,7 +164,13 @@ std::string Connect4::action_to_string(int action) const {
 }
 
 int Connect4::string_to_action(const std::string& str) const {
-    if (str.empty()) return -1;
+    // Remediation REM-01: previously any string's first byte was mapped with
+    // str[0]-'0' ("9" -> 9, "abc" -> 49). Accept only a single column digit
+    // and return the -1 undecodable sentinel otherwise, mirroring the
+    // ChessGame::string_to_action contract.
+    if (str.size() != 1 || str[0] < '0' || str[0] > static_cast<char>('0' + COLS - 1)) {
+        return -1;
+    }
     return str[0] - '0';
 }
 

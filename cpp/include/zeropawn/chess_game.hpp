@@ -63,6 +63,14 @@ public:
 
     uint64_t perft(int depth);
 
+    // Maximum supported perft depth (remediation F-02). compute_perft recurses
+    // once per remaining depth (~1 KB Movelist per frame), so an unbounded
+    // depth reached the stack guard page from Python (perft(20000) killed the
+    // process). 32 is far above any reachable workload (the established
+    // correctness suite tops out at depth 6) while keeping recursion trivially
+    // stack-safe; deeper requests raise std::invalid_argument (ValueError).
+    static constexpr int MAX_PERFT_DEPTH = 32;
+
 private:
     chess::Board board_;
     std::vector<chess::Move> move_history_;

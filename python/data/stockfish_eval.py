@@ -230,6 +230,11 @@ def generate_value_targets_for_dataset(
         outcome = int(ds.outcomes[i])
         val_targets[i] = outcome_to_one_hot(outcome)
 
+    # Side-to-move resolution (audit SLQ-13): prefer the per-row stm sidecar;
+    # ply parity is only valid for PGN-rooted game rows.
+    stm_path = dir_path / "stm.bin"
+    stms = np.fromfile(stm_path, dtype=np.uint8) if stm_path.is_file() else None
+
     # Pick deterministic random subset of indices
     rng = np.random.RandomState(42)
     subset_indices = rng.choice(num_samples, size=target_subset, replace=False)
@@ -241,7 +246,7 @@ def generate_value_targets_for_dataset(
             outcome = int(ds.outcomes[idx])
 
             # Positions in first 10 plies get no value loss, but can still be evaluated
-            is_white = ply % 2 == 0
+            is_white = (bool(stms[idx]) if stms is not None else ply % 2 == 0)
             planes = np.array(ds.planes[idx], dtype=np.float32)
             fen = decode_planes_to_fen(planes, is_white_to_move=is_white, ply=ply)
 

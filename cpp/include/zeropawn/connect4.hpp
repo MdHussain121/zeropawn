@@ -5,6 +5,7 @@
 #include <memory>
 #include <cstdint>
 #include <array>
+#include <stdexcept>
 #include "zeropawn/game.hpp"
 
 namespace zeropawn {
@@ -34,7 +35,19 @@ public:
     int string_to_action(const std::string& str) const override;
 
     int current_player() const { return current_player_; }
-    int cell(int r, int c) const { return grid_[r][c]; }
+    // Bounds-checked (remediation F-01): the previous unchecked grid_[r][c]
+    // allowed a single Python call (e.g. cell(10**7, 0)) to segfault the
+    // interpreter. Out-of-range indices raise std::invalid_argument, which
+    // pybind maps to ValueError.
+    int cell(int r, int c) const {
+        if (r < 0 || r >= ROWS || c < 0 || c >= COLS) {
+            throw std::invalid_argument(
+                "Connect4::cell: indices (" + std::to_string(r) + ", " + std::to_string(c) +
+                ") out of range [0," + std::to_string(ROWS - 1) + "]x[0," +
+                std::to_string(COLS - 1) + "]");
+        }
+        return grid_[r][c];
+    }
     int winner() const { return winner_; } // 0: none, 1: player 1, 2: player 2, -1: draw
 
 private:

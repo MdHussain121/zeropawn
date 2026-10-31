@@ -854,9 +854,10 @@ class Phase4Orchestrator:
             # inference server and RL counters are fresh at 0. The warm-start
             # checkpoint's own step counter is inherited supervised progress —
             # provenance metadata, never RL pacing progress (PR-03).
-            # Audit SR-02: this read `self._warm_start_info`, an attribute never
-            # assigned anywhere — every construction path raised AttributeError
-            # before training. The validated record is `self._warm_start_record`.
+            # Audit SR-02 / SLQ-07 (fixed independently on both branches): this
+            # read `self._warm_start_info`, an attribute never assigned anywhere
+            # — every construction path raised AttributeError before training.
+            # The validated record is `self._warm_start_record`.
             ws = self._warm_start_record or {}
             self.trainer.run_metadata = {
                 "run_id": self.run_id,
@@ -2670,15 +2671,16 @@ def main() -> None:
             "docs/checkpoint_registry.json, or the run fails closed."
         ),
     )
-    # Audit SR-02: this option was registered TWICE (duplicate argparse
-    # registration -> ArgumentError on every invocation, including --help).
-    # Single authoritative definition retained below.
+    # Audit SR-02 / SLQ-07 (fixed independently on both branches): this option
+    # was registered TWICE (duplicate argparse registration -> ArgumentError on
+    # every invocation, including --help). Single definition retained below.
     parser.add_argument(
         "--allow-unverified-warm-start",
         action="store_true",
         help=(
-            "Operator override: start RL from a checkpoint that is absent from the "
-            "checkpoint registry or not designated as a warm start. The decision is "
+            "Explicit operator override to warm-start from a checkpoint that is "
+            "not a designated registry entry (logged as an override; use only "
+            "with a documented provisional selection). The decision is "
             "logged loudly; without this flag such starts are rejected (F-11/F-12)."
         ),
     )

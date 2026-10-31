@@ -171,11 +171,10 @@ def validate_warm_start(
         for rec in registry.get("checkpoints", []):
             # Registry records for missing/quarantined artifacts legitimately
             # carry sha256: null; those must be skipped, not crash the
-            # validator (rec.get("sha256", "") returns None when the key
-            # exists with a null value — `None.startswith` raised
-            # AttributeError and aborted every warm-start construction).
-            rec_sha = rec.get("sha256") or ""
-            if rec_sha and (rec_sha == info.sha256 or rec_sha.startswith(sha16)):
+            # validator (`None.startswith` raised AttributeError and aborted
+            # every warm-start construction; SR-02 / SLQ-07 hit the same bug).
+            rec_sha = rec.get("sha256")
+            if rec_sha and (rec_sha == info.sha256 or str(rec_sha).startswith(sha16)):
                 entry = rec
                 break
 
@@ -205,6 +204,14 @@ def validate_warm_start(
 
     status = entry.get("status")
     if status != "verified":
+        if status == "disqualified":
+            dq = entry.get("disqualification", {})
+            raise WarmStartValidationError(
+                f"Warm-start {p} is DISQUALIFIED in the registry "
+                f"({dq.get('reason', 'undocumented')}): {dq.get('detail', '')} "
+                "A disqualified checkpoint can never become a warm start; see "
+                "docs/checkpoint_registry.json for the evidence trail."
+            )
         raise WarmStartValidationError(
             f"Warm-start {p} is registered with status {status!r} (missing/unverified "
             "artifacts can never be warm starts). See docs/checkpoint_registry.json."
