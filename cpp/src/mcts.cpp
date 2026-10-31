@@ -30,6 +30,33 @@ void MCTS::reset_node_alloc_stats() {
 
 MCTS::MCTS(const MCTSConfig& config)
     : config_(config), rng_(config.seed) {
+    // Remediation F-11: reject semantically invalid configurations at the
+    // single choke point every caller goes through. Previously negative
+    // c_puct/virtual_loss/fpu_reduction/dirichlet_weight, batch_size < 1 and
+    // max_nodes == 0 were accepted silently (max_nodes == 0 also silently
+    // disabled subtree reuse, since any non-empty subtree exceeds the cap).
+    if (config.c_puct < 0.0f) {
+        throw std::invalid_argument("MCTSConfig: c_puct must be >= 0");
+    }
+    if (config.dirichlet_alpha <= 0.0f) {
+        throw std::invalid_argument("MCTSConfig: dirichlet_alpha must be > 0");
+    }
+    if (config.dirichlet_weight < 0.0f) {
+        throw std::invalid_argument("MCTSConfig: dirichlet_weight must be >= 0");
+    }
+    if (config.fpu_reduction < 0.0f) {
+        throw std::invalid_argument("MCTSConfig: fpu_reduction must be >= 0");
+    }
+    if (config.virtual_loss < 0) {
+        throw std::invalid_argument("MCTSConfig: virtual_loss must be >= 0");
+    }
+    if (config.batch_size < 1) {
+        throw std::invalid_argument("MCTSConfig: batch_size must be >= 1");
+    }
+    if (config.max_nodes < 1) {
+        throw std::invalid_argument(
+            "MCTSConfig: max_nodes must be >= 1 (it caps retained subtree reuse)");
+    }
     nn_cache_.reserve(10000);
 }
 

@@ -1,7 +1,43 @@
-"""Type stubs for the zeropawn_cpp pybind11 extension."""
+"""Type stubs for the zeropawn_cpp pybind11 extension.
+
+Contract notes (remediation 2026-10-31, audit A-09 / F-07..F-10, F-15, F-17):
+
+* **En-passant FEN policy:** ``get_fen()`` records the EP square after every
+  double pawn push (classic FEN). This differs from python-chess's default
+  ``en_passant="legal"``; compare FENs across the boundary with
+  ``en_passant="fen"``.
+* **Zobrist hashing:** the raw EP square is hashed even when no legal EP
+  capture exists (phantom EP). Internally consistent; do not use native
+  hashes as cross-library (polyglot-style) position identity.
+* **Repetition / draws:** ``is_repetition(count)`` counts *prior* occurrences
+  of the current position (so the threefold rule is ``is_repetition(2)``).
+  ``is_game_over()`` auto-draws at threefold repetition, the 50-move clock
+  reaching 100, and insufficient material (deliberate RL-efficiency policy,
+  stricter than python-chess's fivefold/75-move auto-draws).
+* **perft:** depth must satisfy ``0 <= depth <= 32`` (``perft(0) == 1``);
+  negative or excessive depths raise ``ValueError``.
+* **Connect4:** ``cell(r, c)`` raises ``ValueError`` outside
+  ``[0,6) x [0,7)``; ``apply_action(col)`` raises ``ValueError`` on
+  out-of-range columns, full columns, and finished games; only a single
+  column digit ``"0".."6"`` is decodable by ``string_to_action``.
+* **MCTSConfig:** validated when ``MCTS`` is constructed — ``c_puct >= 0``,
+  ``dirichlet_alpha > 0``, ``dirichlet_weight >= 0``, ``fpu_reduction >= 0``,
+  ``virtual_loss >= 0``, ``batch_size >= 1``, ``max_nodes >= 1``; violations
+  raise ``ValueError``. ``seed`` is a uint64 (values >= 2**64 overflow).
+* **apply_action (ChessGame):** the action index must decode to a *legal*
+  move; illegal or undecodable indices raise ``ValueError`` and leave the
+  game state untouched.
+* **Evaluator callbacks:** receive a non-owning ``Game`` wrapper that is
+  valid only for the duration of the callback — never store it. Callbacks
+  must not re-enter the owning ``MCTS`` (search/clear/advance_root).
+  Evaluator output is validated exactly: a wrong-shaped policy or value is
+  rejected with ``RuntimeError``, never truncated.
+* **Threading:** ``cache_size()`` / ``live_node_count()`` must be called from
+  the thread that owns the MCTS while no search is in flight on it.
+"""
 
 from collections.abc import Callable
-from typing import Any, Optional
+from typing import Any, Optional, Union
 import numpy as np
 import numpy.typing as npt
 
@@ -37,18 +73,22 @@ class ChessGame(Game):
     def is_game_over(self) -> bool: ...
     def is_checkmate(self) -> bool: ...
     def is_stalemate(self) -> bool: ...
+    # Counts PRIOR occurrences of the current position (see module docstring).
     def is_repetition(self, count: int = ...) -> bool: ...
     def is_50_move_rule(self) -> bool: ...
     def is_insufficient_material(self) -> bool: ...
     def half_move_clock(self) -> int: ...
     def full_move_number(self) -> int: ...
+    # Exact ply count of moves applied to this game object.
+    def history_len(self) -> int: ...
+    # 0 <= depth <= 32; perft(0) == 1. ValueError outside that range.
     def perft(self, depth: int) -> int: ...
 
 class Connect4(Game):
-    ROWS: int
-    COLS: int
     def current_player(self) -> int: ...
+    # Raises ValueError outside [0,6) x [0,7).
     def cell(self, r: int, c: int) -> int: ...
+    # 0: none, 1: player 1, 2: player 2, -1: draw
     def winner(self) -> int: ...
     def encode_state(self) -> npt.NDArray[np.float32]: ...
 
@@ -59,6 +99,7 @@ class MCTSConfig:
     fpu_reduction: float
     virtual_loss: int
     add_noise: bool
+    # uint64: values >= 2**64 raise OverflowError.
     seed: int
     reuse_tree: bool
     max_nodes: int
@@ -78,9 +119,11 @@ class MCTS:
     def __init__(self, config: MCTSConfig = ...) -> None: ...
     def clear(self) -> None: ...
     def set_seed(self, seed: int) -> None: ...
+    # Owns the MCTS; call only from the owning thread, no search in flight.
     def cache_size(self) -> int: ...
     def advance_root(self, *args: Any) -> bool: ...
     def reset_root(self) -> None: ...
+    # Owns the MCTS; call only from the owning thread, no search in flight.
     def live_node_count(self) -> int: ...
     def has_retained_root(self) -> bool: ...
     def retained_visits(self) -> int: ...
@@ -95,8 +138,12 @@ class MCTS:
         self,
         game: Game,
         num_simulations: int,
-        evaluator: Callable[[Game], tuple[list[float], float]],
-        batch_evaluator: Optional[Callable[[list[Game]], list[tuple[list[float], float]]]] = None,
+        # The evaluator may return the policy as a list[float] or an ndarray;
+        # both are accepted (the ndarray path is the memcpy fast path).
+        evaluator: Callable[[Game], tuple[Union[list[float], npt.NDArray[np.float32]], float]],
+        batch_evaluator: Optional[
+            Callable[[list[Game]], list[tuple[Union[list[float], npt.NDArray[np.float32]], float]]]
+        ] = None,
         abort_fn: Optional[Callable[[], bool]] = None,
     ) -> SearchResult: ...
     def search_batched(

@@ -725,6 +725,9 @@ class SelfPlayGame:
         self.raw_positions: List[Dict[str, Any]] = []
         self.ply = 0
         self.total_simulations = 0
+        # Cache-occupancy snapshot published by the owning thread between
+        # searches (remediation F-14); consumed by get_live_cache_stats().
+        self._last_cache_entries = 0
         self.consecutive_low_root_white = 0
         self.consecutive_low_root_black = 0
         self.would_have_resigned = False
@@ -838,6 +841,13 @@ class SelfPlayGame:
                 )
             visit_distribution = np.array(search_result.action_visits, dtype=np.float32)
             root_value = search_result.root_value  # [-1, 1] from side-to-move's perspective
+            # Publish cache telemetry from the owning thread (remediation F-14):
+            # get_live_cache_stats() used to call mcts.cache_size() on *other*
+            # threads' MCTS instances, reading a live unordered_map while its
+            # owner mutates it GIL-free (formal data race). Sampling here —
+            # between searches, on the thread that owns this MCTS — is safe and
+            # costs one call per move.
+            self._last_cache_entries = self.mcts.cache_size()
             # 4. Check resignation
             if root_value < self.resign_threshold:
                 if is_white:
@@ -1171,10 +1181,18 @@ class SelfPlayWorker:
         self.active_games: Dict[int, SelfPlayGame] = {}
 
     def get_live_cache_stats(self) -> Dict[str, Any]:
-        """Query real-time C++ NN cache entries across all active games."""
+        """Report per-game NN-cache entries across all active games.
+
+        Remediation F-14: this used to call ``g.mcts.cache_size()`` from the
+        caller's thread while each game's owner thread could be mutating that
+        cache GIL-free inside a search (formal data race on the underlying
+        unordered_map). Game threads now publish their cache occupancy at a
+        safe point between searches (``_last_cache_entries``), and this method
+        only reads those plain Python attributes.
+        """
         with self.counter_lock:
             games = list(self.active_games.values())
-        cache_sizes = [g.mcts.cache_size() for g in games]
+        cache_sizes = [int(getattr(g, "_last_cache_entries", 0)) for g in games]
         total_entries = sum(cache_sizes)
         est_bytes = total_entries * 18744
         return {
