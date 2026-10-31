@@ -82,21 +82,17 @@ class BatchedEvaluator:
 
 
 def make_single_eval_fn(model: torch.nn.Module, device: str):
-    """Fast single-position fallback (no FEN round-trip).
+    """Fast single-position fallback: encode the passed game directly.
 
-    Uses the ``encode_game`` binding which encodes the passed game object
-    directly instead of serialize-to-FEN + re-parse.
+    ``zeropawn_cpp.encode_state`` accepts the game object itself and preserves
+    its move history (plane 18 repetition).  Both the former
+    ``encode_game``-preferred branch (no such binding has ever been exported)
+    and its FEN-round-trip fallback erased that history (audit M-1).
     """
     import zeropawn_cpp
 
-    has_direct = hasattr(zeropawn_cpp, "encode_game")
-
     def eval_fn(game) -> tuple:
-        if has_direct:
-            planes = zeropawn_cpp.encode_game(game).reshape(NUM_PLANES, BOARD_HW, BOARD_HW)
-        else:  # pragma: no cover - legacy fallback
-            chess_g = zeropawn_cpp.ChessGame(game.get_fen())
-            planes = zeropawn_cpp.encode_state(chess_g)
+        planes = zeropawn_cpp.encode_state(game)
         t = torch.from_numpy(planes).unsqueeze(0).to(device)
         if device == "cuda":
             t = t.to(memory_format=torch.channels_last)

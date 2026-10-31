@@ -24,6 +24,7 @@ from python.cli.common import (
     safe_resolve,
     validate_fen_or_raise,
 )
+from python.cli.eval_callbacks import make_serial_eval_fn
 from python.common.progress import (
     banner,
     emit_error,
@@ -1015,19 +1016,9 @@ def run_solve_puzzles(args: argparse.Namespace) -> int:
     mcts_cfg.add_noise = False
     mcts = zeropawn_cpp.MCTS(mcts_cfg)
 
-    def eval_fn(game: zeropawn_cpp.Game):
-        chess_g = zeropawn_cpp.ChessGame(game.get_fen())
-        planes = zeropawn_cpp.encode_state(chess_g)
-        t = torch.from_numpy(planes).unsqueeze(0).to(device)
-        if device == "cuda":
-            t = t.to(memory_format=torch.channels_last)
-        with torch.no_grad():
-            with torch.amp.autocast(device, dtype=torch.bfloat16):
-                p_logits, v_wdl = model(t)
-            p_probs = torch.softmax(p_logits.float(), dim=-1).squeeze(0).cpu().numpy().tolist()
-            v_probs = torch.softmax(v_wdl.float(), dim=-1).squeeze(0).cpu().numpy()
-            scalar_val = float(v_probs[0] - v_probs[2])
-        return (p_probs, scalar_val)
+    # Shared factory: encodes the passed game directly (history preserved).
+    # The former inline callback FEN-round-tripped the game (audit M-1).
+    eval_fn = make_serial_eval_fn(model, device)
 
     score_correct = 0
     attempted = 0
