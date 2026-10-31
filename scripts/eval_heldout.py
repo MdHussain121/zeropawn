@@ -16,6 +16,7 @@ import sys
 import time
 from pathlib import Path
 from contextlib import nullcontext
+from typing import Optional
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -73,7 +74,28 @@ def evaluate_heldout(
         pin_memory=(device.type == "cuda"),
     )
 
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    # Side-to-move resolution (audit SLQ-13): the 19-plane encoder is fully
+    # side-relative, so the side to move cannot be recovered from the planes.
+    # Schema-2+ builds store it per row in stm.bin (1 = white to move); the
+    # ply-parity heuristic is only valid for PGN-rooted game rows (stored ply
+    # == absolute ply from the game start) and silently wrong for FEN-rooted
+    # tactical rows, whose stored ply is a label convention (0 or 10), not an
+    # absolute ply.
+    stm_path = Path(val_dir) / "stm.bin"
+    stm_mm: Optional[np.memmap] = None
+    stm_fallback_warned = False
+    if stm_path.is_file():
+        n = val_ds.num_samples
+        stm_mm = np.memmap(stm_path, dtype=np.uint8, mode="r", shape=(n,))
+    else:
+        print(
+            "[eval_heldout] WARNING: no stm.bin sidecar in the val split; falling back to "
+            "ply-parity for the side to move. This is only valid for PGN-rooted game rows "
+            "(audit SLQ-13): FEN-rooted tactical rows will be decoded with the wrong "
+            "orientation and their masked-accuracy rows are not trustworthy."
+        )
+
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
     state_dict = checkpoint["model"] if "model" in checkpoint else checkpoint
 
     # Auto-detect architecture from checkpoint metadata or state_dict keys
@@ -179,7 +201,12 @@ def evaluate_heldout(
 
             for i in range(batch_sz):
                 ply = int(plies_cpu[i])
-                is_white = ply % 2 == 0
+                if stm_mm is not None:
+                    is_white = int(stm_mm[total_samples - batch_sz + i]) == 1
+                else:
+                    if not stm_fallback_warned:
+                        stm_fallback_warned = True
+                    is_white = ply % 2 == 0
                 fen = decode_planes_to_fen(planes_cpu[i], is_white_to_move=is_white, ply=ply)
                 g = zeropawn_cpp.ChessGame(fen)
                 legal_acts = g.legal_actions()

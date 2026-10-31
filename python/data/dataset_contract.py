@@ -90,7 +90,15 @@ ROLE_GAMES_WDL = DatasetRole(
 
 ROLE_POLICY_TACTICS = DatasetRole(
     name="policy_tactics",
-    description="Tactical puzzle positions training the policy head only; value targets masked.",
+    description=(
+        "Tactical puzzle positions training the policy head; value targets are masked "
+        "(OUTCOME_UNAVAILABLE) for every row whose solution does not deliver checkmate. "
+        "Mate-delivering rows carry a genuine mover-relative win label (outcome=0) at "
+        "ply=10, and the loaders pass that label through so the trainer's WDL mask "
+        "(ply >= 10 ∧ non-zero target) supervises the value head for them (audit SLQ-06 "
+        "contract decision: a genuinely available and supported target is never silently "
+        "discarded, and unavailable targets remain masked)."
+    ),
     valid_outcomes=(OUTCOME_UNAVAILABLE, OUTCOME_WIN, OUTCOME_DRAW, OUTCOME_LOSS),
     requires_wdl_labels=False,
     allows_masked=True,

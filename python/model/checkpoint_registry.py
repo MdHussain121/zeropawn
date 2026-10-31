@@ -169,7 +169,8 @@ def validate_warm_start(
     entry: Optional[Dict[str, Any]] = None
     if registry:
         for rec in registry.get("checkpoints", []):
-            if rec.get("sha256") == info.sha256 or rec.get("sha256", "").startswith(sha16):
+            rec_sha = rec.get("sha256")
+            if rec_sha and (rec_sha == info.sha256 or str(rec_sha).startswith(sha16)):
                 entry = rec
                 break
 
@@ -199,6 +200,14 @@ def validate_warm_start(
 
     status = entry.get("status")
     if status != "verified":
+        if status == "disqualified":
+            dq = entry.get("disqualification", {})
+            raise WarmStartValidationError(
+                f"Warm-start {p} is DISQUALIFIED in the registry "
+                f"({dq.get('reason', 'undocumented')}): {dq.get('detail', '')} "
+                "A disqualified checkpoint can never become a warm start; see "
+                "docs/checkpoint_registry.json for the evidence trail."
+            )
         raise WarmStartValidationError(
             f"Warm-start {p} is registered with status {status!r} (missing/unverified "
             "artifacts can never be warm starts). See docs/checkpoint_registry.json."

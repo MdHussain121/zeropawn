@@ -191,7 +191,11 @@ def _assign_split_by_family(
     for pid in puzzles:
         root = find(pid)
         if root not in component_split:
-            component_split[root] = "train"
+            # A component's initial split is its FIRST member's hash-based
+            # candidate (not "train" — that default made every component
+            # train and left the val split permanently empty, a latent bug in
+            # this builder surfaced by the 2026-10-31 rebuild, audit SLQ-10).
+            component_split[root] = candidate_split[pid]
         if candidate_split[pid] == "train":
             component_split[root] = "train"
 
@@ -255,13 +259,15 @@ def _write_split_from_records(
     """Re-encode and stream the accepted records to split part files, then
     atomically promote them. Rows are written in ascending (PuzzleId,
     solver_seq) order, so each puzzle's solution line is replayed
-    incrementally exactly once. Returns the number of rows written."""
+    incrementally exactly once. Returns (rows_written, mate_rows_labelled)."""
     import numpy as np
+
+    from python.data.build_dataset import compute_legal_mask
 
     split_dir.mkdir(parents=True, exist_ok=True)
     part_paths = {
         k: split_dir / f"{k}.bin.part"
-        for k in ("planes", "moves", "outcomes", "game_ids", "plies")
+        for k in ("planes", "moves", "outcomes", "game_ids", "plies", "masks", "stm")
     }
 
     rows: list[tuple[str, int, bytes, int]] = []
@@ -270,6 +276,7 @@ def _write_split_from_records(
     rows.sort()
 
     n_rows = 0
+    n_mate = 0
     chunk: list[PositionData] = []
     with (
         open(part_paths["planes"], "wb") as f_planes,
@@ -277,6 +284,8 @@ def _write_split_from_records(
         open(part_paths["outcomes"], "wb") as f_outcomes,
         open(part_paths["game_ids"], "wb") as f_gids,
         open(part_paths["plies"], "wb") as f_plies,
+        open(part_paths["masks"], "wb") as f_masks,
+        open(part_paths["stm"], "wb") as f_stm,
     ):
         current_pid: str | None = None
         game = None
@@ -296,6 +305,7 @@ def _write_split_from_records(
                 sol_move = rec.moves[move_idx_in_line + 1]
                 game.make_move_uci(opp_move)
                 move_idx_in_line += 1
+                row: PositionData | None = None
                 if current_seq == seq:
                     planes = zeropawn_cpp.encode_state(game)
                     actual_key = hashlib.md5(np.ascontiguousarray(planes).tobytes()).digest()
@@ -304,27 +314,51 @@ def _write_split_from_records(
                             f"Re-encode mismatch for puzzle {pid} solver_seq {seq}: "
                             "serialized state changed between collection and write"
                         )
-                    chunk.append(
-                        PositionData(
-                            planes=planes,
-                            move_idx=move_idx,
-                            outcome=OUTCOME_UNAVAILABLE,
-                            game_id=rec.gid,
-                            ply=0,
-                            pos_hash=0,
-                        )
+                    # Schema-2 sidecars at the exact stored position: the
+                    # packed legal mask (masked policy loss) and the side to
+                    # move (held-out STM resolution; the 19-plane encoder is
+                    # side-relative).
+                    row = PositionData(
+                        planes=planes,
+                        move_idx=move_idx,
+                        outcome=OUTCOME_UNAVAILABLE,
+                        game_id=rec.gid,
+                        ply=0,
+                        pos_hash=0,
+                        legal_mask=compute_legal_mask(game),
+                        stm=1 if game.side_to_move() else 0,
                     )
+                    chunk.append(row)
                     n_rows += 1
                     if len(chunk) >= chunk_size:
                         _flush_positions_chunk(
-                            chunk, f_planes, f_moves, f_outcomes, f_gids, f_plies
+                            chunk,
+                            f_planes,
+                            f_moves,
+                            f_outcomes,
+                            f_gids,
+                            f_plies,
+                            f_masks=f_masks,
+                            f_stm=f_stm,
                         )
                         chunk.clear()
                 game.make_move_uci(sol_move)
                 move_idx_in_line += 1
                 current_seq += 1
+                # Mate contract (audit SLQ-06, builder side): when the solver
+                # move delivers checkmate the outcome IS available and must
+                # not be silently discarded — label the row as a mover-relative
+                # win at ply 10 so the trainer's WDL mask (ply >= 10 ∧ non-zero
+                # target) supervises the value head. The line ends at mate.
+                if row is not None and game.is_checkmate():
+                    row.outcome = 0
+                    row.ply = 10
+                    n_mate += 1
+                    break
         if chunk:
-            _flush_positions_chunk(chunk, f_planes, f_moves, f_outcomes, f_gids, f_plies)
+            _flush_positions_chunk(
+                chunk, f_planes, f_moves, f_outcomes, f_gids, f_plies, f_masks=f_masks, f_stm=f_stm
+            )
             chunk.clear()
 
     for name, part_path in part_paths.items():
@@ -332,7 +366,7 @@ def _write_split_from_records(
         if final_path.exists():
             final_path.unlink()
         part_path.replace(final_path)
-    return n_rows
+    return n_rows, n_mate
 
 
 def _verify_serialized_output(output_dir: Path, n_train: int, n_val: int) -> dict:
@@ -409,13 +443,16 @@ def build_tactics_dataset(
             f"target conflicts {s['target_conflicts']:,}"
         )
 
-    n_train = _write_split_from_records(
+    n_train, train_mate_rows = _write_split_from_records(
         train_dir, conflict_report["kept"]["train"], puzzles, chunk_size
     )
-    n_val = _write_split_from_records(
+    n_val, val_mate_rows = _write_split_from_records(
         val_dir, conflict_report["kept"]["val"], puzzles, chunk_size
     )
-    print(f"Serialized train {n_train:,} rows, val {n_val:,} rows")
+    print(
+        f"Serialized train {n_train:,} rows ({train_mate_rows:,} mate-labelled), "
+        f"val {n_val:,} rows ({val_mate_rows:,} mate-labelled)"
+    )
 
     verification = _verify_serialized_output(out_dir, n_train, n_val)
     if not verification["passed"]:
@@ -430,9 +467,12 @@ def build_tactics_dataset(
 
     label_semantics = {
         "role": "policy_tactics",
-        "outcome_encoding": "255=masked (policy-only example)",
+        "outcome_encoding": (
+            "mover perspective: 0=win (solver move delivers checkmate, ply=10), "
+            "255=masked (policy-only example, ply=0)"
+        ),
         "wdl_supervised": False,
-        "value_loss": "masked (outcome=255, ply=0)",
+        "value_loss": "masked except mate-delivering rows (outcome=0, ply=10) per the SLQ-06 contract",
     }
     metadata_common = {
         "planes_shape": [19, 8, 8],
@@ -441,6 +481,8 @@ def build_tactics_dataset(
         "dtype_outcomes": "uint8",
         "dtype_game_ids": "uint64",
         "dtype_plies": "int16",
+        "dtype_stm": "uint8 (1 = white to move, 0 = black)",
+        "dtype_masks": "uint8-bitpacked-4672",
         "schema_version": SCHEMA_VERSION,
         "role": "policy_tactics",
         "label_semantics": label_semantics,
@@ -478,7 +520,9 @@ def build_tactics_dataset(
             "component_size_histogram": component_sizes,
             "skip_reasons": skip_reasons,
             "train_rows": n_train,
+            "train_mate_rows": train_mate_rows,
             "val_rows": n_val,
+            "val_mate_rows": val_mate_rows,
             **{
                 f"{split}_{key}": value
                 for split in ("train", "val")

@@ -1,20 +1,25 @@
 """Supervised warm start training script for ZeroPawn.
 
 Contract Specifications:
-- Model: PyTorch dual-head ResNet (10 ResBlocks, 128 filters, channels-last)
+- Model: PyTorch dual-head ResNet (12 ResBlocks, 128 filters, channels-last)
 - Optimizer: AdamW
-- Schedule: Linear warmup (few hundred steps) + Cosine decay
-- Policy Loss: Cross-Entropy with 0.05 label smoothing
-- Total Loss: policy_loss + 0.5 * wdl_loss
-- Value Mask: Positions with ply < 10 have zero value loss
+- Schedule: Linear warmup + Cosine decay (single formula, see WarmupCosineScheduler)
+- Policy Loss: legal-masked CE with 0.05 label smoothing over legal actions
+  (full-vocabulary fallback only for schema-1 datasets, logged once)
+- Total Loss: policy_loss + 0.5 * wdl_loss (WDL masked to ply >= 10 with a
+  non-zero target)
 - Mixed Precision: bfloat16 autocast
-- Checkpointing: Resumable checkpoints every 30 minutes / configured steps
-- Logging: TensorBoard metrics (losses, top-1, top-3, policy entropy, GPU utilization)
+- Checkpointing: Resumable checkpoints every 30 minutes / configured steps;
+  every save carries optimizer/checkpoint type stamps and run provenance
+- Telemetry: TensorBoard metrics + durable run_manifest.json + telemetry.jsonl
+  next to the checkpoints (audit SLQ-02)
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import logging
 import math
 import os
@@ -155,25 +160,17 @@ class WarmupCosineScheduler:
         With ``step_num`` the LR is computed as a pure function of that step
         (identical to :meth:`get_lr`) and the internal counter jumps there. The
         RL trainer uses this to drive the schedule from its own checkpointed
-        step counter; callers without an argument keep the legacy advance-by-one
-        warmup semantics.
+        step counter; callers without an argument advance by one. Both paths
+        delegate to :meth:`get_lr` — the single definition of the schedule
+        (audit SLQ-11: the previous no-arg warmup formula
+        ``base_lr · k / warmup_steps`` diverged from ``get_lr``'s
+        min_lr-anchored warmup; they can no longer disagree).
         """
         if step_num is not None:
             self.current_step = int(step_num)
-            lr = self.get_lr(self.current_step)
         else:
             self.current_step += 1
-            if self.current_step <= self.warmup_steps:
-                # Linear warmup
-                lr = self.base_lr * (self.current_step / self.warmup_steps)
-            else:
-                # Cosine decay
-                progress = (self.current_step - self.warmup_steps) / (
-                    self.total_steps - self.warmup_steps
-                )
-                progress = min(1.0, max(0.0, progress))
-                cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
-                lr = self.min_lr + (self.base_lr - self.min_lr) * cosine_decay
+        lr = self.get_lr(self.current_step)
 
         for param_group in self.optimizer.param_groups:
             param_group["lr"] = lr
@@ -189,7 +186,12 @@ class WarmupCosineScheduler:
         }
 
     def get_lr(self, step: int) -> float:
-        """Return the learning rate at a given step without advancing the scheduler."""
+        """Return the learning rate at a given step without advancing the scheduler.
+
+        Single source of truth for the schedule (audit SLQ-11): min_lr-anchored
+        linear warmup for ``step < warmup_steps``, then cosine decay toward
+        ``min_lr``. Both :meth:`step` paths delegate here.
+        """
         if step < self.warmup_steps:
             return self.min_lr + (self.base_lr - self.min_lr) * (step / max(1, self.warmup_steps))
         progress = (step - self.warmup_steps) / max(1, self.total_steps - self.warmup_steps)
@@ -294,6 +296,26 @@ def legal_masked_policy_loss(
     return ((1.0 - s) * natural + s * legal_mean).mean()
 
 
+def _grad_norms(model: nn.Module, device: torch.device) -> tuple[float, float]:
+    """Pre-clip L2 grad norms (total, value head) over parameters carrying grads.
+
+    The value head is identified by the ChessNet parameter-name contract
+    (``value_conv``/``value_bn``/``value_fc1``/``value_fc2``). Used for the
+    value-head gradient diagnostics that prove WDL supervision reaches the
+    value head (audit SLQ-01/SLQ-02 telemetry requirement).
+    """
+    total = torch.zeros((), device=device)
+    value = torch.zeros((), device=device)
+    for name, p in model.named_parameters():
+        if p.grad is None:
+            continue
+        g = p.grad.detach().float().pow(2).sum()
+        total = total + g
+        if "value" in name:
+            value = value + g
+    return float(total.sqrt().item()), float(value.sqrt().item())
+
+
 def train_step(
     model: nn.Module,
     batch: dict[str, torch.Tensor],
@@ -304,14 +326,25 @@ def train_step(
     step_optimizer: bool = True,
     zero_grad: bool = True,
     v_total: Optional[int] = None,
-) -> tuple[float, float, float, float, float, float, bool]:
-    """Single optimization step or accumulation micro-step. Returns (total_loss, policy_loss, wdl_loss, top1, top3, entropy)."""
+) -> tuple[float, float, float, float, float, float, bool, Optional[dict[str, float]]]:
+    """Single optimization step or accumulation micro-step.
+
+    Returns ``(total_loss, policy_loss, wdl_loss, top1, top3, entropy, skip,
+    grad_diag)`` where ``grad_diag`` carries the pre-clip total and value-head
+    gradient norms on optimizer-step micro-batches (None otherwise).
+    """
     device = torch.device(device)
     device_type: str = device.type
     planes = batch["planes"].to(device, memory_format=torch.channels_last, non_blocking=True)
     moves = batch["move"].to(device, non_blocking=True)
     value_targets = batch["value_target"].to(device, non_blocking=True)
     plies = batch["ply"].to(device, non_blocking=True)
+    # The legal mask must ride with the batch: the disk-backed loader yields
+    # CPU tensors while the model runs on CUDA (the GPU-resident loader
+    # yields device tensors, so this is a no-op there).
+    legal_mask = batch.get("legal_mask")
+    if legal_mask is not None:
+        legal_mask = legal_mask.to(device, non_blocking=True)
 
     if zero_grad:
         optimizer.zero_grad(set_to_none=True)
@@ -329,7 +362,7 @@ def train_step(
         # only (SL-01); falls back to full-vocabulary smoothing when the batch
         # carries no mask stream (logged once).
         policy_loss = legal_masked_policy_loss(
-            policy_logits, moves, batch.get("legal_mask"), label_smoothing=0.05
+            policy_logits, moves, legal_mask, label_smoothing=0.05
         )
 
         # Value loss: Cross-Entropy with soft WDL targets + mask for first 10 plies
@@ -376,11 +409,15 @@ def train_step(
             top3,
             entropy,
             True,  # non-finite: skip window optimizer step
+            None,
         )
 
     loss_to_backward.backward()
 
+    grad_diag: Optional[dict[str, float]] = None
     if step_optimizer:
+        total_norm, value_norm = _grad_norms(model, device)
+        grad_diag = {"total_grad_norm": total_norm, "value_grad_norm": value_norm}
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
@@ -396,6 +433,7 @@ def train_step(
         top3,
         entropy,
         False,  # finite loss: proceed normally
+        grad_diag,
     )
 
 
@@ -426,6 +464,9 @@ def evaluate(
             moves = batch["move"].to(device, non_blocking=True)
             value_targets = batch["value_target"].to(device, non_blocking=True)
             plies = batch["ply"].to(device, non_blocking=True)
+            batch_legal_mask = batch.get("legal_mask")
+            if batch_legal_mask is not None:
+                batch_legal_mask = batch_legal_mask.to(device, non_blocking=True)
             batch_sz = moves.size(0)
 
             autocast_context = (
@@ -442,7 +483,7 @@ def evaluate(
                 # the batch carries a mask stream), summed per-sample for
                 # exact averaging over the split.
                 per_sample_policy = legal_masked_policy_loss(
-                    policy_logits, moves, batch.get("legal_mask"), label_smoothing=0.05
+                    policy_logits, moves, batch_legal_mask, label_smoothing=0.05
                 )
                 policy_loss = per_sample_policy * batch_sz
                 log_wdl = F.log_softmax(wdl_logits, dim=-1)
@@ -489,8 +530,14 @@ def save_checkpoint(
     num_blocks: int = 12,
     num_filters: int = 128,
     keep_last_n: int = 3,
+    run_metadata: Optional[dict[str, Any]] = None,
 ) -> None:
-    """Save training state checkpoint (atomic tmp write + os.replace)."""
+    """Save training state checkpoint (atomic tmp write + os.replace).
+
+    Every save carries the optimizer/checkpoint type stamps (audit SLQ-17) and
+    the run's provenance metadata (audit SLQ-02: run identity, dataset
+    receipts, git commit, seed, and configuration travel inside the artifact).
+    """
     checkpoint_path = Path(checkpoint_path)
     state = {
         "model": model.state_dict(),
@@ -501,6 +548,9 @@ def save_checkpoint(
         "best_val_loss": best_val_loss,
         "num_blocks": num_blocks,
         "num_filters": num_filters,
+        "checkpoint_type": "supervised",
+        "_optimizer_type": "AdamW",
+        "run_metadata": dict(run_metadata) if run_metadata else {},
         "metadata": {
             "architecture": f"{num_blocks} ResBlocks x {num_filters} Filters",
             "step": step,
@@ -522,6 +572,179 @@ def save_checkpoint(
                 prune_checkpoints(parent, keep_last_n=keep_last_n)
         except (OSError, ValueError):
             logger.debug("supervised checkpoint prune skipped", exc_info=True)
+
+
+class _RunTelemetry:
+    """Durable per-run telemetry: run manifest + append-only JSONL stream.
+
+    Audit SLQ-02/SLQ-15 remediation: every supervised run persists enough
+    information next to its checkpoints to reproduce and interpret it —
+    run identity, git commit, dataset receipts, seed, full configuration,
+    schedule geometry, and per-step/per-epoch metrics. The JSONL stream is
+    flushed per line so interrupted runs retain their telemetry, and each
+    line carries the run_id so concurrent or resumed runs sharing a
+    checkpoint directory remain attributable.
+    """
+
+    def __init__(self, ckpt_dir: Path, manifest: dict[str, Any]) -> None:
+        import uuid
+        from datetime import datetime, timezone
+
+        self.ckpt_dir = Path(ckpt_dir)
+        self.ckpt_dir.mkdir(parents=True, exist_ok=True)
+        self.manifest_path = self.ckpt_dir / "run_manifest.json"
+        self.telemetry_path = self.ckpt_dir / "telemetry.jsonl"
+        self.run_id = manifest.get("run_id") or (
+            datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
+        )
+        manifest["run_id"] = self.run_id
+        # Rotate any previous run's manifest so it is never silently lost.
+        if self.manifest_path.exists():
+            prior_stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+            try:
+                self.manifest_path.replace(
+                    self.ckpt_dir / f"run_manifest_{prior_stamp}.json"
+                )
+            except OSError:
+                logger.debug("manifest rotation failed", exc_info=True)
+        self.manifest = manifest
+        self._write_manifest()
+        self._fh = open(self.telemetry_path, "a", encoding="utf-8")
+
+    def _write_manifest(self) -> None:
+        tmp = self.manifest_path.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(self.manifest, f, indent=2, sort_keys=True)
+            f.write("\n")
+        tmp.replace(self.manifest_path)
+
+    def log(self, record: dict[str, Any]) -> None:
+        record = {"run_id": self.run_id, "ts": time.time(), **record}
+        try:
+            self._fh.write(json.dumps(record, sort_keys=True) + "\n")
+            self._fh.flush()
+        except (OSError, ValueError, TypeError):
+            logger.debug("telemetry write failed", exc_info=True)
+
+    def checkpoint_event(self, path: Path, reason: str, step: int) -> None:
+        self.log({"event": "checkpoint_saved", "path": str(path), "reason": reason, "step": step})
+
+    def finalize(self, status: str, extra: Optional[dict[str, Any]] = None) -> None:
+        self.manifest["status"] = status
+        self.manifest["finished_at"] = time.time()
+        if extra:
+            self.manifest.update(extra)
+        self._write_manifest()
+        try:
+            self.log({"event": "run_finished", "status": status})
+            self._fh.close()
+        except (OSError, ValueError):
+            logger.debug("telemetry finalize failed", exc_info=True)
+
+
+def _build_run_metadata(
+    train_dir: str | Path,
+    val_dir: str | Path,
+    gate_receipts: dict[str, Any],
+    seed: Optional[int],
+    num_blocks: int,
+    num_filters: int,
+    batch_size: int,
+    micro_bs: int,
+    accum_steps: int,
+    base_lr: float,
+    warmup_steps: int,
+    total_steps: int,
+    epochs: int,
+    max_steps: Optional[int],
+    gpu_resident: bool,
+    tactics_ratio: Optional[float],
+    tactics_dir: Optional[str | Path],
+    data_role: Optional[str],
+    allow_uncertified_data: bool,
+    verify_identity: str,
+    checkpoint_dir: str | Path,
+    log_dir: str | Path,
+) -> dict[str, Any]:
+    """Assemble the run manifest written next to the checkpoints (audit SLQ-02)."""
+    import platform as _platform
+
+    from python.data.dataset_contract import detect_git_commit
+
+    def _receipt_summary(label: str) -> dict[str, Any]:
+        info = gate_receipts.get(label, {})
+        receipt = info.get("receipt")
+        if not isinstance(receipt, dict):
+            return {
+                "data_dir": info.get("data_dir"),
+                "certified": info.get("certified", False),
+                "receipt_id": None,
+            }
+        return {
+            "data_dir": info.get("data_dir"),
+            "certified": info.get("certified", False),
+            "receipt_id": (
+                f"sha256:{hashlib.sha256(json.dumps(receipt, sort_keys=True).encode()).hexdigest()[:16]}"
+            ),
+            "validated_at": receipt.get("validated_at"),
+            "receipt_overall": receipt.get("overall"),
+            "role": receipt.get("role"),
+            "dataset_build_dir": receipt.get("dataset_dir"),
+        }
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return {
+        "entry": "python.train.train_supervised",
+        "created_at": time.time(),
+        "git_commit": detect_git_commit(),
+        "seed": seed,
+        "dataset": {
+            "train": _receipt_summary("train"),
+            "val": _receipt_summary("val"),
+        },
+        "model": {
+            "num_blocks": num_blocks,
+            "num_filters": num_filters,
+            "in_channels": 19,
+            "num_actions": 4672,
+            "param_count": None,  # filled after model construction
+        },
+        "optimizer": {
+            "type": "AdamW",
+            "base_lr": base_lr,
+            "weight_decay": 1e-4,
+            "fused": device.type == "cuda",
+        },
+        "schedule": {
+            "warmup_steps": warmup_steps,
+            "total_steps": total_steps,
+            "min_lr": 1e-5,
+        },
+        "config": {
+            "batch_size": batch_size,
+            "micro_batch_size": micro_bs,
+            "gradient_accumulation_steps": accum_steps,
+            "epochs": epochs,
+            "max_steps": max_steps,
+            "gpu_resident": gpu_resident,
+            "tactics_ratio": tactics_ratio,
+            "tactics_dir": str(tactics_dir) if tactics_dir else None,
+            "data_role": data_role,
+            "allow_uncertified_data": allow_uncertified_data,
+            "verify_identity": verify_identity,
+            "checkpoint_dir": str(checkpoint_dir),
+            "log_dir": str(log_dir),
+        },
+        "host": {
+            "platform": _platform.platform(),
+            "python": _platform.python_version(),
+            # str(): torch.__version__ is a TorchVersion instance, which the
+            # weights_only unpickler rejects on reload (SLQ-13 contract).
+            "torch": str(torch.__version__),
+            "device": str(device),
+            "device_name": torch.cuda.get_device_name(0) if device.type == "cuda" else "CPU",
+        },
+    }
 
 
 def train_supervised(
@@ -550,6 +773,7 @@ def train_supervised(
     data_role: Optional[str] = None,
     allow_uncertified_data: bool = False,
     verify_identity: str = "full",
+    override_schedule: bool = False,
     **kwargs: Any,
 ) -> dict[str, float]:
     """Execute supervised training loop.
@@ -565,6 +789,7 @@ def train_supervised(
     #    out with allow_uncertified_data.
     from python.data.dataset_validation import require_validated_dataset
 
+    gate_receipts: dict[str, Any] = {}
     for label, split_dir in (("train", train_dir), ("val", val_dir)):
         gate = require_validated_dataset(
             Path(split_dir),
@@ -581,6 +806,16 @@ def train_supervised(
         )
         for warning in gate.warnings:
             print(f"[data-gate] {warning}")
+        # Audit SLQ-02/SLQ-15: bind this run to the dataset identity the gate
+        # verified, so the checkpoint's training inputs are reconstructable.
+        gate_receipts[label] = {
+            "data_dir": str(split_dir),
+            "certified": gate.certified,
+            "role": role_name,
+            "masked_fraction": gate.masked_fraction,
+            "num_samples": gate.num_samples,
+            "receipt": gate.receipt,
+        }
 
     if seed is not None:
         random.seed(seed)
@@ -637,6 +872,13 @@ def train_supervised(
     )
     print("=" * 80 + "\n")
 
+    # Audit SLQ-18: one tactics-ratio default across loader paths. The
+    # disk-backed path historically sampled at 0.3 when --tactics-dir was
+    # given without --tactics-ratio; the GPU path silently used natural
+    # composition. Both now resolve identically before any loader is built.
+    if tactics_dir is not None and tactics_ratio is None:
+        tactics_ratio = 0.3
+
     if gpu_resident and device.type == "cuda":
         print("Using high-throughput GpuResidentDataLoader (maximizing GPU VRAM over CPU/RAM)...")
         train_loader = GpuResidentDataLoader(
@@ -671,7 +913,9 @@ def train_supervised(
             t_path = Path(tactics_dir)
             if not t_path.is_dir():
                 raise FileNotFoundError(f"Tactical dataset directory not found: {t_path}")
-            t_ratio = tactics_ratio if tactics_ratio is not None else 0.3
+            # tactics_ratio was resolved above (0.3 default when --tactics-dir
+            # is set without an explicit ratio — audit SLQ-18).
+            t_ratio = tactics_ratio
             if not (0.0 <= t_ratio <= 1.0):
                 raise ValueError(f"tactics_ratio must be between 0.0 and 1.0, got {t_ratio}")
             tactics_ds = BinaryChessDataset(t_path, is_tactical=True)
@@ -680,7 +924,10 @@ def train_supervised(
                     f"tactics_ratio is {t_ratio} but tactical dataset at {t_path} is empty."
                 )
             combined_ds = SourceAwareCombinedDataset(train_ds, tactics_ds, tactics_ratio=t_ratio)
-            sampler = combined_ds.get_sampler()
+            # Epoch length under ratio sampling stays the historical master-row
+            # count (audit SLQ-19: __len__ now reports the combined total, so
+            # the sampler's num_samples must be passed explicitly).
+            sampler = combined_ds.get_sampler(num_samples=combined_ds.n_master)
             train_ds = combined_ds
             shuffle = False
         elif tactics_ratio is not None:
@@ -770,6 +1017,43 @@ def train_supervised(
         ckpt_dir = ckpt_dir.parent
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
+    # Durable run telemetry (audit SLQ-02/SLQ-15): manifest + JSONL stream
+    # written next to the checkpoints, flushed per line.
+    run_metadata = _build_run_metadata(
+        train_dir=train_dir,
+        val_dir=val_dir,
+        gate_receipts=gate_receipts,
+        seed=seed,
+        num_blocks=num_blocks,
+        num_filters=num_filters,
+        batch_size=batch_size,
+        micro_bs=micro_bs,
+        accum_steps=accum_steps,
+        base_lr=base_lr,
+        warmup_steps=warmup_steps,
+        total_steps=total_training_steps,
+        epochs=epochs,
+        max_steps=max_steps,
+        gpu_resident=gpu_resident,
+        tactics_ratio=tactics_ratio,
+        tactics_dir=tactics_dir,
+        data_role=data_role,
+        allow_uncertified_data=allow_uncertified_data,
+        verify_identity=verify_identity,
+        checkpoint_dir=ckpt_dir,
+        log_dir=log_dir,
+    )
+    run_metadata["model"]["param_count"] = sum(p.numel() for p in model.parameters())
+    telemetry = _RunTelemetry(ckpt_dir, run_metadata)
+    telemetry.log(
+        {
+            "event": "run_started",
+            "resume_path": str(resume_path) if resume_path else None,
+            "resume_weights_only": resume_weights_only,
+            "device": str(device),
+        }
+    )
+
     start_step = 0
     start_epoch = 0
     best_val_loss = float("inf")
@@ -795,12 +1079,47 @@ def train_supervised(
             if checkpoint.get("scheduler") is not None:
                 try:
                     saved_scheduler = checkpoint["scheduler"]
-                    # Only restore the current step; keep CLI-provided LR, warmup,
-                    # total_steps, and min_lr (fixes silent CLI override bug).
                     saved_current_step = saved_scheduler.get("current_step", 0)
-                    scheduler.current_step = saved_current_step
-                    # Preserve CLI/base values set when scheduler was constructed
-                    # (base_lr, warmup_steps, total_steps, min_lr stay as-is)
+                    # Audit SLQ-11: a resumed run continues the ORIGINAL
+                    # schedule. Restore the checkpoint's schedule geometry
+                    # (warmup/total/base/min) instead of silently reshaping the
+                    # remaining schedule from the current CLI values; adopting
+                    # the CLI geometry is an explicit --override-schedule act.
+                    geometry = ("warmup_steps", "total_steps", "base_lr", "min_lr")
+                    stored = {k: saved_scheduler.get(k) for k in geometry}
+                    if override_schedule or any(v is None for v in stored.values()):
+                        if override_schedule:
+                            print(
+                                "[SCHEDULE] --override-schedule given: adopting CLI schedule "
+                                f"geometry (warmup={scheduler.warmup_steps}, "
+                                f"total={scheduler.total_steps}, base_lr={scheduler.base_lr}); "
+                                "continuing at the checkpoint's step position."
+                            )
+                        scheduler.current_step = saved_current_step
+                    else:
+                        cli_geometry = {
+                            "warmup_steps": scheduler.warmup_steps,
+                            "total_steps": scheduler.total_steps,
+                            "base_lr": scheduler.base_lr,
+                            "min_lr": scheduler.min_lr,
+                        }
+                        diffs = {
+                            k: f"cli={cli_geometry[k]} ckpt={stored[k]}"
+                            for k in geometry
+                            if stored[k] != cli_geometry[k]
+                        }
+                        if diffs:
+                            print(
+                                "[SCHEDULE] Resuming with the CHECKPOINT's schedule geometry so "
+                                "the original schedule is not reshaped (audit SLQ-11). "
+                                f"CLI values differ: {diffs}. Pass --override-schedule to "
+                                "adopt the CLI geometry deliberately."
+                            )
+                        scheduler.warmup_steps = stored["warmup_steps"]
+                        scheduler.total_steps = stored["total_steps"]
+                        scheduler.base_lr = stored["base_lr"]
+                        scheduler.min_lr = stored["min_lr"]
+                        scheduler.current_step = saved_current_step
                 except (KeyError, ValueError, TypeError) as e:
                     logger.debug(
                         "Ignoring incompatible scheduler state in '%s': %s", resume_path, e
@@ -870,11 +1189,12 @@ def train_supervised(
                     v_total += v_mask.sum().item()
 
                 window_losses = []
+                window_grad_diag: Optional[dict[str, float]] = None
                 window_skip = False
                 for m_idx, b in enumerate(window):
                     is_first = m_idx == 0
                     is_last = m_idx == w_size - 1
-                    tot, pol, wdl, t1, t3, ent, skip = train_step(
+                    tot, pol, wdl, t1, t3, ent, skip, grad_diag = train_step(
                         model=model,
                         batch=b,
                         optimizer=optimizer,
@@ -885,9 +1205,19 @@ def train_supervised(
                         zero_grad=is_first,
                         v_total=v_total,
                     )
+                    if not skip:
+                        window_losses.append((tot, pol, wdl, t1, t3, ent))
+                    if grad_diag is not None:
+                        window_grad_diag = grad_diag
                     if skip:
                         window_skip = True
-                    window_losses.append((tot, pol, wdl, t1, t3, ent))
+                        # Audit SLQ-16: a non-finite micro-batch aborts the rest
+                        # of the window, clears the partially accumulated
+                        # gradients immediately, and this window performs no
+                        # optimizer step. The next window starts from a clean
+                        # gradient state.
+                        optimizer.zero_grad(set_to_none=True)
+                        break
 
                 # Only advance scheduler and step counter if no non-finite loss occurred.
                 # This fixes the bug where a bad micro-batch still advanced LR/scheduler.
@@ -901,12 +1231,15 @@ def train_supervised(
                 effective_samples = w_size * micro_bs
                 epoch_samples += effective_samples
 
-                avg_tot = sum(x[0] for x in window_losses) / len(window_losses)
-                avg_pol = sum(x[1] for x in window_losses) / len(window_losses)
-                avg_wdl = sum(x[2] for x in window_losses) / len(window_losses)
-                avg_top1 = sum(x[3] for x in window_losses) / len(window_losses)
-                avg_top3 = sum(x[4] for x in window_losses) / len(window_losses)
-                avg_ent = sum(x[5] for x in window_losses) / len(window_losses)
+                if window_losses:
+                    avg_tot = sum(x[0] for x in window_losses) / len(window_losses)
+                    avg_pol = sum(x[1] for x in window_losses) / len(window_losses)
+                    avg_wdl = sum(x[2] for x in window_losses) / len(window_losses)
+                    avg_top1 = sum(x[3] for x in window_losses) / len(window_losses)
+                    avg_top3 = sum(x[4] for x in window_losses) / len(window_losses)
+                    avg_ent = sum(x[5] for x in window_losses) / len(window_losses)
+                else:
+                    avg_tot = avg_pol = avg_wdl = avg_top1 = avg_top3 = avg_ent = 0.0
 
                 step_time = time.time() - step_t0
                 sps = effective_samples / max(1e-4, step_time)
@@ -920,6 +1253,31 @@ def train_supervised(
                     writer.add_scalar("entropy/policy", avg_ent, global_step)
                     writer.add_scalar("train/lr", lr, global_step)
                     writer.add_scalar("perf/samples_per_sec", sps, global_step)
+
+                # Durable telemetry (audit SLQ-02): every optimizer window,
+                # including the value-head gradient diagnostics proving WDL
+                # supervision reaches the value head. Short runs and interrupted
+                # runs keep a complete step-level record.
+                if True:
+                    telemetry.log(
+                        {
+                            "event": "train_step",
+                            "step": global_step,
+                            "epoch": epoch,
+                            "loss": avg_tot,
+                            "policy_loss": avg_pol,
+                            "wdl_loss": avg_wdl,
+                            "top1": avg_top1,
+                            "top3": avg_top3,
+                            "entropy": avg_ent,
+                            "lr": lr,
+                            "samples_per_sec": sps,
+                            "window_valid_wdl": v_total,
+                            "window_size": w_size,
+                            "window_skipped": window_skip,
+                            "grad": window_grad_diag,
+                        }
+                    )
 
                 if global_step % 100 == 0:
                     emit_report(
@@ -949,6 +1307,10 @@ def train_supervised(
                         best_val_loss,
                         num_blocks=num_blocks,
                         num_filters=num_filters,
+                        run_metadata=run_metadata,
+                    )
+                    telemetry.checkpoint_event(
+                        ckpt_dir / f"checkpoint_step_{global_step}.pt", "periodic", global_step
                     )
                     last_checkpoint_time = now
 
@@ -983,7 +1345,19 @@ def train_supervised(
                         best_val_loss,
                         num_blocks=num_blocks,
                         num_filters=num_filters,
+                        run_metadata=run_metadata,
                     )
+                    telemetry.checkpoint_event(ckpt_dir / "best_model.pt", "best", global_step)
+                telemetry.log(
+                    {
+                        "event": "epoch_end",
+                        "epoch": epoch,
+                        "step": global_step,
+                        "val": val_metrics,
+                        "epoch_samples": epoch_samples,
+                        "max_steps_reached": True,
+                    }
+                )
                 break
 
             # End of epoch validation
@@ -1010,6 +1384,12 @@ def train_supervised(
             writer.add_scalar("val/top1", val_metrics["top1"], global_step)
             writer.add_scalar("val/top3", val_metrics["top3"], global_step)
             writer.add_scalar("val/entropy", val_metrics["entropy"], global_step)
+            writer.flush()
+
+            # Durable per-epoch telemetry (audit SLQ-02) — val metrics are
+            # recomputable from the saved checkpoint + the receipt-identified
+            # val split recorded in the manifest.
+            telemetry.log({"event": "epoch_end", "epoch": epoch, "step": global_step, "val": val_metrics, "epoch_samples": epoch_samples})
 
             # Save best model checkpoint
             if val_metrics["total_loss"] < best_val_loss:
@@ -1024,7 +1404,9 @@ def train_supervised(
                     best_val_loss,
                     num_blocks=num_blocks,
                     num_filters=num_filters,
+                    run_metadata=run_metadata,
                 )
+                telemetry.checkpoint_event(ckpt_dir / "best_model.pt", "best", global_step)
 
             if max_steps is not None and global_step >= max_steps:
                 break
@@ -1042,7 +1424,9 @@ def train_supervised(
             best_val_loss,
             num_blocks=num_blocks,
             num_filters=num_filters,
+            run_metadata=run_metadata,
         )
+        telemetry.checkpoint_event(ckpt_dir / "latest_checkpoint.pt", "interrupted", global_step)
         raise
     finally:
         # Save final/latest checkpoint on clean completion (fixes missing final checkpoint bug)
@@ -1068,7 +1452,23 @@ def train_supervised(
                     best_val_loss if "best_val_loss" in locals() else float("inf"),
                     num_blocks=num_blocks if "num_blocks" in locals() else 12,
                     num_filters=num_filters if "num_filters" in locals() else 128,
+                    run_metadata=run_metadata,
                 )
+                telemetry.checkpoint_event(
+                    ckpt_dir / "latest_checkpoint.pt", "final", final_step
+                )
+        except Exception:
+            pass
+        try:
+            final_status = "interrupted" if isinstance(sys.exc_info()[1], KeyboardInterrupt) else "completed"
+            telemetry.finalize(
+                final_status,
+                extra={
+                    "final_step": final_step if "final_step" in locals() else None,
+                    "best_val_loss": best_val_loss if "best_val_loss" in locals() else None,
+                    "val_metrics": val_metrics if "val_metrics" in locals() else None,
+                },
+            )
         except Exception:
             pass
         try:
@@ -1152,6 +1552,19 @@ def main() -> None:
         "--log-dir", type=str, default="runs/supervised", help="TensorBoard logs dir."
     )
     parser.add_argument("--resume", type=str, default=None, help="Checkpoint path to resume.")
+    parser.add_argument(
+        "--resume-weights-only",
+        action="store_true",
+        help="Load only the model weights from --resume (fresh optimizer, step 0) for "
+        "fine-tuning. Default: full resume (optimizer/scheduler/step/RNG state).",
+    )
+    parser.add_argument(
+        "--override-schedule",
+        action="store_true",
+        help="On resume, adopt the CLI's LR/warmup/total-steps geometry instead of the "
+        "checkpoint's original schedule (logged loudly). Default: continue the original "
+        "schedule at the checkpoint's step position (audit SLQ-11).",
+    )
     parser.add_argument("--workers", type=int, default=2, help="DataLoader worker processes.")
     parser.add_argument(
         "--gpu-resident",
@@ -1298,6 +1711,8 @@ def main() -> None:
             allow_uncertified_data=args.allow_uncertified_data,
             verify_identity=args.verify_identity,
             seed=args.seed,
+            resume_weights_only=args.resume_weights_only,
+            override_schedule=args.override_schedule,
         )
         emit_report(
             format_kv_line(

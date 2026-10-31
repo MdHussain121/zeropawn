@@ -107,7 +107,7 @@ VALID_OUTCOMES: tuple[int, ...] = (0, 1, 2, OUTCOME_UNAVAILABLE)
 class PositionData:
     __slots__ = (
         "planes", "move_idx", "outcome", "game_id", "ply", "pos_hash",
-        "state_key", "legal_mask",
+        "state_key", "legal_mask", "stm",
     )
 
     # 4672 actions packed into bits: ceil(4672/8) bytes per position.
@@ -124,6 +124,7 @@ class PositionData:
         pos_hash: int,
         state_key: bytes | None = None,
         legal_mask: Optional[np.ndarray] = None,
+        stm: int = 1,
     ) -> None:
         if outcome not in VALID_OUTCOMES:
             raise ValueError(f"Invalid outcome {outcome}: must be one of {VALID_OUTCOMES}")
@@ -141,6 +142,12 @@ class PositionData:
             np.ascontiguousarray(planes).tobytes()
         ).digest()
         self.legal_mask = legal_mask
+        # Side to move: 1 = white, 0 = black. The 19-plane encoder is fully
+        # side-relative (no absolute side plane), so the side cannot be
+        # recovered from the planes alone — store it explicitly so held-out
+        # evaluation never has to guess it from ply parity (audit SLQ-13;
+        # ply parity is invalid for FEN-rooted tactical rows).
+        self.stm = 1 if stm else 0
 
 
 def compute_legal_mask(cpp_game) -> np.ndarray:
@@ -154,24 +161,36 @@ def compute_legal_mask(cpp_game) -> np.ndarray:
     return np.packbits(legal)  # uint8, 584 bytes
 
 
-def process_pgn_game(game: chess.pgn.Game) -> tuple[int, bool, list[PositionData]]:
+def process_pgn_game(game: chess.pgn.Game) -> tuple[int, str, list[PositionData]]:
     """Process a single chess.pgn.Game using the C++ ChessGame and encoder.
 
+    Splits games deterministically by game-ID hash into three buckets
+    (audit SLQ-09): ``val`` = hash % 100 < 2 (unchanged from the historical
+    rule, so previously-val games stay val), ``test`` = 2 <= hash % 100 < 3
+    (an independent held-out test set, never used for selection), and
+    ``train`` = the remaining 97 %.
+
     Returns:
-        (game_id_hash, is_val, list of PositionData)
+        (game_id_hash, split_name, list of PositionData)
     """
     # Snapshot the canonical mainline first so the fallback game identity can
     # bind to game content (collision-resistant, audit F-03).
     mainline_uci = [move.uci() for move in game.mainline_moves()]
     game_id_str = extract_game_id(game, mainline_uci)
     game_id = hash_game_id(game_id_str)
-    # Deterministic 98% train / 2% val split by game ID hash
-    is_val = (game_id % 100) < 2
+    # Deterministic 97% train / 2% val / 1% test split by game ID hash
+    bucket = game_id % 100
+    if bucket < 2:
+        split = "val"
+    elif bucket < 3:
+        split = "test"
+    else:
+        split = "train"
 
     raw_res = game.headers.get("Result", "")
     res = parse_result(raw_res)
     if res is None:
-        return game_id, is_val, []
+        return game_id, split, []
 
     positions: list[PositionData] = []
     cpp_game = zeropawn_cpp.ChessGame()
@@ -218,12 +237,13 @@ def process_pgn_game(game: chess.pgn.Game) -> tuple[int, bool, list[PositionData
                 ply=ply_num,
                 pos_hash=pos_hash,
                 legal_mask=legal_mask,
+                stm=1 if is_white else 0,
             )
         )
 
         cpp_game.make_move_uci(uci_move)
 
-    return game_id, is_val, positions
+    return game_id, split, positions
 
 
 def save_dataset_split(
@@ -242,6 +262,7 @@ def save_dataset_split(
     game_ids_path = data_dir / "game_ids.bin"
     plies_path = data_dir / "plies.bin"
     masks_path = data_dir / "masks.bin"
+    stm_path = data_dir / "stm.bin"
     has_masks = all(p.legal_mask is not None for p in positions)
 
     planes_mm = np.memmap(planes_path, dtype=np.float32, mode="w+", shape=(num_samples, 19, 8, 8))
@@ -259,6 +280,7 @@ def save_dataset_split(
         if has_masks
         else None
     )
+    stm_mm = np.memmap(stm_path, dtype=np.uint8, mode="w+", shape=(num_samples,))
 
     try:
         for i, pos in enumerate(positions):
@@ -267,6 +289,7 @@ def save_dataset_split(
             outcomes_mm[i] = pos.outcome
             game_ids_mm[i] = pos.game_id
             plies_mm[i] = pos.ply
+            stm_mm[i] = pos.stm
             if masks_mm is not None:
                 masks_mm[i] = pos.legal_mask
 
@@ -275,10 +298,11 @@ def save_dataset_split(
         outcomes_mm.flush()
         game_ids_mm.flush()
         plies_mm.flush()
+        stm_mm.flush()
         if masks_mm is not None:
             masks_mm.flush()
     finally:
-        for mm in (planes_mm, moves_mm, outcomes_mm, game_ids_mm, plies_mm, masks_mm):
+        for mm in (planes_mm, moves_mm, outcomes_mm, game_ids_mm, plies_mm, masks_mm, stm_mm):
             if mm is None:
                 continue
             try:
@@ -295,7 +319,19 @@ def save_dataset_split(
         "dtype_outcomes": "uint8",
         "dtype_game_ids": "uint64",
         "dtype_plies": "int16",
-        "schema_version": 2,
+        "dtype_stm": "uint8 (1 = white to move, 0 = black)",
+        # SCHEMA_VERSION constant (not a hardcoded 2): the validator compares
+        # this field against dataset_contract.SCHEMA_VERSION, and the
+        # discrepancy made helper-built splits fail validation (SLQ-08).
+        "schema_version": SCHEMA_VERSION,
+        # Role declaration (SL-01/F-04 contract): the games builder produces
+        # mover-relative WDL supervision for every replayed position.
+        "role": "games_wdl",
+        "label_semantics": {
+            "role": "games_wdl",
+            "outcome_encoding": "mover perspective: 0=win, 1=draw, 2=loss, 255=masked",
+            "wdl_supervised": True,
+        },
     }
     if has_masks:
         metadata["dtype_masks"] = "uint8-bitpacked-4672"
@@ -317,6 +353,7 @@ def _flush_positions_chunk(
     f_game_ids: Any,
     f_plies: Any,
     f_masks: Any = None,
+    f_stm: Any = None,
 ) -> None:
     """Pack and flush a chunk of PositionData to binary file handles."""
     n = len(positions)
@@ -330,6 +367,7 @@ def _flush_positions_chunk(
     masks_arr = (
         np.empty((n, PositionData.MASK_PACKED_BYTES), dtype=np.uint8) if f_masks is not None else None
     )
+    stm_arr = np.empty(n, dtype=np.uint8) if f_stm is not None else None
 
     for i, p in enumerate(positions):
         planes_arr[i] = p.planes
@@ -337,6 +375,8 @@ def _flush_positions_chunk(
         outcomes_arr[i] = p.outcome
         game_ids_arr[i] = p.game_id
         plies_arr[i] = p.ply
+        if stm_arr is not None:
+            stm_arr[i] = p.stm
         if masks_arr is not None:
             if p.legal_mask is None:
                 raise ValueError("masks stream provided but a position lacks a legal mask")
@@ -347,6 +387,8 @@ def _flush_positions_chunk(
     f_outcomes.write(outcomes_arr.tobytes())
     f_game_ids.write(game_ids_arr.tobytes())
     f_plies.write(plies_arr.tobytes())
+    if f_stm is not None:
+        f_stm.write(stm_arr.tobytes())
     if f_masks is not None:
         f_masks.write(masks_arr.tobytes())
 
@@ -369,9 +411,11 @@ def build_binary_dataset(
     out_dir = Path(output_dir)
     train_dir = out_dir / "train"
     val_dir = out_dir / "val"
+    test_dir = out_dir / "test"
 
     train_dir.mkdir(parents=True, exist_ok=True)
     val_dir.mkdir(parents=True, exist_ok=True)
+    test_dir.mkdir(parents=True, exist_ok=True)
 
     # Pre-check disk space (at least 200 MB free)
     try:
@@ -383,17 +427,22 @@ def build_binary_dataset(
     except Exception as e:
         logger.debug("Disk usage check warning: %s", e)
 
-    train_part_paths = {
-        "planes": train_dir / "planes.bin.part",
-        "moves": train_dir / "moves.bin.part",
-        "outcomes": train_dir / "outcomes.bin.part",
-        "game_ids": train_dir / "game_ids.bin.part",
-        "plies": train_dir / "plies.bin.part",
-        "masks": train_dir / "masks.bin.part",
-    }
+    def _part_paths(split_dir: Path) -> dict[str, Path]:
+        return {
+            "planes": split_dir / "planes.bin.part",
+            "moves": split_dir / "moves.bin.part",
+            "outcomes": split_dir / "outcomes.bin.part",
+            "game_ids": split_dir / "game_ids.bin.part",
+            "plies": split_dir / "plies.bin.part",
+            "masks": split_dir / "masks.bin.part",
+            "stm": split_dir / "stm.bin.part",
+        }
+
+    train_part_paths = _part_paths(train_dir)
 
     train_chunk: list[PositionData] = []
     candidate_val_positions: list[PositionData] = []
+    candidate_test_positions: list[PositionData] = []
     # Serialized-state identity of every accepted train position: val dedup
     # keys on the exact encoded bytes, not the C++ engine hash (which can
     # distinguish states the encoder renders identically).
@@ -401,6 +450,7 @@ def build_binary_dataset(
 
     train_games_count = 0
     val_games_count = 0
+    test_games_count = 0
     total_games_seen = 0
     n_train = 0
     # Exact-duplicate game handling (audit F-03): games with identical content
@@ -417,6 +467,7 @@ def build_binary_dataset(
             open(train_part_paths["game_ids"], "wb") as f_tr_game_ids,
             open(train_part_paths["plies"], "wb") as f_tr_plies,
             open(train_part_paths["masks"], "wb") as f_tr_masks,
+            open(train_part_paths["stm"], "wb") as f_tr_stm,
         ):
             with contextlib.ExitStack() as stack:
                 if isinstance(pgn_path_or_stream, (str, Path)):
@@ -432,7 +483,7 @@ def build_binary_dataset(
                         break
                     total_games_seen += 1
 
-                    game_id, is_val, pos_list = process_pgn_game(game)
+                    game_id, split, pos_list = process_pgn_game(game)
                     if not pos_list:
                         continue
 
@@ -445,9 +496,12 @@ def build_binary_dataset(
                         continue
                     seen_games[game_id] = res_raw
 
-                    if is_val:
+                    if split == "val":
                         val_games_count += 1
                         candidate_val_positions.extend(pos_list)
+                    elif split == "test":
+                        test_games_count += 1
+                        candidate_test_positions.extend(pos_list)
                     else:
                         train_games_count += 1
                         for p in pos_list:
@@ -464,6 +518,7 @@ def build_binary_dataset(
                                 f_tr_game_ids,
                                 f_tr_plies,
                                 f_masks=f_tr_masks,
+                                f_stm=f_tr_stm,
                             )
                             train_chunk.clear()
 
@@ -477,6 +532,7 @@ def build_binary_dataset(
                                     ("parsed_games", total_games_seen),
                                     ("train_games", train_games_count),
                                     ("val_games", val_games_count),
+                                    ("test_games", test_games_count),
                                     ("train_positions", n_train),
                                 ]
                             )
@@ -492,6 +548,7 @@ def build_binary_dataset(
                     f_tr_game_ids,
                     f_tr_plies,
                     f_masks=f_tr_masks,
+                    f_stm=f_tr_stm,
                 )
                 train_chunk.clear()
 
@@ -511,6 +568,7 @@ def build_binary_dataset(
             "dtype_outcomes": "uint8",
             "dtype_game_ids": "uint64",
             "dtype_plies": "int16",
+            "dtype_stm": "uint8 (1 = white to move, 0 = black)",
             "schema_version": SCHEMA_VERSION,
             "role": "games_wdl",
             "label_semantics": {
@@ -518,6 +576,10 @@ def build_binary_dataset(
                 "outcome_encoding": "mover perspective: 0=win, 1=draw, 2=loss, 255=masked",
                 "wdl_supervised": True,
             },
+            "split_rule": (
+                "hash_game_id(game_id) % 100: <2 -> val, 2..<3 -> test (independent "
+                "held-out set, audit SLQ-09), else train"
+            ),
             "game_identity_rule": (
                 "sha256 game identity: Site URL last segment when present, else "
                 "Date_White_Black + sha256(mainline UCI) digest (audit F-03)"
@@ -537,76 +599,110 @@ def build_binary_dataset(
                 final_val_positions.append(pos)
 
         n_val_final = len(final_val_positions)
-        val_part_paths = {
-            "planes": val_dir / "planes.bin.part",
-            "moves": val_dir / "moves.bin.part",
-            "outcomes": val_dir / "outcomes.bin.part",
-            "game_ids": val_dir / "game_ids.bin.part",
-            "plies": val_dir / "plies.bin.part",
-            "masks": val_dir / "masks.bin.part",
-        }
 
-        with (
-            open(val_part_paths["planes"], "wb") as f_val_planes,
-            open(val_part_paths["moves"], "wb") as f_val_moves,
-            open(val_part_paths["outcomes"], "wb") as f_val_outcomes,
-            open(val_part_paths["game_ids"], "wb") as f_val_game_ids,
-            open(val_part_paths["plies"], "wb") as f_val_plies,
-            open(val_part_paths["masks"], "wb") as f_val_masks,
-        ):
-            for start_idx in range(0, n_val_final, chunk_size):
-                end_idx = min(start_idx + chunk_size, n_val_final)
-                _flush_positions_chunk(
-                    final_val_positions[start_idx:end_idx],
-                    f_val_planes,
-                    f_val_moves,
-                    f_val_outcomes,
-                    f_val_game_ids,
-                    f_val_plies,
-                    f_masks=f_val_masks,
-                )
+        # The test split must be independent of BOTH train and the final val
+        # split (audit SLQ-09): a position whose exact encoded state survives
+        # in train or val cannot serve as test data.
+        val_state_keys = {pos.state_key for pos in final_val_positions}
+        final_test_positions: list[PositionData] = []
+        test_removed_count = 0
+        for pos in candidate_test_positions:
+            if pos.state_key in train_state_keys or pos.state_key in val_state_keys:
+                test_removed_count += 1
+            else:
+                final_test_positions.append(pos)
 
-        # Atomically rename val part files to final .bin files
-        for key, part_p in val_part_paths.items():
-            final_p = val_dir / f"{key}.bin"
-            if part_p.exists():
-                part_p.replace(final_p)
+        n_test_final = len(final_test_positions)
 
-        # Write val metadata.json
-        val_metadata = {
-            "split": "val",
-            "num_samples": n_val_final,
-            "planes_shape": [19, 8, 8],
-            "dtype_planes": "float32",
-            "dtype_moves": "int16",
-            "dtype_outcomes": "uint8",
-            "dtype_game_ids": "uint64",
-            "dtype_plies": "int16",
-            "schema_version": SCHEMA_VERSION,
-            "role": "games_wdl",
-            "label_semantics": {
+        def _write_candidate_split(
+            split_dir: Path,
+            split_name: str,
+            positions: list[PositionData],
+            candidate_count: int,
+            dedup_removed: int,
+        ) -> None:
+            part_paths = _part_paths(split_dir)
+            with (
+                open(part_paths["planes"], "wb") as fp,
+                open(part_paths["moves"], "wb") as fm,
+                open(part_paths["outcomes"], "wb") as fo,
+                open(part_paths["game_ids"], "wb") as fg,
+                open(part_paths["plies"], "wb") as fl,
+                open(part_paths["masks"], "wb") as fk,
+                open(part_paths["stm"], "wb") as fs,
+            ):
+                for start_idx in range(0, len(positions), chunk_size):
+                    end_idx = min(start_idx + chunk_size, len(positions))
+                    _flush_positions_chunk(
+                        positions[start_idx:end_idx],
+                        fp,
+                        fm,
+                        fo,
+                        fg,
+                        fl,
+                        f_masks=fk,
+                        f_stm=fs,
+                    )
+            for key, part_p in part_paths.items():
+                final_p = split_dir / f"{key}.bin"
+                if part_p.exists():
+                    part_p.replace(final_p)
+
+            metadata = {
+                "split": split_name,
+                "num_samples": len(positions),
+                "planes_shape": [19, 8, 8],
+                "dtype_planes": "float32",
+                "dtype_moves": "int16",
+                "dtype_outcomes": "uint8",
+                "dtype_game_ids": "uint64",
+                "dtype_plies": "int16",
+                "dtype_stm": "uint8 (1 = white to move, 0 = black)",
+                "schema_version": SCHEMA_VERSION,
                 "role": "games_wdl",
-                "outcome_encoding": "mover perspective: 0=win, 1=draw, 2=loss, 255=masked",
-                "wdl_supervised": True,
-            },
-            "game_identity_rule": (
-                "sha256 game identity: Site URL last segment when present, else "
-                "Date_White_Black + sha256(mainline UCI) digest (audit F-03)"
-            ),
-            "candidate_val_positions": len(candidate_val_positions),
-            "dedup_removed_positions": removed_count,
-        }
-        with open(val_dir / "metadata.json", "w", encoding="utf-8") as f:
-            json.dump(val_metadata, f, indent=2)
+                "label_semantics": {
+                    "role": "games_wdl",
+                    "outcome_encoding": "mover perspective: 0=win, 1=draw, 2=loss, 255=masked",
+                    "wdl_supervised": True,
+                },
+                "split_rule": (
+                    "hash_game_id(game_id) % 100: <2 -> val, 2..<3 -> test (independent "
+                    "held-out set, audit SLQ-09), else train"
+                ),
+                "game_identity_rule": (
+                    "sha256 game identity: Site URL last segment when present, else "
+                    "Date_White_Black + sha256(mainline UCI) digest (audit F-03)"
+                ),
+                "candidate_positions": candidate_count,
+                "dedup_removed_positions": dedup_removed,
+                "dedup_rule": (
+                    "positions whose exact serialized-state identity (MD5 of encoded "
+                    "planes) occurs in an earlier split are dropped"
+                ),
+            }
+            with open(split_dir / "metadata.json", "w", encoding="utf-8") as f:
+                json.dump(metadata, f, indent=2)
+
+        _write_candidate_split(
+            val_dir, "val", final_val_positions, len(candidate_val_positions), removed_count
+        )
+        _write_candidate_split(
+            test_dir,
+            "test",
+            final_test_positions,
+            len(candidate_test_positions),
+            test_removed_count,
+        )
 
     except Exception:
         # Clean up partial files on failure
-        for p in list(train_part_paths.values()) + list(val_dir.glob("*.bin.part")):
-            if p.exists():
-                try:
-                    p.unlink()
-                except OSError:
-                    pass
+        for split_dir in (train_dir, val_dir, test_dir):
+            for p in split_dir.glob("*.bin.part"):
+                if p.exists():
+                    try:
+                        p.unlink()
+                    except OSError:
+                        pass
         raise
 
     print("\n" + "=" * 60)
@@ -619,11 +715,17 @@ def build_binary_dataset(
     print(
         f"Validation games:                {val_games_count} ({(val_games_count / max(1, total_games_seen) * 100):.1f}%)"
     )
+    print(
+        f"Test games:                      {test_games_count} ({(test_games_count / max(1, total_games_seen) * 100):.1f}%)"
+    )
     print(f"Training positions:              {n_train}")
     print(f"Candidate validation positions:  {len(candidate_val_positions)}")
     pct_removed = (removed_count / max(1, len(candidate_val_positions))) * 100
     print(f"Validation positions removed:    {removed_count} ({pct_removed:.2f}%)")
     print(f"Final validation positions:      {n_val_final}")
+    print(f"Candidate test positions:        {len(candidate_test_positions)}")
+    print(f"Test positions removed:          {test_removed_count}")
+    print(f"Final test positions:            {n_test_final}")
     print(f"Duplicate games skipped:         {duplicate_games}")
     print(f"Conflicting duplicate games:     {conflicting_duplicate_games}")
     print("=" * 60 + "\n")
@@ -640,8 +742,8 @@ def build_binary_dataset(
     else:
         source_identity = {"kind": "TextIO stream (not hashable)"}
 
-    output_hashes: dict[str, dict[str, str]] = {"train": {}, "val": {}}
-    for split_name, split_dir in (("train", train_dir), ("val", val_dir)):
+    output_hashes: dict[str, dict[str, str]] = {"train": {}, "val": {}, "test": {}}
+    for split_name, split_dir in (("train", train_dir), ("val", val_dir), ("test", test_dir)):
         for array_file in sorted(split_dir.glob("*.bin")) + [split_dir / "metadata.json"]:
             if array_file.is_file():
                 output_hashes[split_name][array_file.name] = sha256_file(array_file)
@@ -650,8 +752,13 @@ def build_binary_dataset(
         builder="python.data.build_dataset.build_binary_dataset",
         source=source_identity,
         config={
-            "split_rule": "hash_game_id(game_id) % 100 < 2 -> val, else train",
+            "split_rule": (
+                "hash_game_id(game_id) % 100: <2 -> val, 2..<3 -> test (independent "
+                "held-out set, audit SLQ-09), else train"
+            ),
             "val_dedup": "val positions whose exact serialized-state identity (MD5 of encoded planes) occurs in train are dropped",
+            "test_dedup": "test positions whose exact serialized-state identity occurs in train OR the final val split are dropped",
+            "stm_sidecar": "stm.bin uint8 (1 = white to move, 0 = black), stored per position because the 19-plane encoder is side-relative",
             "max_games": max_games,
             "chunk_size": chunk_size,
         },
@@ -665,10 +772,14 @@ def build_binary_dataset(
             "total_games_seen": total_games_seen,
             "train_games": train_games_count,
             "val_games": val_games_count,
+            "test_games": test_games_count,
             "train_positions": n_train,
             "candidate_val_positions": len(candidate_val_positions),
             "dedup_removed_val_positions": removed_count,
             "final_val_positions": n_val_final,
+            "candidate_test_positions": len(candidate_test_positions),
+            "dedup_removed_test_positions": test_removed_count,
+            "final_test_positions": n_test_final,
             "duplicate_games_skipped": duplicate_games,
             "conflicting_duplicate_games_skipped": conflicting_duplicate_games,
         },
