@@ -67,8 +67,19 @@ class InferenceServer:
         # module reference under this lock and forwards outside it (lock-free
         # steady state); load holds it for the whole swap (predicts stall
         # only during a reload, ~1s for 8.6M params). No torn reads.
-        # Created before any load_checkpoint() call in __init__.
+        # Created before any load_checkpoint() call in __init__ and it is the
+        # ONLY lock instance (audit L-2: a second allocation used to replace
+        # this one after construction; one lock, created before first use).
         self._weights_lock = threading.RLock()
+
+        # Hot-reload outcome tracking (audit L-3): a failed candidate never
+        # touches the active model, but the failure must be observable —
+        # callers compare model_version and/or read these fields instead of
+        # scraping logs.  ``active_checkpoint_path`` is the identity of the
+        # weights currently being served (None = in-memory/unbacked).
+        self.last_reload_error: Optional[str] = None
+        self.reload_failure_count: int = 0
+        self.active_checkpoint_path: Optional[str] = None
 
         # Load or create model
         if model is not None:
@@ -88,13 +99,6 @@ class InferenceServer:
             self.model = self.model.to(memory_format=torch.channels_last)
 
         self.model.eval()
-
-        # Hot-reload lock: load_checkpoint() swaps weights in place while
-        # predict_batch() forwards may be running. Takers: predict grabs the
-        # module reference under this lock and forwards outside it (lock-free
-        # steady state); load holds it for the whole swap (predicts stall
-        # only during a reload, ~1s for 8.6M params). No torn reads.
-        self._weights_lock = threading.RLock()
 
         # Telemetry metrics
         self.total_evaluations = 0
@@ -141,6 +145,27 @@ class InferenceServer:
                 num_filters = int(stem.shape[0])
         return ChessNet(num_blocks=num_blocks, num_filters=num_filters)
 
+    def _record_reload_failure(self, path: str, what: str, reason: str) -> int:
+        """Record a rejected hot-reload candidate; return the unchanged version.
+
+        The active model is untouched by construction (the candidate is only
+        ever a fresh off-side module).  This helper makes the failure
+        observable: an ERROR log naming the retained weights, a machine-
+        readable ``last_reload_error``, and a failure counter.
+        """
+        self.last_reload_error = f"{path}: {what}: {reason}"
+        self.reload_failure_count += 1
+        logger.error(
+            "HOT-RELOAD FAILED (%s): %s — the checkpoint was NOT activated; keeping "
+            "active weights %s (model version %d). Reason: %s",
+            what,
+            path,
+            self.active_checkpoint_path or "<in-memory>",
+            self.model_version,
+            reason,
+        )
+        return self.model_version
+
     def load_checkpoint(self, path: str, sync_event: Optional[Any] = None) -> int:
         """Hot-reload model weights without restarting server.
 
@@ -148,8 +173,14 @@ class InferenceServer:
         off to the side, then published under the hot-reload lock by swapping
         the reference. In-flight forwards keep the old module alive by
         refcount and are never torn. Increments model_version monotonically
-        and tags all future responses. On failure the old weights are kept
-        and the current version returned.
+        and tags all future responses.
+
+        Failure contract (audit L-3): a missing, unreadable, structurally
+        invalid, or architecture-incompatible candidate never touches the
+        active model.  The returned version then equals the pre-call version
+        (success always increments) and ``last_reload_error`` /
+        ``reload_failure_count`` record why.  ``_hot_reload_and_report`` is
+        the loud wrapper used by the serving loop.
         """
         if sync_event is not None and self.stream is not None:
             try:
@@ -160,9 +191,9 @@ class InferenceServer:
         logger.info(f"Loading checkpoint from {path}...")
         try:
             ckpt = torch.load(path, map_location=self.device, weights_only=True)
-        except Exception:
+        except Exception as e:
             logger.exception("Failed to load checkpoint %s; keeping old weights", path)
-            return self.model_version
+            return self._record_reload_failure(path, "unreadable checkpoint", str(e))
 
         # Determine state dict key
         if isinstance(ckpt, dict):
@@ -184,14 +215,18 @@ class InferenceServer:
             new_model.eval()
             if self.channels_last and self.device.type == "cuda":
                 new_model = new_model.to(memory_format=torch.channels_last)
-        except Exception:
+        except Exception as e:
             logger.exception("Invalid checkpoint %s; keeping old weights", path)
-            return self.model_version
+            return self._record_reload_failure(path, "invalid checkpoint", str(e))
         with self._weights_lock:
             self.model = new_model
             self.model_version += 1
             new_version = self.model_version
-        logger.info(f"Successfully reloaded checkpoint. New model version: {new_version}")
+            self.active_checkpoint_path = str(path)
+        self.last_reload_error = None
+        logger.info(
+            "Successfully reloaded checkpoint %s. New model version: %d", path, new_version
+        )
         return new_version
 
     def load_state_dict_weights(
@@ -204,12 +239,17 @@ class InferenceServer:
         Safe across streams and devices: waits on sync_event if provided,
         constructs new model instance off to the side, transfers tensors to
         self.device, and publishes under the hot-reload lock.
+
+        Same failure contract as :meth:`load_checkpoint` (audit L-3): on
+        rejection the version is unchanged and ``last_reload_error`` records
+        the reason; the caller (RLTrainer.push_weights) fail-closes on the
+        version delta so trainer and server weights never diverge.
         """
         if sync_event is not None and self.stream is not None:
             try:
                 self.stream.wait_event(sync_event)
             except Exception as e:
-                logger.debug("wait_event failed: %s", e)
+                logger.debug("wait_event failed on stream: %s", e)
 
         try:
             cur_blocks = getattr(self.model, "num_blocks", 12)
@@ -223,16 +263,25 @@ class InferenceServer:
             new_model.eval()
             if self.channels_last and self.device.type == "cuda":
                 new_model = new_model.to(memory_format=torch.channels_last)
-        except Exception:
+        except Exception as e:
             logger.exception("Failed to load state_dict weights; keeping old weights")
-            return self.model_version
+            return self._record_reload_failure(
+                "<state_dict push>", "invalid state dict", str(e)
+            )
 
         with self._weights_lock:
             self.model = new_model
             self.model_version += 1
             new_version = self.model_version
+            self.active_checkpoint_path = "<state_dict push>"
+        self.last_reload_error = None
         logger.info(f"Successfully reloaded weights from state_dict. New version: {new_version}")
         return new_version
+
+    @property
+    def reload_ok(self) -> bool:
+        """True when the most recent reload attempt (if any) succeeded."""
+        return self.last_reload_error is None
 
     @torch.no_grad()
     def predict_batch(
@@ -323,6 +372,28 @@ class InferenceServer:
         return avg_batch_size, avg_latency_ms, fill_rate
 
 
+def _hot_reload_and_report(server: InferenceServer, checkpoint_path: str) -> int:
+    """Apply one hot-reload request and make non-activation loud (audit L-3).
+
+    ``load_checkpoint`` keeps the active weights on failure; this wrapper
+    turns the silent-stale outcome into an explicit, orchestrator-visible
+    ERROR naming the retained weights and the recorded failure reason.
+    Success is exactly "the returned version increased".
+    """
+    version_before = server.model_version
+    new_version = server.load_checkpoint(checkpoint_path)
+    if new_version == version_before:
+        logger.error(
+            "HOT-RELOAD REQUEST DID NOT ACTIVATE: %s (still model version %d, active "
+            "weights %s). Continuing with the existing weights. Reason: %s",
+            checkpoint_path,
+            version_before,
+            getattr(server, "active_checkpoint_path", None) or "<in-memory>",
+            getattr(server, "last_reload_error", None) or "unknown",
+        )
+    return new_version
+
+
 def run_inference_server_process(
     shm_pool_prefix: str,
     capacity: int,
@@ -381,7 +452,7 @@ def run_inference_server_process(
                     pass
                 if latest_ckpt is not None:
                     try:
-                        server.load_checkpoint(latest_ckpt)
+                        _hot_reload_and_report(server, latest_ckpt)
                     except (RuntimeError, OSError, KeyError, ValueError) as e:
                         logger.error("Failed to hot-reload checkpoint %s: %s", latest_ckpt, e)
 
