@@ -200,19 +200,45 @@ def test_auto_resume_unstamped_healthy_sgd_selected(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def _make_trainer(tmp_path, name: str) -> RLTrainer:
-    buf = ReplayBuffer(buffer_dir=tmp_path / f"buf_{name}", capacity=100, create_new=True)
+def _one_hot(slot: int) -> np.ndarray:
+    """Normalized one-hot visit distribution (valid policy target, SR-07)."""
+    v = np.zeros(4672, dtype=np.float32)
+    v[slot] = 1.0
+    return v
+
+
+def _make_trainer(tmp_path, name: str, reopen: bool = False) -> RLTrainer:
+    """Build a trainer on a synthetic buffer.
+
+    ``reopen=True`` reopens an EXISTING buffer directory (same buffer id and
+    generation, no reset) — the legitimate same-buffer resume case of the
+    audit SR-04 contract.
+    """
+    buf = ReplayBuffer(
+        buffer_dir=tmp_path / f"buf_{name}", capacity=100, create_new=not reopen
+    )
+    if reopen:
+        model = ChessNet(num_blocks=2, num_filters=32)
+        return RLTrainer(
+            model=model,
+            replay_buffer=buf,
+            batch_size=8,
+            warmup_steps=5,
+            total_steps=100,
+            checkpoint_dir=tmp_path / f"ckpt_{name}",
+            sync_weights_path=tmp_path / f"sync_{name}.pt",
+        )
     # A few positions so train_step can sample immediately.
     positions = []
     for i in range(16):
         positions.append(
             SavedPosition(
-                planes=np.random.randn(19, 8, 8).astype(np.float32),
-                visits=np.zeros(4672, dtype=np.float32),
+                planes=(np.random.rand(19, 8, 8) < 0.5).astype(np.float32),
+                visits=_one_hot(i % 4672),
                 outcome=i % 3,
                 is_full_search=True,
                 model_version=1,
-                game_id=i,
+                game_id=i + 1,
             )
         )
     buf.add_positions(positions)
@@ -262,12 +288,23 @@ def test_rl_resume_keeps_step_counter_and_momentum(tmp_path):
     assert saved["step"] == 1
     assert "inherited_supervised_step" not in saved or saved["inherited_supervised_step"] == 0
 
-    trainer2 = _make_trainer(tmp_path, "c")
+    # Same-buffer resume (audit SR-04): reopening the SAME buffer directory
+    # is a matching/legitimately-ahead state and must restore step+momentum.
+    trainer2 = _make_trainer(tmp_path, "b", reopen=True)
     trainer2.load_checkpoint(p)
     assert trainer2.step_num == 1
     # Momentum buffers survived the round trip.
     state = trainer2.optimizer.state_dict()["state"]
     assert any("momentum_buffer" in per_param for per_param in state.values())
+
+    # A checkpoint paired with a DIFFERENT buffer directory fails closed
+    # unless the operator overrides it explicitly (SR-04).
+    from python.train.train_rl import BufferCheckpointMismatchError
+
+    trainer3 = _make_trainer(tmp_path, "c")
+    with pytest.raises(BufferCheckpointMismatchError):
+        trainer3.load_checkpoint(p)
+    assert trainer3.load_checkpoint(p, allow_buffer_mismatch=True) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -336,12 +373,12 @@ def test_gpu_cache_restore_preserves_real_versions(tmp_path):
     for i in range(n):
         positions.append(
             types.SimpleNamespace(
-                planes=_row(float(i)),
-                visits=np.zeros(4672, dtype=np.float32),
+                planes=_row(1.0),
+                visits=_one_hot(i % 4672),
                 outcome=int(i % 3),
                 is_full_search=True,
                 model_version=int(versions[i]),
-                game_id=i,
+                game_id=i + 1,
             )
         )
     buf.add_positions(positions)

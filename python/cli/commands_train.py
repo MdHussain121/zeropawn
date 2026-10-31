@@ -45,6 +45,68 @@ class ExplicitTrackingAction(argparse.Action):
         explicit.add(self.dest)
 
 
+def _ensure_data_gate_arguments(parser: argparse.ArgumentParser) -> None:
+    """Register the data-gate / provenance flags needed by BOTH train modes.
+
+    Audit SR-02: the RL path constructs ReplayBuffer, whose human-data
+    consumption gate requires an explicit ``data_role`` (or a metadata-declared
+    role) and an explicit ``allow_uncertified_data`` opt-in for uncertified
+    datasets — but ``zeropawn train`` exposed neither flag, making the intended
+    RL workflow unreachable from the CLI (the standalone
+    ``scripts/run_phase4_rl.py`` has had both for its whole life). These are
+    the SAME gates, now merely reachable: the flags do not weaken the gate —
+    an undeclared/uncertified dataset is still refused unless the operator
+    states the role and/or accepts the loud UNCERTIFIED warning.
+
+    Registration is idempotent (checked against the parser's existing options)
+    so this helper can coexist with another registration site for the same
+    flags without producing a duplicate-option ``ArgumentError``.
+    """
+    existing = {opt for action in parser._actions for opt in action.option_strings}
+    additions = [
+        (
+            ("--data-role",),
+            dict(
+                choices=("games_wdl", "policy_tactics", "endgame_syzygy", "unified"),
+                default=None,
+                help="Explicit role for the human replay dataset (default: from dataset "
+                "metadata; unclassified datasets are refused by the fail-closed data gate)",
+            ),
+        ),
+        (
+            ("--allow-uncertified-data",),
+            dict(
+                action="store_true",
+                default=False,
+                help="Consume human/tactic datasets without valid validation receipts "
+                "(loud UNCERTIFIED warning; role/label invariants still apply).",
+            ),
+        ),
+        (
+            ("--allow-uncertified-eval",),
+            dict(
+                action="store_true",
+                default=False,
+                help="Run with an uncertified evaluation puzzle set (results are NOT certified).",
+            ),
+        ),
+        (
+            ("--no-require-certified-eval",),
+            dict(
+                dest="require_certified_eval",
+                action="store_false",
+                default=True,
+                help="Do not abort when the evaluation puzzle set is uncertified.",
+            ),
+        ),
+    ]
+    for option_strings, kwargs in additions:
+        if any(opt in existing for opt in option_strings):
+            continue
+        parser.add_argument(*option_strings, **kwargs)
+        existing.update(option_strings)
+
+
 class ExplicitTrackingStoreTrueAction(argparse._StoreTrueAction):
     """Custom argparse Action for boolean flags that records explicit supply."""
 
@@ -443,7 +505,17 @@ def register_parser(subparsers: argparse._SubParsersAction) -> None:
         default=0.001,
         help="Policy entropy bonus coefficient in total loss (default: 0.001)",
     )
+    parser.add_argument(
+        "--allow-buffer-mismatch",
+        action="store_true",
+        default=False,
+        help=(
+            "Allow resuming from a checkpoint whose stored buffer snapshot contradicts the "
+            "live replay buffer (loudly logged; the live buffer state is never rewound)."
+        ),
+    )
     # ────────────────────────────────────────────────────────────────────────
+    _ensure_data_gate_arguments(parser)
     _add_supervised_arguments(parser)
     parser.set_defaults(func=run_training)
 
@@ -1409,6 +1481,14 @@ def run_training(args: argparse.Namespace) -> int:
                 seed=getattr(args, "seed", None),
                 policy_target_temp=getattr(args, "policy_target_temp", 0.5),
                 entropy_bonus=getattr(args, "entropy_bonus", 0.001),
+                # Audit SR-02: forward the data gate and buffer-mismatch
+                # overrides so the intended RL workflow is reachable from the
+                # CLI (same gates as the standalone launcher, not weaker ones).
+                data_role=getattr(args, "data_role", None),
+                allow_uncertified_data=bool(getattr(args, "allow_uncertified_data", False)),
+                allow_uncertified_eval=bool(getattr(args, "allow_uncertified_eval", False)),
+                require_certified_eval=bool(getattr(args, "require_certified_eval", True)),
+                allow_buffer_mismatch=bool(getattr(args, "allow_buffer_mismatch", False)),
             )
         else:
             orchestrator = Phase4Orchestrator(
@@ -1448,6 +1528,14 @@ def run_training(args: argparse.Namespace) -> int:
                 seed=getattr(args, "seed", None),
                 policy_target_temp=getattr(args, "policy_target_temp", 0.5),
                 entropy_bonus=getattr(args, "entropy_bonus", 0.001),
+                # Audit SR-02: forward the data gate and buffer-mismatch
+                # overrides so the intended RL workflow is reachable from the
+                # CLI (same gates as the standalone launcher, not weaker ones).
+                data_role=getattr(args, "data_role", None),
+                allow_uncertified_data=bool(getattr(args, "allow_uncertified_data", False)),
+                allow_uncertified_eval=bool(getattr(args, "allow_uncertified_eval", False)),
+                require_certified_eval=bool(getattr(args, "require_certified_eval", True)),
+                allow_buffer_mismatch=bool(getattr(args, "allow_buffer_mismatch", False)),
             )
 
         code = orchestrator.run()

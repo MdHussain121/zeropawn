@@ -169,7 +169,13 @@ def validate_warm_start(
     entry: Optional[Dict[str, Any]] = None
     if registry:
         for rec in registry.get("checkpoints", []):
-            if rec.get("sha256") == info.sha256 or rec.get("sha256", "").startswith(sha16):
+            # Registry records for missing/quarantined artifacts legitimately
+            # carry sha256: null; those must be skipped, not crash the
+            # validator (rec.get("sha256", "") returns None when the key
+            # exists with a null value — `None.startswith` raised
+            # AttributeError and aborted every warm-start construction).
+            rec_sha = rec.get("sha256") or ""
+            if rec_sha and (rec_sha == info.sha256 or rec_sha.startswith(sha16)):
                 entry = rec
                 break
 

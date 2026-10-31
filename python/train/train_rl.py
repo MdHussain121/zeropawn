@@ -41,6 +41,19 @@ class WeightPushError(RuntimeError):
     """
 
 
+class BufferCheckpointMismatchError(RuntimeError):
+    """Raised when a checkpoint's buffer snapshot contradicts the live buffer.
+
+    Audit SR-04: a checkpoint from a different buffer directory, capacity,
+    schema, generation, or with pointer/count arithmetic that does not
+    correspond to appends must never pair silently with whatever buffer the
+    launcher happens to point at. The live buffer state (persisted atomically
+    after every insert) is authoritative and is NEVER rolled backward from a
+    checkpoint; the operator can permit the pairing explicitly with
+    ``allow_buffer_mismatch=True`` (loudly logged).
+    """
+
+
 def _masked_policy_entropy(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """Mean Shannon entropy (nats) of softmax(logits) restricted to ``mask``.
 
@@ -134,6 +147,14 @@ def inspect_rl_checkpoint(path: Union[str, Path]) -> Optional[Dict[str, Any]]:
         "step": int(ckpt.get("step", 0) or 0),
         "optimizer_class": classify_optimizer_state(ckpt),
         "model_version": ckpt.get("model_version"),
+        # Checkpoint type stamp (audit SR-03): "rl" for trainer checkpoints;
+        # None for pre-stamp legacy files; other values (e.g. "finetune") are
+        # never eligible for RL resume.
+        "checkpoint_type": ckpt.get("checkpoint_type"),
+        # Buffer association (audit SR-04): the full snapshot when present,
+        # the legacy write-head/size pair otherwise.
+        "buffer_state": ckpt.get("buffer_state"),
+        "buffer_size": ckpt.get("buffer_size"),
         "buffer_write_head": ckpt.get("buffer_write_head"),
         "last_push_step": ckpt.get("last_push_step"),
         "mtime": p.stat().st_mtime,
@@ -232,6 +253,17 @@ class RLTrainer:
         self.inherited_step_num = 0
         self.warm_start_path: Optional[str] = None
         self.warm_start_step: Optional[int] = None
+        # Run provenance written into every checkpoint and by the orchestrator
+        # (run_id, warm-start record, run_status, termination time, ...).
+        self.run_metadata: Dict[str, Any] = {}
+        # Sampling provenance of the most recent batch (set in train_step).
+        self._last_sampling_stats: Dict[str, Any] = {
+            "sample_source": "none",
+            "sampled_selfplay_rows": 0,
+            "sampled_rows_with_game_id": 0,
+            "sampled_unique_games": 0,
+            "staleness_fallbacks": 0,
+        }
 
         # Dedicated non-default CUDA stream for training pipeline
         if self.device.type == "cuda":
@@ -363,6 +395,7 @@ class RLTrainer:
         scheduler_override: bool = True,
         reset_step: bool = False,
         warm_start: bool = False,
+        allow_buffer_mismatch: bool = False,
     ) -> int:
         """Resume training from a checkpoint.
 
@@ -372,6 +405,17 @@ class RLTrainer:
         (supervised) run, so RL progress restarts at 0 and the inherited
         counter is kept only as provenance metadata. Resuming this run's own
         checkpoint uses the default.
+
+        Buffer synchronization contract (audit SR-04): on a full resume the
+        checkpoint's stored buffer snapshot (``buffer_state``, or the legacy
+        ``buffer_size``/``buffer_write_head`` pair) must be consistent with the
+        LIVE buffer — ``match`` or a verifiably appended ``ahead`` state. Any
+        other combination raises :class:`BufferCheckpointMismatchError` unless
+        ``allow_buffer_mismatch=True`` is set explicitly (loudly logged). The
+        live buffer pointer is NEVER overwritten from the checkpoint: its own
+        meta is persisted atomically after every insert and is at least as
+        fresh as any checkpoint written from it, so restoring the pointer from
+        a checkpoint could only roll it backward and overwrite newer records.
         """
         path_str = str(path)
         reset_step = bool(reset_step or warm_start)
@@ -477,15 +521,67 @@ class RLTrainer:
                     self.entropy_bonus,
                 )
 
-        if ckpt.get("buffer_write_head") is not None and hasattr(self.replay_buffer, "write_head"):
-            try:
-                head = int(ckpt["buffer_write_head"])
-                cap = getattr(self.replay_buffer, "capacity", None)
-                if cap and cap > 0:
-                    head = head % cap
-                self.replay_buffer.write_head = head
-            except (ValueError, TypeError):
-                logger.debug("Ignoring invalid buffer_write_head in '%s'", path_str)
+        # ── Buffer <-> checkpoint consistency (audit SR-04) ────────────────
+        # The live buffer's own meta.json (atomic fsync + replace after every
+        # insert) is the authoritative state; the checkpoint snapshot is a
+        # consistency ASSERTION, never a restore source for the pointer.
+        snapshot = ckpt.get("buffer_state")
+        if snapshot is None and (
+            ckpt.get("buffer_size") is not None or ckpt.get("buffer_write_head") is not None
+        ):
+            snapshot = {
+                "size": ckpt.get("buffer_size"),
+                "write_head": ckpt.get("buffer_write_head"),
+            }
+        if snapshot is not None:
+            live = getattr(self.replay_buffer, "snapshot", None)
+            classify = getattr(self.replay_buffer, "checkpoint_consistency", None)
+            if callable(live) and callable(classify):
+                verdict, detail = classify(snapshot)
+                if verdict == "match":
+                    logger.info("[BUFFER] checkpoint/buffer snapshot matches live state (%s)", detail)
+                elif verdict == "ahead":
+                    logger.info(
+                        "[BUFFER] live buffer is ahead of the checkpoint snapshot (%s); "
+                        "keeping the live state (pointer is never rewound)",
+                        detail,
+                    )
+                else:
+                    message = (
+                        f"Checkpoint '{path_str}' buffer snapshot is inconsistent with the live "
+                        f"replay buffer: {detail}. The live buffer state (size="
+                        f"{getattr(self.replay_buffer, 'size', '?')}, write_head="
+                        f"{getattr(self.replay_buffer, 'write_head', '?')}) is authoritative; "
+                        "refusing to pair this checkpoint with it unless --allow-buffer-mismatch "
+                        "is passed explicitly."
+                    )
+                    if not allow_buffer_mismatch:
+                        raise BufferCheckpointMismatchError(message)
+                    logger.warning(
+                        "[BUFFER OVERRIDE] Proceeding despite buffer/checkpoint mismatch "
+                        "(audited explicitly): %s",
+                        detail,
+                    )
+            else:
+                # Buffer object without the snapshot API (minimal test doubles):
+                # fall back to the legacy write-head restore for compatibility.
+                if ckpt.get("buffer_write_head") is not None and hasattr(
+                    self.replay_buffer, "write_head"
+                ):
+                    try:
+                        head = int(ckpt["buffer_write_head"])
+                        cap = getattr(self.replay_buffer, "capacity", None)
+                        if cap and cap > 0:
+                            head = head % cap
+                        self.replay_buffer.write_head = head
+                    except (ValueError, TypeError):
+                        logger.debug("Ignoring invalid buffer_write_head in '%s'", path_str)
+        else:
+            logger.info(
+                "[BUFFER] checkpoint '%s' carries no buffer snapshot (legacy format); "
+                "live buffer state kept as-is",
+                path_str,
+            )
 
         if ckpt.get("rng_state") is not None:
             try:
@@ -550,6 +646,15 @@ class RLTrainer:
             "push_freq": self.push_freq,
             "buffer_size": int(len(self.replay_buffer)) if hasattr(self.replay_buffer, "__len__") else None,
             "buffer_write_head": getattr(self.replay_buffer, "write_head", None),
+            # Full buffer association (audit SR-04): buffer identity, capacity,
+            # schema, generation and counters. Consumed by the resume
+            # consistency check; the live buffer's own meta stays authoritative.
+            "buffer_state": (
+                self.replay_buffer.snapshot()
+                if hasattr(self.replay_buffer, "snapshot")
+                else None
+            ),
+            "run_metadata": dict(getattr(self, "run_metadata", {}) or {}),
             "last_push_step": self.last_push_step,
             "tactical_pool_size": getattr(self.replay_buffer, "tactical_pool_size", None),
             "rng_state": torch.get_rng_state(),
@@ -583,6 +688,36 @@ class RLTrainer:
 
         return str(ckpt_path)
 
+    def _sampling_stats_from_batch(self, batch_dict: dict[str, Any]) -> Dict[str, Any]:
+        """Per-step sampling provenance (audit SR-13/SR-08).
+
+        Counts how many sampled rows carried a producing game id (self-play
+        rows) and how many distinct games they came from; human/tactical rows
+        carry game id 0 (``NO_GAME_ID``) and are excluded from both the count
+        and the distinct-game tally.
+        """
+        source = getattr(self.replay_buffer, "last_selfplay_source", None)
+        stats: Dict[str, Any] = {
+            "sample_source": source or "external",
+            "sampled_selfplay_rows": int(getattr(self.replay_buffer, "last_selfplay_rows", 0) or 0),
+            "sampled_rows_with_game_id": 0,
+            "sampled_unique_games": 0,
+            "staleness_fallbacks": int(
+                getattr(self.replay_buffer, "staleness_fallback_count", 0) or 0
+            ),
+        }
+        gids = batch_dict.get("game_ids")
+        if gids is None:
+            return stats
+        try:
+            g = gids.detach().to("cpu").to(torch.long)
+            positive = g[g > 0]
+            stats["sampled_rows_with_game_id"] = int(positive.numel())
+            stats["sampled_unique_games"] = int(torch.unique(positive).numel())
+        except (AttributeError, RuntimeError, TypeError):
+            logger.debug("sampling stats unavailable for this batch", exc_info=True)
+        return stats
+
     def train_step(self, batch_dict: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         """Run one training step on a sampled batch and return metrics."""
         self.model.train()
@@ -594,6 +729,7 @@ class RLTrainer:
                 step=self.step_num,
                 device=self.device,
             )
+        self._last_sampling_stats = self._sampling_stats_from_batch(batch_dict)
 
         if self.train_stream is not None:
             with torch.cuda.stream(self.train_stream):
@@ -696,6 +832,7 @@ class RLTrainer:
                 "target_entropy": float("nan"),
                 "n_full": int(full_mask.sum().item()),
                 "n_total": int(is_full.numel()),
+                **self._last_sampling_stats,
             }
             return metrics
 
@@ -741,6 +878,11 @@ class RLTrainer:
             self.last_checkpoint_time = now
 
         m = metrics_t.tolist()
+        # Sampling provenance for this step (audit SR-13/SR-08): how many
+        # self-play rows carried a producing game id, and how many distinct
+        # games they came from. Human/tactical rows carry game id 0 and are
+        # excluded from the distinct-game count. Cheap (one small unique()).
+        sampled = self._last_sampling_stats
         return {
             "step": self.step_num,
             "policy_loss": float(m[1]),
@@ -751,6 +893,7 @@ class RLTrainer:
             "target_entropy": float(m[4]),
             "n_full": int(m[5]),
             "n_total": n_total,
+            **sampled,
         }
 
     def push_weights(self) -> Any:

@@ -153,6 +153,126 @@ def puzzle_decline_trips(history: list[float], band: float = 0.015) -> bool:
     )
 
 
+def load_quarantine_index(checkpoint_dir: Path) -> Dict[str, Any]:
+    """Collect quarantine evidence for this checkpoint directory (SR-03).
+
+    Sources: ``QUARANTINE.json`` in the checkpoint directory and in its
+    ``quarantined/`` subdirectory (the layout written by the 2026-10-27
+    strength remediation), plus ``docs/checkpoint_registry.json`` entries
+    whose status is ``quarantined``/``missing``/``disqualified``.
+
+    Returns ``{"names_by_dir": {dir: set(names)}, "paths": set(resolved),
+    "sha256": set(hex or 16-prefix), "sizes": set(bytes)}``. Filename matches
+    are scoped to the directory whose own ``QUARANTINE.json`` names them —
+    matching bare basenames globally would falsely flag a healthy
+    ``latest_checkpoint.pt`` merely because some other directory's manifest
+    (or the registry) knows a quarantined file with the same basename.
+    """
+    index: Dict[str, Any] = {
+        "names_by_dir": {},
+        "paths": set(),
+        "sha256": set(),
+        "sizes": set(),
+    }
+
+    def _ingest_manifest(manifest_path: Path) -> None:
+        try:
+            data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        names_here = index["names_by_dir"].setdefault(
+            os.path.normcase(str(manifest_path.parent.resolve())), set()
+        )
+        entries = data.get("files", data if isinstance(data, list) else [])
+        for entry in entries if isinstance(entries, list) else []:
+            if not isinstance(entry, dict):
+                continue
+            for key in ("file", "filename"):
+                if entry.get(key):
+                    names_here.add(Path(str(entry[key])).name)
+            for key in ("moved_to", "path"):
+                if entry.get(key):
+                    try:
+                        resolved = Path(str(entry[key]))
+                        if not resolved.is_absolute():
+                            resolved = manifest_path.parent / resolved
+                        index["paths"].add(os.path.normcase(str(resolved.resolve())))
+                    except OSError:
+                        pass
+            if entry.get("sha256"):
+                digest = str(entry["sha256"])
+                index["sha256"].add(digest)
+                index["sha256"].add(digest[:16])
+            if entry.get("size_bytes") is not None:
+                try:
+                    index["sizes"].add(int(entry["size_bytes"]))
+                except (TypeError, ValueError):
+                    pass
+
+    for candidate in (
+        checkpoint_dir / "QUARANTINE.json",
+        checkpoint_dir / "quarantined" / "QUARANTINE.json",
+    ):
+        if candidate.is_file():
+            _ingest_manifest(candidate)
+    try:
+        from python.model.checkpoint_registry import load_registry
+
+        repo_root = Path(__file__).resolve().parent.parent
+        registry = load_registry(repo_root)
+        for rec in registry.get("checkpoints", []):
+            if rec.get("status") in ("quarantined", "missing", "disqualified"):
+                if rec.get("sha256"):
+                    index["sha256"].add(str(rec["sha256"]))
+                    index["sha256"].add(str(rec["sha256"])[:16])
+                if rec.get("path"):
+                    try:
+                        index["paths"].add(
+                            os.path.normcase(str((repo_root / rec["path"]).resolve()))
+                        )
+                    except OSError:
+                        pass
+                # NOTE: registry entries contribute resolved PATHS only, never
+                # bare basenames (a registry-known quarantined
+                # ".../quarantined/latest_checkpoint.pt" must not blacklist a
+                # healthy "latest_checkpoint.pt" in a live checkpoint dir).
+    except (FileNotFoundError, ValueError, OSError):
+        logger.debug("[RESUME] checkpoint registry unavailable for quarantine index", exc_info=True)
+    return index
+
+
+def quarantine_verdict(path: Path, index: Dict[str, Any]) -> Optional[str]:
+    """Return a reason string when ``path`` is provably quarantined."""
+    try:
+        resolved_path = path.resolve()
+        resolved = os.path.normcase(str(resolved_path))
+    except OSError:
+        resolved_path = path
+        resolved = os.path.normcase(str(path))
+    if "quarantined" in Path(resolved).parts:
+        return "inside a quarantined/ directory"
+    if resolved in index["paths"]:
+        return "listed in QUARANTINE.json / checkpoint registry"
+    names_here = index.get("names_by_dir", {}).get(
+        os.path.normcase(str(resolved_path.parent)), set()
+    )
+    if path.name in names_here:
+        return "filename listed in this directory's QUARANTINE.json"
+    # Hash/size comparison only when the size matches a quarantined entry
+    # (keeps the scan cheap: two 100 MB hashes at most per candidate).
+    try:
+        if index["sha256"] and path.stat().st_size in index["sizes"]:
+            from python.model.checkpoint_registry import compute_sha256
+
+            digest = compute_sha256(path)
+            if digest in index["sha256"] or digest[:16] in index["sha256"]:
+                return "sha256 matches a quarantined checkpoint"
+    except OSError:
+        pass
+    return None
+
+
+
 class Phase4Orchestrator:
     """Orchestrates Phase 4 self-play + RL training run with 6-hour evaluations and stop conditions."""
 
@@ -183,6 +303,7 @@ class Phase4Orchestrator:
         # legacy behavior deliberately.
         stockfish_elo: Optional[int] = 1500,
         allow_unverified_warm_start: bool = False,
+        allow_buffer_mismatch: bool = False,
         is_verify_mode: bool = False,
         skip_baseline_eval: bool = False,
         data_role: Optional[str] = None,
@@ -255,6 +376,9 @@ class Phase4Orchestrator:
         self.allow_uncertified_data = allow_uncertified_data
         self.allow_uncertified_eval = allow_uncertified_eval
         self.require_certified_eval = require_certified_eval
+        # Explicit operator override permitting a checkpoint whose buffer
+        # snapshot contradicts the live buffer (audit SR-04; loudly logged).
+        self.allow_buffer_mismatch = bool(allow_buffer_mismatch)
         self.gpu_cache_capacity = gpu_cache_capacity
         self.human_cache_size = human_cache_size
         self.tablebase_path = tablebase_path
@@ -378,6 +502,23 @@ class Phase4Orchestrator:
         self.match_games_csv_path = self.log_dir / "match_games.csv"
         self.puzzle_eval_jsonl_path = self.log_dir / "eval_puzzle_history.jsonl"
         self._run_commit = self._git_commit()
+        # ── Run identity and per-game provenance (audit SR-08) ──────────────
+        # A run id ties this run's telemetry, per-game log, checkpoints (via
+        # run_metadata) and shutdown summary together. The per-game JSONL
+        # records every sunk game with its termination reason, result and
+        # buffer-insertion statistics; the run manifest records the resolved
+        # configuration and the checkpoint/buffer association at startup.
+        import uuid as _uuid
+
+        self.run_id = _uuid.uuid4().hex[:16]
+        self.games_jsonl_path = self.log_dir / "games.jsonl"
+        self.run_manifest_path = self.log_dir / "run_manifest.json"
+        self.run_summary_path = self.log_dir / "run_summary.json"
+        self._game_log_lock = threading.Lock()
+        # Reporting-only counters (telemetry, never training inputs).
+        self._aborted_games_seen = 0
+        self._invalid_games_seen = 0
+        self._records_rejected = 0
 
         p_cand = [
             Path(puzzle_csv_path) if puzzle_csv_path else None,
@@ -426,6 +567,7 @@ class Phase4Orchestrator:
         self.stockfish_elo = stockfish_elo
         self.allow_unverified_warm_start = allow_unverified_warm_start
 
+        self.human_data_dir = str(human_data_dir) if human_data_dir else None
         self.stop_event = threading.Event()
         self.start_time = time.time()
         self.last_eval_time = self.start_time
@@ -511,6 +653,7 @@ class Phase4Orchestrator:
 
         is_resuming = resume_checkpoint is not None
         active_checkpoint = resume_checkpoint if is_resuming else base_checkpoint
+        self._resumed_from = str(resume_checkpoint) if is_resuming else None
         self._active_checkpoint_path = (
             str(active_checkpoint) if active_checkpoint else "random_init"
         )
@@ -610,11 +753,27 @@ class Phase4Orchestrator:
             csv_path=self.log_dir / "phase4_telemetry.csv",
             inference_server=self.server,
         )
+        # Stamp the run id into telemetry rows (audit SR-08).
+        self.metrics_tracker.run_id = self.run_id
 
         # 4. Initialize Self-Play Worker
         def sink(positions: list[SavedPosition], summary: GameSummary):
+            # Sink admission guard (audit SR-01, defense in depth): a game cut
+            # short by shutdown has no result and no valid experience. It is
+            # refused here even if it somehow reaches the sink, so a partial
+            # game can never be inserted as draw-labeled data or counted as a
+            # draw in telemetry.
+            if not SelfPlayWorker.accepts_for_sink(summary):
+                self._aborted_games_seen += 1
+                logger.warning(
+                    "[SINK] refused aborted game %s (%s): no positions inserted",
+                    getattr(summary, "game_id", "?"),
+                    getattr(summary, "termination_reason", "?"),
+                )
+                return
             self.buffer.add_positions(positions)
             self.metrics_tracker.record_game(summary)
+            self._append_game_record(summary, len(positions))
             # Reporting-only counters (no training effect).
             self._completed_games_seen += 1
             if getattr(summary, "adjudicated", False):
@@ -676,9 +835,17 @@ class Phase4Orchestrator:
         )
 
         if is_resuming:
-            self.trainer.load_checkpoint(resume_checkpoint)
+            self.trainer.load_checkpoint(
+                resume_checkpoint,
+                allow_buffer_mismatch=self.allow_buffer_mismatch,
+            )
             if hasattr(self.trainer, "direct_server") and self.trainer.direct_server is not None:
                 self.server.model_version = self.trainer.direct_server.model_version
+            self.trainer.run_metadata = {
+                "run_id": self.run_id,
+                "resumed_from": str(resume_checkpoint),
+                "resumed_at_step": int(getattr(self.trainer, "step_num", 0)),
+            }
             logger.info(
                 f"Resumed RL training from {resume_checkpoint} at step {self.trainer.step_num} (model_version={self.server.model_version})"
             )
@@ -687,8 +854,12 @@ class Phase4Orchestrator:
             # inference server and RL counters are fresh at 0. The warm-start
             # checkpoint's own step counter is inherited supervised progress —
             # provenance metadata, never RL pacing progress (PR-03).
-            ws = self._warm_start_info or {}
+            # Audit SR-02: this read `self._warm_start_info`, an attribute never
+            # assigned anywhere — every construction path raised AttributeError
+            # before training. The validated record is `self._warm_start_record`.
+            ws = self._warm_start_record or {}
             self.trainer.run_metadata = {
+                "run_id": self.run_id,
                 "warm_start": str(base_checkpoint) if base_checkpoint else "random_init",
                 "warm_start_sha256": ws.get("sha256", "unverified"),
                 "warm_start_step": ws.get("step", 0),
@@ -709,12 +880,29 @@ class Phase4Orchestrator:
     def _select_resume_checkpoint(self) -> Optional[str]:
         """Pick the best RL-resumable checkpoint in ``checkpoint_dir``, or None.
 
-        A candidate is resumable only when it is readable, carries model weights
-        with the project architecture, and its optimizer state is SGD-compatible
-        (or has no per-parameter state yet). Poisoned checkpoints — supervised
-        AdamW state saved by a failed run's exception cleanup — are skipped with
-        a loud warning: filename ordering (``phase4_final``/``latest``) must
-        never decide what a relaunch resumes from.
+        Eligibility contract (audit SR-03; every condition is code-enforced):
+
+        1. readable, model weights present, architecture 12x128 (existing);
+        2. NOT quarantined: files listed in a ``QUARANTINE.json`` beside them
+           (or in the checkpoint dir), files inside a ``quarantined/``
+           directory, and files whose sha256/size match a quarantined registry
+           entry are rejected outright — a quarantined checkpoint can never
+           become eligible through an automatic selection fallback;
+        3. NOT disqualified: registry entries with status
+           ``quarantined``/``missing``/``disqualified``;
+        4. type evidence: ``checkpoint_type == "rl"`` is eligible; an explicit
+           non-RL ``checkpoint_type`` is never eligible; a pre-stamp legacy
+           file (no type field) is eligible only when its per-parameter
+           optimizer state positively identifies an SGD trainer (empty/absent
+           optimizer state with no type stamp is exactly the hole this finding
+           closed — such a file is skipped with a loud warning);
+        5. optimizer state SGD-compatible or empty (existing);
+        6. buffer association: when the candidate carries a full ``buffer_state``
+           its ``buffer_id`` must match the configured buffer directory unless
+           the operator set ``allow_buffer_mismatch`` (logged).
+
+        Selection among eligible candidates is by (step, mtime) — never by
+        filename — and is deterministic.
         """
         from python.train.train_rl import inspect_rl_checkpoint
 
@@ -724,26 +912,69 @@ class Phase4Orchestrator:
             files = sorted(self.checkpoint_dir.glob("*.pt"))
         except OSError:
             return None
+
+        quarantine = load_quarantine_index(self.checkpoint_dir)
+        live_buffer_id = None
+        buffer = getattr(self, "buffer", None)
+        if buffer is not None and hasattr(buffer, "buffer_id"):
+            live_buffer_id = buffer.buffer_id
+        allow_mismatch = bool(getattr(self, "allow_buffer_mismatch", False))
+
         for f in files:
             if not f.is_file():
+                continue
+            verdict = quarantine_verdict(f, quarantine)
+            if verdict is not None:
+                rejected.append(f"{f.name}: quarantined ({verdict})")
                 continue
             info = inspect_rl_checkpoint(f)
             if info is None:
                 rejected.append(f"{f.name}: unreadable or invalid")
                 continue
-            if info["optimizer_class"] not in ("SGD", "empty"):
+            ckpt_type = info.get("checkpoint_type")
+            if ckpt_type is not None and ckpt_type != "rl":
                 rejected.append(
-                    f"{f.name}: optimizer state is {info['optimizer_class']} "
+                    f"{f.name}: checkpoint_type={ckpt_type!r} is not an RL training checkpoint"
+                )
+                continue
+            opt_class = info["optimizer_class"]
+            if opt_class not in ("SGD", "empty"):
+                rejected.append(
+                    f"{f.name}: optimizer state is {opt_class} "
                     "(foreign/poisoned — not resumable by an SGD trainer)"
                 )
                 continue
+            if ckpt_type is None and opt_class != "SGD":
+                # Pre-stamp file without positive SGD evidence: the audit's
+                # confirmed hole. Require real optimizer-state evidence of an
+                # SGD trainer before an unstamped file may be auto-resumed.
+                rejected.append(
+                    f"{f.name}: no checkpoint_type stamp and no SGD optimizer-state evidence "
+                    "(cannot verify this is an RL checkpoint; refusing auto-resume)"
+                )
+                continue
+            buffer_state = info.get("buffer_state")
+            if (
+                live_buffer_id is not None
+                and isinstance(buffer_state, dict)
+                and buffer_state.get("buffer_id") not in (None, live_buffer_id)
+            ):
+                line = (
+                    f"{f.name}: buffer_state.buffer_id={buffer_state.get('buffer_id')} does not "
+                    f"match the configured buffer {live_buffer_id}"
+                )
+                if allow_mismatch:
+                    logger.warning("[RESUME] including mismatched candidate (override): %s", line)
+                else:
+                    rejected.append(line + " (pass --allow-buffer-mismatch to override)")
+                    continue
             candidates.append(info)
         for line in rejected:
             logger.warning("[RESUME] excluded checkpoint: %s", line)
         if not candidates:
             if files:
                 logger.warning(
-                    "[RESUME] no SGD-compatible RL checkpoint in %s (%d file(s) rejected); "
+                    "[RESUME] no eligible RL checkpoint in %s (%d file(s) rejected); "
                     "starting from the warm-start base instead",
                     self.checkpoint_dir,
                     len(rejected),
@@ -751,9 +982,10 @@ class Phase4Orchestrator:
             return None
         best = max(candidates, key=lambda c: (c["step"], c["mtime"]))
         logger.info(
-            "[RESUME] selected %s (step=%s, optimizer=%s) — %d compatible candidate(s)",
+            "[RESUME] selected %s (step=%s, type=%s, optimizer=%s) — %d eligible candidate(s)",
             best["path"],
             best["step"],
+            best.get("checkpoint_type") or "unstamped(SGD-evidence)",
             best["optimizer_class"],
             len(candidates),
         )
@@ -925,6 +1157,164 @@ class Phase4Orchestrator:
             f.write(json.dumps(record) + "\n")
             f.flush()
             os.fsync(f.fileno())
+
+    def _append_game_record(self, summary: GameSummary, num_records: int) -> None:
+        """Append one per-game provenance row to games.jsonl (audit SR-08).
+
+        Runs on game threads, so the append is lock-protected and flushed (not
+        fsynced) to keep the sink off the critical path while remaining durable
+        across a clean stop. Every row carries the run id, the producing game
+        id and model version, the termination reason and result, the discarded/
+        aborted flags, and the buffer insertion statistics observed right after
+        this game's records were committed.
+        """
+        try:
+            row = {
+                "run_id": self.run_id,
+                "timestamp": time.time(),
+                "game_id": int(getattr(summary, "game_id", 0) or 0),
+                "model_version": int(getattr(summary, "model_version", 0) or 0),
+                "termination_reason": getattr(summary, "termination_reason", "unknown"),
+                "result": getattr(summary, "result", None),
+                "aborted": bool(getattr(summary, "aborted", False)),
+                "adjudicated": bool(getattr(summary, "adjudicated", False)),
+                "resigned": bool(getattr(summary, "resigned", False)),
+                "resigned_side_white": getattr(summary, "resigned_side_white", None),
+                "would_have_resigned": bool(getattr(summary, "would_have_resigned", False)),
+                "is_false_resign": bool(getattr(summary, "is_false_resign", False)),
+                "cut_ply": getattr(summary, "cut_ply", None),
+                "cut_piece_count": getattr(summary, "cut_piece_count", None),
+                "raw_wdl": getattr(summary, "raw_wdl", None),
+                "plies": int(getattr(summary, "length_plies", 0) or 0),
+                "duration_sec": float(getattr(summary, "duration_sec", 0.0) or 0.0),
+                "total_simulations": int(getattr(summary, "total_simulations", 0) or 0),
+                "records": int(num_records),
+                "buffer_size_after": int(getattr(self.buffer, "size", 0)),
+                "buffer_write_head_after": int(getattr(self.buffer, "write_head", 0)),
+                "buffer_total_added_after": int(getattr(self.buffer, "total_added", 0)),
+                "buffer_generation": int(getattr(self.buffer, "generation", 0)),
+            }
+            with self._game_log_lock:
+                with open(self.games_jsonl_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(row, sort_keys=True) + "\n")
+                    f.flush()
+        except OSError as exc:
+            logger.warning("[GAMES] failed to append game record: %s", exc)
+
+    def _write_run_manifest(self, *, resuming_from: Optional[str]) -> None:
+        """Persist this run's identity and resolved configuration (audit SR-08).
+
+        Written once at startup (atomic tmp+replace). Records the run id, the
+        master seed, the active checkpoint and its sha256 (when verified), the
+        buffer identity/capacity/schema/generation, the resolved settings, and
+        the run's commit — the durable "what exactly ran" record whose absence
+        made the historical campaign unreproducible.
+        """
+        payload = {
+            "run_id": self.run_id,
+            "started_at": time.time(),
+            "commit": self._run_commit,
+            "seed": self.seed,
+            "resumed_from": resuming_from,
+            "active_checkpoint": self._active_checkpoint_path,
+            "active_checkpoint_sha256": getattr(self, "_active_checkpoint_sha256", None),
+            "warm_start_record": getattr(self, "_warm_start_record", None),
+            "buffer": {
+                "dir": str(self.buffer.buffer_dir),
+                "buffer_id": getattr(self.buffer, "buffer_id", None),
+                "capacity": self.buffer.capacity,
+                "schema_version": getattr(self.buffer, "schema_version", None),
+                "generation": getattr(self.buffer, "generation", None),
+                "size": self.buffer.size,
+                "write_head": self.buffer.write_head,
+                "total_added": self.buffer.total_added,
+                "selfplay_sampling_policy": getattr(
+                    self.buffer, "selfplay_sampling_policy", None
+                ),
+            },
+            "config": {
+                "max_hours": self.max_hours,
+                "eval_interval_sec": self.eval_interval_sec,
+                "num_concurrent_games": self.num_concurrent_games,
+                "full_search_sims": self.full_search_sims,
+                "fast_search_sims": self.fast_search_sims,
+                "base_lr": self.base_lr,
+                "min_lr": self.min_lr,
+                "tactical_mix": self.tactical_mix,
+                "policy_target_temp": self.policy_target_temp,
+                "entropy_bonus": self.entropy_bonus,
+                "max_reuse_ratio": self.max_reuse_ratio,
+                "human_data_dir": getattr(self, "human_data_dir", None),
+                "data_role": self.data_role,
+                "allow_uncertified_data": self.allow_uncertified_data,
+                "device": self.device,
+                "train_device": self.train_device,
+                "infer_device": self.infer_device,
+                "tablebase_path": self.tablebase_path,
+                "stockfish_nodes": self.stockfish_nodes,
+                "stockfish_elo": self.stockfish_elo,
+            },
+        }
+        try:
+            tmp = self.run_manifest_path.with_name(self.run_manifest_path.name + ".tmp")
+            tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            os.replace(tmp, self.run_manifest_path)
+        except OSError as exc:
+            logger.warning("[RUN] failed to write run manifest: %s", exc)
+
+    def _write_run_summary(self, status: str) -> None:
+        """Persist shutdown diagnostics and counters (audit SR-08)."""
+        payload = {
+            "run_id": self.run_id,
+            "stopped_at": time.time(),
+            "status": status,
+            "exit_reason": getattr(self, "_exit_reason", "unknown"),
+            "games": {
+                "completed": int(getattr(self.metrics_tracker, "total_games", 0)),
+                "aborted": int(getattr(self.worker, "aborted_games", 0))
+                + int(self._aborted_games_seen),
+                "invalid": int(getattr(self.worker, "invalid_games", 0))
+                + int(self._invalid_games_seen),
+                "records_rejected": int(getattr(self.buffer, "rejected_records", 0))
+                + int(self._records_rejected),
+                "positions_inserted": int(getattr(self.buffer, "total_added", 0)),
+            },
+            "worker": {
+                "inference_failures": int(
+                    getattr(self.worker.aggregator, "inference_failure_count", 0)
+                ),
+                "failed_flushes": int(getattr(self.worker.aggregator, "failed_flushes", 0)),
+                "failed_eval_requests": int(
+                    getattr(self.worker.aggregator, "failed_eval_requests", 0)
+                ),
+                "staleness_fallbacks": int(
+                    getattr(self.buffer, "staleness_fallback_count", 0)
+                ),
+            },
+            "trainer": {
+                "rl_steps": int(getattr(self.trainer, "step_num", 0)),
+                "run_steps": int(self._steps_this_run),
+                "push_success": int(getattr(self.trainer, "push_success_count", 0)),
+                "push_failure": int(getattr(self.trainer, "push_failure_count", 0)),
+            },
+            "buffer": {
+                "buffer_id": getattr(self.buffer, "buffer_id", None),
+                "size": int(getattr(self.buffer, "size", 0)),
+                "write_head": int(getattr(self.buffer, "write_head", 0)),
+                "total_added": int(getattr(self.buffer, "total_added", 0)),
+                "generation": int(getattr(self.buffer, "generation", 0)),
+            },
+            "checkpoint": {
+                "last_saved": getattr(self, "_last_saved_ckpt_name", None),
+                "final_path": str(self.checkpoint_dir / "phase4_final_checkpoint.pt"),
+            },
+        }
+        try:
+            tmp = self.run_summary_path.with_name(self.run_summary_path.name + ".tmp")
+            tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            os.replace(tmp, self.run_summary_path)
+        except OSError as exc:
+            logger.warning("[RUN] failed to write run summary: %s", exc)
 
     def _persist_match_game(self, game: dict, partial: bool = False) -> None:
         """Persist one completed match game (Stage A §7 incremental durability)."""
@@ -1816,9 +2206,11 @@ class Phase4Orchestrator:
         except OSError:
             self._known_ckpt_names = set()
         self._last_push_version = int(getattr(self.server, "model_version", 0) or 0)
+        self._write_run_manifest(resuming_from=getattr(self, "_resumed_from", None))
         self._print_startup_banner()
         self._event(
             "START",
+            f"run_id={self.run_id} buffer_id={getattr(self.buffer, 'buffer_id', '?')}",
             f"self-play workers={self.num_concurrent_games} "
             f"buffer_cap={self.buffer.capacity} "
             f"base_lr={self.base_lr} min_lr={self.min_lr} "
@@ -1988,6 +2380,22 @@ class Phase4Orchestrator:
                         step=step,
                         buffer_size=len(self.buffer),
                         model_version=self.server.model_version,
+                        buffer_total_added=self.buffer.total_added,
+                        buffer_write_head=self.buffer.write_head,
+                        buffer_schema_version=getattr(self.buffer, "schema_version", None),
+                        games_aborted=getattr(self.worker, "aborted_games", 0)
+                        + self._aborted_games_seen,
+                        games_invalid=getattr(self.worker, "invalid_games", 0)
+                        + self._invalid_games_seen,
+                        records_rejected=getattr(self.buffer, "rejected_records", 0)
+                        + self._records_rejected,
+                        checkpoint_file=self._last_saved_ckpt_name or None,
+                        sampling={
+                            "sample_source": train_metrics.get("sample_source"),
+                            "sampled_selfplay_rows": train_metrics.get("sampled_selfplay_rows"),
+                            "sampled_unique_games": train_metrics.get("sampled_unique_games"),
+                            "staleness_fallbacks": train_metrics.get("staleness_fallbacks"),
+                        },
                     )
                     # Check safety triggers
                     self.check_safety_triggers(train_metrics)
@@ -2113,7 +2521,20 @@ class Phase4Orchestrator:
                 self.buffer.close()
             except Exception as exc:
                 logger.error("Buffer close failed during shutdown: %s", exc)
-        self._event("SHUTDOWN", "telemetry flushed")
+        # Shutdown diagnostics (audit SR-08): counters and provenance in one
+        # durable JSON record, written before the janitor prunes anything.
+        try:
+            self._write_run_summary(getattr(self, "_status_for_checkpoint", "unknown"))
+        except Exception as exc:  # never let reporting break shutdown
+            logger.warning("Run summary write failed: %s", exc)
+        self._event(
+            "SHUTDOWN",
+            "telemetry flushed "
+            f"(games_completed={getattr(self.metrics_tracker, 'total_games', 0)} "
+            f"aborted={getattr(self.worker, 'aborted_games', 0) + self._aborted_games_seen} "
+            f"invalid={getattr(self.worker, 'invalid_games', 0) + self._invalid_games_seen} "
+            f"records_rejected={getattr(self.buffer, 'rejected_records', 0) + self._records_rejected})",
+        )
         logger.info(
             f"Phase 4 run stopped. Final checkpoint saved to {getattr(self, '_last_final_ckpt', 'unknown')}"
         )
@@ -2249,15 +2670,9 @@ def main() -> None:
             "docs/checkpoint_registry.json, or the run fails closed."
         ),
     )
-    parser.add_argument(
-        "--allow-unverified-warm-start",
-        action="store_true",
-        help=(
-            "Explicit operator override to warm-start from a checkpoint that is "
-            "not a designated registry entry (logged as an override; use only "
-            "with a documented provisional selection)."
-        ),
-    )
+    # Audit SR-02: this option was registered TWICE (duplicate argparse
+    # registration -> ArgumentError on every invocation, including --help).
+    # Single authoritative definition retained below.
     parser.add_argument(
         "--allow-unverified-warm-start",
         action="store_true",
@@ -2265,6 +2680,16 @@ def main() -> None:
             "Operator override: start RL from a checkpoint that is absent from the "
             "checkpoint registry or not designated as a warm start. The decision is "
             "logged loudly; without this flag such starts are rejected (F-11/F-12)."
+        ),
+    )
+    parser.add_argument(
+        "--allow-buffer-mismatch",
+        action="store_true",
+        help=(
+            "Operator override: allow resuming from a checkpoint whose stored buffer "
+            "snapshot contradicts the live replay buffer (different buffer directory, "
+            "capacity, generation, or pointer/count arithmetic). The live buffer state "
+            "is kept as-is (never rewound) and the override is logged loudly."
         ),
     )
     parser.add_argument(
@@ -2446,6 +2871,7 @@ def main() -> None:
             checkpoint_dir=args.checkpoint_dir,
             base_checkpoint=args.base_checkpoint,
             allow_unverified_warm_start=args.allow_unverified_warm_start,
+            allow_buffer_mismatch=args.allow_buffer_mismatch,
             device=args.device,
             train_device=args.train_device,
             infer_device=args.infer_device,
@@ -2496,6 +2922,7 @@ def main() -> None:
             checkpoint_dir=args.checkpoint_dir,
             base_checkpoint=args.base_checkpoint,
             allow_unverified_warm_start=args.allow_unverified_warm_start,
+            allow_buffer_mismatch=args.allow_buffer_mismatch,
             device=args.device,
             train_device=args.train_device,
             infer_device=args.infer_device,

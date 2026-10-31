@@ -22,9 +22,9 @@ ZeroPawn pairs an optimized C++17 bitboard chess engine and Monte Carlo Tree Sea
                                └───────┬──────────────────────────────┬─────────┘
                                        │                              │
                     ┌──────────────────▼─────────────┐ ┌──────────────▼────────────────┐
-                    │     Self-Play Workers (C++)    │ │  Supervised Warm-Start Pipeline│
+                    │     Self-Play Workers          │ │  Supervised Warm-Start Pipeline│
                     │   - Bitboard move generation   │ │  - 2500+ Elo Human Master PGNs│
-                    │   - Batched MCTS tree search   │ │  - Curated Tactical Puzzles   │
+                    │   - Serial MCTS (locked default)│ │  - Curated Tactical Puzzles  │
                     │   - Syzygy tablebase checks    │ │  - Binary memmap float32 data │
                     └──────────────────┬─────────────┘ └──────────────┬────────────────┘
                                        │                              │
@@ -141,8 +141,23 @@ We provide two pre-trained model checkpoints:
 When launching the engine without an explicit `--checkpoint` flag, ZeroPawn automatically selects the strongest available checkpoint in this order:
 1. `models/checkpoints_finetune/best_model.pt` *(Fine-tuned model — strongest)*
 2. `models/checkpoints_scaled/best_model.pt` *(Scaled supervised baseline)*
-3. `models/checkpoints_rl/best_model.pt` *(Reinforcement learning self-play checkpoint)*
+3. `models/checkpoints_rl/best_eval.pt` *(RL self-play checkpoint, when a run has promoted one)*
 4. Any `.pt` path explicitly passed via `--checkpoint <path>`
+
+> [!IMPORTANT]
+> **No RL-trained checkpoint lineage exists yet.** The 2026-10-26 RL campaign applied
+> **zero** optimizer updates: it resumed from the supervised checkpoint (step 6000, an
+> inherited supervised counter — not RL progress), produced 96,067 self-play records
+> with the un-updated model (all records `model_version == 1`), and crashed on its first
+> optimizer step (`KeyError: 'momentum'`). See
+> `docs/audits/phase4-rl-momentum-keyerror-root-cause-v2.md`. The self-play/replay
+> infrastructure was subsequently remediated (2026-10-31); a future RL campaign is a
+> separate, separately-authorized step.
+>
+> RL resume is additionally fail-closed: only checkpoints with an RL type stamp (or
+> positive SGD optimizer-state evidence), an SGD-compatible optimizer, no quarantine
+> entry, and a buffer snapshot consistent with the live replay buffer are eligible for
+> automatic resume. See `audit-reports/selfplay-replay-integrity-remediation/`.
 
 ### Downloading Official Checkpoints
 
