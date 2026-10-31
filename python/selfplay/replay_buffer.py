@@ -27,6 +27,14 @@ the scalar domains of every live record; it fails closed (raises
 ``BufferIntegrityError``) rather than loading a state it cannot validate.
 Insertion validates every record before writing (``add_positions`` raises
 ``ReplayRecordValidationError`` and commits nothing).
+
+Randomness contract (audit SR-12 scope): buffer SAMPLING uses the
+process-global ``numpy``/``torch`` RNG (uniform draws, batch permutation). The
+orchestrator seeds those globals once when ``--seed`` is given, so sampling is
+reproducible run-scoped (not batch-scoped); self-play GAME randomness is
+per-game seeded (``master_seed + game_id``) and never touches the globals. The
+cache/ring split and the staleness filter are deterministic given the sampled
+indices.
 """
 
 from __future__ import annotations
@@ -788,8 +796,14 @@ class ReplayBuffer:
             "meta": self.buffer_dir / "meta.json",
         }
 
-        # Initialize or load metadata
-        if not create_new and self.paths["meta"].exists():
+        # Initialize or load metadata. A directory whose SHARD files exist must
+        # go through _load_meta even when meta.json is missing: that path now
+        # recovers from a valid scratch file or fails closed for a populated
+        # buffer (REM-06) instead of silently starting a fresh size-0 view over
+        # existing records.
+        _shard_keys = ("planes", "visits", "outcomes", "full_search", "versions", "game_ids")
+        _shards_exist = any(self.paths[key].exists() for key in _shard_keys)
+        if not create_new and (self.paths["meta"].exists() or _shards_exist):
             self._load_meta()
         else:
             if create_new:
@@ -1018,6 +1032,19 @@ class ReplayBuffer:
                     os.replace(str(tmp_path), str(meta_path))
                 except OSError:
                     pass
+            elif self._looks_populated():
+                # REM-06 (same defect family as SR-10): meta.json is gone or
+                # empty while the shards still contain records. Silently
+                # writing a fresh size=0 meta would make the existing records
+                # invisible (and later inserts would overwrite them from slot
+                # 0). Refuse, with a diagnostic naming the recovery options.
+                raise BufferIntegrityError(
+                    f"Replay meta {meta_path} is missing/empty but the shard files at "
+                    f"{self.buffer_dir} contain records. Refusing to silently reset a "
+                    "populated buffer. Restore meta.json (or a valid meta scratch file), "
+                    "or pass create_new=True / --reset-buffer to explicitly start a fresh "
+                    "generation."
+                )
             else:
                 self._save_meta(force=True)
                 return
@@ -1129,6 +1156,40 @@ class ReplayBuffer:
                 "bytes": _shard_nbytes(shape, np.dtype(dtype)),
             }
         return layout
+
+    def _looks_populated(self) -> bool:
+        """True when shard files exist and carry record data (REM-06 guard).
+
+        Cheap proxy over the four scalar shards (a populated buffer always has
+        ``game_ids > 0``); used only on the missing/empty-meta path so the cost
+        (~10 MB worst case at capacity 500k, tens of ms) never touches the
+        normal load path.
+        """
+        for key, dtype, shape in (
+            ("game_ids", np.uint64, (self.capacity,)),
+            ("outcomes", np.int64, (self.capacity,)),
+            ("versions", np.int32, (self.capacity,)),
+            ("full_search", np.bool_, (self.capacity,)),
+        ):
+            path = self.paths[key]
+            if not path.exists():
+                continue
+            try:
+                m = np.memmap(path, dtype=dtype, mode="r", shape=shape)
+                try:
+                    if bool(np.asarray(m).any()):
+                        return True
+                finally:
+                    try:
+                        m._mmap.close()  # type: ignore[attr-defined]
+                    except (AttributeError, ValueError, OSError):
+                        pass
+                    del m
+            except (OSError, ValueError):
+                # Unreadable shard on the recovery path: let normal load fail
+                # closed with its own diagnostic rather than guessing here.
+                continue
+        return False
 
     def _read_existing_generation(self) -> int:
         """Generation recorded in an existing meta (0 when none/unreadable)."""

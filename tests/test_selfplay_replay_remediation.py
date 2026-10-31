@@ -214,6 +214,27 @@ def test_genuine_completion_is_preserved_when_stop_races_the_last_ply():
     assert {p.game_id for p in positions} == {101}
 
 
+def test_book_plies_produce_no_records_and_are_excluded_from_searched_plies():
+    """SR-09 gap: book moves are not model experience.
+
+    A game that plays 3 book plies and 2 searched plies must produce exactly 2
+    records, all of them searched positions, with ply accounting consistent.
+    """
+    agg = StubAggregator(running=True)
+    book = StubOpeningBook(stop_after=3)  # book supplies plies 0..2
+    game = _make_game(agg, book=book, max_plies=5)
+
+    positions, summary = game.play_game()
+
+    assert summary.aborted is False
+    assert game.book_plies == 3
+    assert game.ply == 5  # 3 book + 2 searched plies
+    assert len(positions) == 2  # exactly the searched plies
+    assert len(game.raw_positions) == 2
+    assert agg.evaluate_calls >= 2  # searches ran for the searched plies
+    assert {p.game_id for p in positions} == {game.game_id}
+
+
 def test_worker_exception_still_fails_closed():
     """An InferenceError raised mid-search propagates (game discarded)."""
     agg = StubAggregator(running=True)

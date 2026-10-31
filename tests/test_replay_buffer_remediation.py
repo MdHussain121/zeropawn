@@ -239,6 +239,58 @@ def test_reset_buffer_bumps_generation_and_keeps_loadable(tmp_path):
     assert any("slots at/after size" in w for w in report["warnings"])
 
 
+def test_corrupt_meta_is_backed_up_and_never_silently_reset(tmp_path):
+    buf = ReplayBuffer(buffer_dir=tmp_path / "b", capacity=8, create_new=True)
+    buf.add_positions([_pos(i + 1) for i in range(4)])
+    buf.close()
+    meta = tmp_path / "b" / "meta.json"
+    meta.write_text("{not json", encoding="utf-8")
+    with pytest.raises(ValueError):
+        ReplayBuffer(buffer_dir=tmp_path / "b", capacity=8)
+    backups = list((tmp_path / "b").glob("meta.corrupt.*.json"))
+    assert backups, "corrupt meta must be preserved as forensic backup"
+    assert backups[0].read_text(encoding="utf-8") == "{not json"
+    # No silent reset: the buffer on disk still holds its records.
+    assert (tmp_path / "b" / "game_ids.bin").stat().st_size == 8 * 8
+
+
+def test_interrupted_meta_write_recovers_from_valid_scratch_file(tmp_path):
+    """A crash between scratch write and os.replace leaves ``meta.tmp`` as the
+    newest valid state; an empty meta recovers from it (existing path,
+    regression-pinned against the ACTUAL scratch filename used by _save_meta).
+    """
+    buf = ReplayBuffer(buffer_dir=tmp_path / "b", capacity=8, create_new=True)
+    buf.add_positions([_pos(i + 1) for i in range(3)])
+    buf.close()
+    meta = tmp_path / "b" / "meta.json"
+    payload = meta.read_text(encoding="utf-8")
+    scratch = tmp_path / "b" / "meta.tmp"  # Path.with_suffix('.tmp') => meta.tmp
+    scratch.write_text(payload, encoding="utf-8")
+    meta.write_text("", encoding="utf-8")  # torn meta from an interrupted replace
+    buf2 = ReplayBuffer(buffer_dir=tmp_path / "b", capacity=8)
+    assert buf2.size == 3 and buf2.total_added == 3
+
+
+def test_missing_meta_on_populated_buffer_fails_closed(tmp_path):
+    """REM-06: a lost meta must never silently reset a populated buffer."""
+    buf = ReplayBuffer(buffer_dir=tmp_path / "b", capacity=8, create_new=True)
+    buf.add_positions([_pos(i + 1) for i in range(3)])
+    buf.close()
+    (tmp_path / "b" / "meta.json").unlink()
+    with pytest.raises(BufferIntegrityError):
+        ReplayBuffer(buffer_dir=tmp_path / "b", capacity=8)
+    # An explicitly requested reset is still allowed and starts generation 2.
+    buf2 = ReplayBuffer(buffer_dir=tmp_path / "b", capacity=8, create_new=True)
+    assert buf2.generation == 2
+    assert buf2.size == 0
+
+
+def test_missing_meta_on_empty_buffer_initializes_fresh(tmp_path):
+    """A brand-new directory (no shards, no meta) still initializes normally."""
+    buf = ReplayBuffer(buffer_dir=tmp_path / "fresh", capacity=8)
+    assert buf.size == 0 and buf.generation == 1
+
+
 # ---------------------------------------------------------------------------
 # SR-04 — snapshot / consistency classification
 # ---------------------------------------------------------------------------
