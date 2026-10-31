@@ -199,6 +199,14 @@ def validate_warm_start(
 
     status = entry.get("status")
     if status != "verified":
+        if status == "disqualified":
+            dq = entry.get("disqualification", {})
+            raise WarmStartValidationError(
+                f"Warm-start {p} is DISQUALIFIED in the registry "
+                f"({dq.get('reason', 'undocumented')}): {dq.get('detail', '')} "
+                "A disqualified checkpoint can never become a warm start; see "
+                "docs/checkpoint_registry.json for the evidence trail."
+            )
         raise WarmStartValidationError(
             f"Warm-start {p} is registered with status {status!r} (missing/unverified "
             "artifacts can never be warm starts). See docs/checkpoint_registry.json."

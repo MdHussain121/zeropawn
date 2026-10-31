@@ -687,7 +687,10 @@ class Phase4Orchestrator:
             # inference server and RL counters are fresh at 0. The warm-start
             # checkpoint's own step counter is inherited supervised progress —
             # provenance metadata, never RL pacing progress (PR-03).
-            ws = self._warm_start_info or {}
+            # Audit SLQ-07: this was `_warm_start_info`, an attribute never
+            # assigned anywhere — a fresh start crashed with AttributeError
+            # before training. The validated record is `self._warm_start_record`.
+            ws = self._warm_start_record or {}
             self.trainer.run_metadata = {
                 "warm_start": str(base_checkpoint) if base_checkpoint else "random_init",
                 "warm_start_sha256": ws.get("sha256", "unverified"),
@@ -2255,15 +2258,7 @@ def main() -> None:
         help=(
             "Explicit operator override to warm-start from a checkpoint that is "
             "not a designated registry entry (logged as an override; use only "
-            "with a documented provisional selection)."
-        ),
-    )
-    parser.add_argument(
-        "--allow-unverified-warm-start",
-        action="store_true",
-        help=(
-            "Operator override: start RL from a checkpoint that is absent from the "
-            "checkpoint registry or not designated as a warm start. The decision is "
+            "with a documented provisional selection). The decision is "
             "logged loudly; without this flag such starts are rejected (F-11/F-12)."
         ),
     )

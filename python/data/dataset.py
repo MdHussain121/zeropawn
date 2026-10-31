@@ -9,7 +9,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import tempfile
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Optional, Union, Dict, Any, TypedDict
@@ -169,6 +168,24 @@ def _outcome_to_value_target(outcomes: np.ndarray, is_syzygy: bool) -> np.ndarra
     return targets
 
 
+# Bit shift for big-endian (np.packbits-default) unpacking: bit i of a byte is
+# (byte >> shift[i]) & 1 with shift = [7, 6, ..., 0].
+_PACK_SHIFT = torch.tensor([7, 6, 5, 4, 3, 2, 1, 0], dtype=torch.uint8)
+
+MASK_PACKED_BYTES = (4672 + 7) // 8  # 584 — 4672 actions bit-packed
+
+
+def decode_packed_masks(packed: torch.Tensor) -> torch.Tensor:
+    """Decode bit-packed legal masks to a bool tensor, identical to np.unpackbits.
+
+    ``packed``: (B, 584) uint8 → returns (B, 4672) bool. 4672 = 584 × 8 exactly,
+    so no padding bits exist. Runs on whatever device the tensor lives on.
+    """
+    shift = _PACK_SHIFT.to(packed.device)
+    bits = (packed.unsqueeze(-1) >> shift) & 1
+    return bits.reshape(packed.shape[0], -1).to(torch.bool)
+
+
 class BinaryChessDataset(Dataset):
     """Memory-mapped PyTorch Dataset for ZeroPawn supervised training."""
 
@@ -307,7 +324,12 @@ class BinaryChessDataset(Dataset):
             "move": torch.tensor(move, dtype=torch.long),
             "outcome": torch.tensor(-1 if is_tac else outcome, dtype=torch.long),
             "game_id": torch.tensor(game_id_val, dtype=torch.int64),
-            "ply": torch.tensor(0 if self.is_tactical else ply, dtype=torch.long),
+            # Stored ply passes through for every row (SLQ-06): supervision is
+            # decided by the WDL loss mask (ply >= 10 ∧ target sum > 0) and the
+            # stored label, never by the dataset kind. Mate-labelled tactical
+            # rows (ply=10, outcome=0) therefore reach the value head, while
+            # OUTCOME_UNAVAILABLE rows stay masked by their zero target.
+            "ply": torch.tensor(ply, dtype=torch.long),
             "is_tactical": torch.tensor(is_tac, dtype=torch.bool),
         }
 
@@ -315,8 +337,9 @@ class BinaryChessDataset(Dataset):
             unpacked = np.unpackbits(np.array(self.masks[idx]), count=4672)
             sample["legal_mask"] = torch.from_numpy(unpacked.astype(np.bool_))
 
-        if is_tac:
-            # Tactical positions have masked value target [0, 0, 0]
+        if outcome == OUTCOME_UNAVAILABLE:
+            # Masked value target — the only contract for unavailable outcomes
+            # (audit SLQ-06: never decode a masked row into a real class).
             sample["value_target"] = torch.zeros(3, dtype=torch.float32)
         elif self.value_targets is not None:
             vt = np.array(self.value_targets[idx], dtype=np.float32)
@@ -381,7 +404,10 @@ class SourceAwareCombinedDataset(Dataset):
     """Combines a master-game dataset and a tactical puzzle dataset.
 
     Guarantees:
-    - Tactical samples always have value_target masked to [0, 0, 0] and ply=0.
+    - Each sample's ply and value target pass through from its source dataset
+      (audit SLQ-06): mate-labelled tactical rows (ply=10, outcome=0) keep
+      their value supervision; OUTCOME_UNAVAILABLE rows stay masked by their
+      zero target. Supervision is decided by the trainer's WDL loss mask.
     - Master samples preserve valid game outcome targets.
     - An explicit is_tactical boolean tensor is included in each sample dict.
     - Ratio sampling: ratio 0.0 guarantees exact exclusion of tactical positions;
@@ -408,20 +434,23 @@ class SourceAwareCombinedDataset(Dataset):
         self.total_len = self.n_master + self.n_tactics
 
     def __len__(self) -> int:
-        return self.n_master if self.n_master > 0 else self.n_tactics
+        # Total rows across both sources (audit SLQ-19): direct iteration must
+        # see every sample. Epoch length under ratio sampling is chosen
+        # explicitly via get_sampler(num_samples=...) by the trainer.
+        return self.total_len
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         if idx < self.n_master:
             sample = self.master_ds[idx]
             sample["is_tactical"] = torch.tensor(False, dtype=torch.bool)
             return sample
-        else:
-            sample = self.tactics_ds[idx - self.n_master]
-            sample["is_tactical"] = torch.tensor(True, dtype=torch.bool)
-            sample["value_target"] = torch.zeros(3, dtype=torch.float32)
-            sample["outcome"] = torch.tensor(-1, dtype=torch.long)
-            sample["ply"] = torch.tensor(0, dtype=torch.long)
-            return sample
+        # Tactical rows pass through the underlying dataset's stored ply and
+        # value labels (audit SLQ-06): mate-labelled rows supervise the value
+        # head, OUTCOME_UNAVAILABLE rows stay masked. Only the is_tactical
+        # marker is enforced here.
+        sample = self.tactics_ds[idx - self.n_master]
+        sample["is_tactical"] = torch.tensor(True, dtype=torch.bool)
+        return sample
 
     def get_sampler(
         self, num_samples: Optional[int] = None
@@ -458,6 +487,12 @@ class GpuResidentDataLoader:
     value targets directly into GPU memory in bfloat16 channels-last format.
     Any dataset excess beyond the safe VRAM budget is placed into pinned host RAM,
     ensuring maximum throughput while eliminating disk I/O and CPU collation bottlenecks.
+
+    Schema-2 datasets' packed legal-action masks (``masks.bin``) are loaded with
+    the same tiering and decoded per batch, so the legal-masked policy loss
+    behaves identically on the GPU path and the disk-backed path (audit SLQ-05).
+    Combined tactics shards are read segment-wise; no multi-gigabyte array is
+    ever materialized in host RAM (audit SLQ-12).
     """
 
     def __init__(
@@ -522,6 +557,21 @@ class GpuResidentDataLoader:
         )
         self._memmaps.extend([planes_m, moves_m, plies_m])
 
+        # Packed legal-action masks (schema-2 datasets). The GPU path MUST
+        # consume the same mask stream as BinaryChessDataset (audit SLQ-05):
+        # without it the legal-masked policy loss can never activate on the
+        # production CUDA default path.
+        masks_m: Optional[np.memmap] = None
+        masks_path = self.data_dir / "masks.bin"
+        if masks_path.exists():
+            _check_st_size(masks_path, self.num_samples * MASK_PACKED_BYTES)
+            masks_m = np.memmap(
+                masks_path,
+                dtype=np.uint8,
+                mode="r",
+                shape=(self.num_samples, MASK_PACKED_BYTES),
+            )
+
         val_targets_path = self.data_dir / "value_targets.bin"
         if val_targets_path.exists():
             targets_m = np.memmap(
@@ -564,9 +614,18 @@ class GpuResidentDataLoader:
         # OUTCOME_UNAVAILABLE (255) rows in memory, and rows that carry valid
         # W/D/L labels keep them.
 
-        # Load separate tactics dataset and concatenate arrays if tactics_dir is set.
-        # This fixes the critical bug where --tactics-dir was silently ignored in GPU mode.
+        # Load a separate tactics dataset and concatenate it with the master
+        # rows when tactics_dir is set (the --tactics-dir flag must never be
+        # silently ignored). Planes and masks — the two multi-gigabyte arrays
+        # — are kept as two segments and read segment-aware in the populate
+        # loop below, so neither is ever fully materialized in host RAM
+        # (audit SLQ-12: the previous implementation built ~3–4 full fp32
+        # copies ≈ 36–48 GB for the 2.49M-sample corpus, guaranteed OOM on the
+        # 16 GB host). Only the small per-row arrays are concatenated.
         tactics_n = 0
+        master_n = self.num_samples
+        t_planes_m: Optional[np.memmap] = None
+        t_masks_m: Optional[np.memmap] = None
         if self.tactics_dir is not None and self.tactics_dir.exists() and self.tactics_dir.is_dir():
             t_meta_path = self.tactics_dir / "metadata.json"
             if t_meta_path.exists():
@@ -582,128 +641,97 @@ class GpuResidentDataLoader:
                     t_bytes = t_planes_path.stat().st_size
                     tactics_n = max(t_bytes // plane_bytes, 0)
             if tactics_n > 0:
-                # Load tactics arrays
-                t_planes_path = self.tactics_dir / "planes.bin"
-                t_moves_path = self.tactics_dir / "moves.bin"
-                t_plies_path = self.tactics_dir / "plies.bin"
-                t_targets_path = self.tactics_dir / "value_targets.bin"
-                # Read master arrays fully into memory
-                master_n = self.num_samples
-                master_planes = np.array(planes_m, dtype=np.float32)
-                master_moves = np.array(moves_m, dtype=np.int16)
-                master_plies = np.array(plies_m, dtype=np.int16)
-                if targets_m is not None:
-                    master_targets = np.array(targets_m, dtype=np.float32)
-                else:
-                    master_targets = _outcome_to_value_target(
-                        np.array(outcomes_m, dtype=np.uint8), self.is_syzygy
-                    )
-
-                # Load tactics arrays
                 t_planes_m = np.memmap(
-                    t_planes_path, dtype=np.float32, mode="r", shape=(tactics_n, *self.planes_shape)
+                    self.tactics_dir / "planes.bin",
+                    dtype=np.float32,
+                    mode="r",
+                    shape=(tactics_n, *self.planes_shape),
                 )
-                t_moves_m = np.memmap(t_moves_path, dtype=np.int16, mode="r", shape=(tactics_n,))
-                t_plies_m = np.memmap(t_plies_path, dtype=np.int16, mode="r", shape=(tactics_n,))
-                if t_targets_path.exists():
-                    t_targets_m = np.memmap(
-                        t_targets_path, dtype=np.float32, mode="r", shape=(tactics_n, 3)
+                t_moves_m = np.memmap(
+                    self.tactics_dir / "moves.bin", dtype=np.int16, mode="r", shape=(tactics_n,)
+                )
+                t_plies_m = np.memmap(
+                    self.tactics_dir / "plies.bin", dtype=np.int16, mode="r", shape=(tactics_n,)
+                )
+                # Value targets: prefer an explicit stream; otherwise decode
+                # from the shard's own outcomes so mate-labelled rows keep
+                # their labels (SLQ-06) and 255 rows stay masked.
+                t_targets_path = self.tactics_dir / "value_targets.bin"
+                t_outcomes_m: Optional[np.memmap] = None
+                if (self.tactics_dir / "outcomes.bin").exists():
+                    t_outcomes_m = np.memmap(
+                        self.tactics_dir / "outcomes.bin",
+                        dtype=np.uint8,
+                        mode="r",
+                        shape=(tactics_n,),
                     )
-                    tactics_targets = np.array(t_targets_m, dtype=np.float32)
+                if t_targets_path.exists():
+                    t_targets_arr = np.asarray(
+                        np.memmap(
+                            t_targets_path, dtype=np.float32, mode="r", shape=(tactics_n, 3)
+                        )
+                    )
+                elif t_outcomes_m is not None:
+                    t_targets_arr = _outcome_to_value_target(np.asarray(t_outcomes_m), False)
                 else:
-                    tactics_targets = np.zeros((tactics_n, 3), dtype=np.float32)
-                    # For tactics, set ply=0 and value_target masked
-                    # Outcomes will be 255 (unavailable) so tactics_mask picks them up
+                    t_targets_arr = np.zeros((tactics_n, 3), dtype=np.float32)
 
-                # Concatenate
-                combined_planes = np.concatenate(
-                    [master_planes, np.array(t_planes_m, dtype=np.float32)]
+                # Small arrays: concatenate in RAM (a few MB each).
+                moves_m = np.concatenate(
+                    [np.asarray(moves_m), np.asarray(t_moves_m, dtype=np.int16)]
                 )
-                combined_moves = np.concatenate([master_moves, np.array(t_moves_m, dtype=np.int16)])
-                combined_plies = np.concatenate([master_plies, np.array(t_plies_m, dtype=np.int16)])
-                # For tactics plies: set to 0 for masked value loss
-                combined_plies[-tactics_n:] = 0
-                combined_targets = np.concatenate([master_targets, tactics_targets])
+                plies_m = np.concatenate(
+                    [np.asarray(plies_m), np.asarray(t_plies_m, dtype=np.int16)]
+                )
+                # Stored plies pass through for tactics rows (SLQ-06): mate
+                # rows carry ply=10 from the builder and must not be reset to 0.
+                if targets_m is not None:
+                    master_targets = np.asarray(targets_m, dtype=np.float32)
+                elif outcomes_m is not None:
+                    master_targets = _outcome_to_value_target(
+                        np.asarray(outcomes_m, dtype=np.uint8), self.is_syzygy
+                    )
+                else:
+                    master_targets = np.zeros((master_n, 3), dtype=np.float32)
+                targets_m = np.concatenate([master_targets, t_targets_arr])
 
-                # Replace memmaps with combined arrays stored as new memmaps.
-                # Staging files go to a private temp dir, never the source
-                # dataset tree (audit V-1 companion: loading a dataset must
-                # leave it byte-identical).
-                combined_tmp_dir = Path(tempfile.mkdtemp(prefix="zeropawn_gpu_combined_"))
-                combined_planes_path = combined_tmp_dir / "planes.bin"
-                combined_moves_path = combined_tmp_dir / "moves.bin"
-                combined_plies_path = combined_tmp_dir / "plies.bin"
-                combined_targets_path = combined_tmp_dir / "targets.bin"
-
-                # Write combined binary files
-                combined_planes_path.write_bytes(combined_planes.tobytes())
-                combined_moves_path.write_bytes(combined_moves.tobytes())
-                combined_plies_path.write_bytes(combined_plies.tobytes())
-                combined_targets_path.write_bytes(combined_targets.tobytes())
-
-                # Update master memmaps to point to combined files
-                # We create new memmap objects for the combined arrays
-                # Actually, for simplicity we'll just replace the variables in memory
-                # and use array-based processing in the chunk loop
-                # But the chunk loop expects np.memmap objects. Let's update them directly.
-                # Given time constraints, we'll use a simpler approach: replace memmaps with array views
-                # Actually, the cleanest approach is to just replace the variables that the chunk loop uses.
-                # Let's replace the memmap objects with array-based objects that have the same interface.
-                # Actually, the chunk loop uses `np.array(planes_m[start:end], ...)`. So we can replace
-                # `planes_m` with a numpy array directly.
-                planes_m = combined_planes
-                moves_m = combined_moves
-                plies_m = combined_plies
-                targets_m = combined_targets.reshape((combined_n := master_n + tactics_n, 3))
-                # For outcomes, create combined array with 255 for tactics portion
                 master_outcomes = (
-                    np.array(outcomes_m, dtype=np.uint8)
+                    np.asarray(outcomes_m, dtype=np.uint8)
                     if outcomes_m is not None
                     else np.zeros(master_n, dtype=np.uint8)
                 )
-                combined_outcomes = np.concatenate(
-                    [master_outcomes, np.full(tactics_n, 255, dtype=np.uint8)]
+                t_outcomes_arr = (
+                    np.asarray(t_outcomes_m, dtype=np.uint8)
+                    if t_outcomes_m is not None
+                    else np.full(tactics_n, OUTCOME_UNAVAILABLE, dtype=np.uint8)
                 )
-                outcomes_m = combined_outcomes
+                outcomes_m = np.concatenate([master_outcomes, t_outcomes_arr])
 
-                # Update counts
+                t_masks_path = self.tactics_dir / "masks.bin"
+                if t_masks_path.exists():
+                    _check_st_size(t_masks_path, tactics_n * MASK_PACKED_BYTES)
+                    t_masks_m = np.memmap(
+                        t_masks_path,
+                        dtype=np.uint8,
+                        mode="r",
+                        shape=(tactics_n, MASK_PACKED_BYTES),
+                    )
+
                 self.num_samples = master_n + tactics_n
-                # Replace memmap variables with array variables
-                # The chunk loop uses `np.array(planes_m[start:end])` which works for arrays
-                # Update shapes for array variables
-                # Actually, we can just replace `self.num_samples` and rely on array slicing
-                # The chunk loop will work since arrays support slicing.
-                # But we need to update the memmap list to include combined arrays (optional)
-                # For simplicity, we'll keep the original memmap references but the variables
-                # `planes_m`, `moves_m`, `plies_m` now point to arrays. The chunk loop
-                # uses `planes_m[start:end]` which works for arrays. The `np.array()` call
-                # around it creates a new array, which is fine.
-                # Let's just set the variables directly.
 
         self.sample_weights: Optional[torch.Tensor] = None
         # Build source-aware sampling weights if tactics_ratio is requested
         if tactics_ratio is not None:
             if not (0.0 <= tactics_ratio <= 1.0):
                 raise ValueError(f"tactics_ratio must be between 0.0 and 1.0, got {tactics_ratio}")
-            outcomes_bin = self.data_dir / "outcomes.bin"
-            # Fix masking logic: compute tactics_mask from the correct array,
-            # not by re-reading the master outcomes file with the combined size.
-            if tactics_n > 0:
-                # After concatenation, outcomes_m points to the combined array
-                # (numpy array or combined memmap). Read it safely.
-                outcomes_arr = np.array(outcomes_m, dtype=np.uint8)
+            if outcomes_m is not None:
+                # Combined (after concat) or master outcomes, already in memory.
+                outcomes_arr = np.asarray(outcomes_m, dtype=np.uint8)
                 tactics_mask = outcomes_arr == OUTCOME_UNAVAILABLE
-            elif outcomes_bin.exists():
-                # No tactics concatenated; read master file with master count
-                master_n_for_mask = master_n if "master_n" in locals() else self.num_samples
-                master_outcomes_m = np.memmap(
-                    outcomes_bin, dtype=np.uint8, mode="r", shape=(master_n_for_mask,)
-                )
-                tactics_mask = master_outcomes_m[:] == OUTCOME_UNAVAILABLE
             else:
                 # No outcomes file and no tactics concatenated; rely on ply==0
                 # but only when tactics_dir actually indicates tactical data.
-                plies_arr = np.array(plies_m, dtype=np.int16)
+                plies_arr = np.asarray(plies_m, dtype=np.int16)
                 tactics_mask = plies_arr == 0
             n_tactics = int(tactics_mask.sum())
             n_master = self.num_samples - n_tactics
@@ -729,6 +757,44 @@ class GpuResidentDataLoader:
                     w_np = np.where(tactics_mask, w_tactics, w_master).astype(np.float32)
                     self.sample_weights = torch.from_numpy(w_np).to(self.device)
 
+        # Segment layout for the (possibly combined) dataset. Planes and masks
+        # are read segment-aware so no full-size copy is ever materialized in
+        # host RAM (audit SLQ-12). A combined dataset carries a mask stream
+        # only when BOTH sources have one — a partial stream would silently
+        # change loss semantics for the uncovered rows.
+        if t_planes_m is not None:
+            planes_segments = [(planes_m, 0, master_n), (t_planes_m, master_n, master_n + tactics_n)]
+            if masks_m is not None and t_masks_m is not None:
+                mask_segments = [
+                    (masks_m, 0, master_n),
+                    (t_masks_m, master_n, master_n + tactics_n),
+                ]
+            else:
+                if masks_m is not None or t_masks_m is not None:
+                    print(
+                        "[GpuResidentDataLoader] WARNING: legal masks dropped for the combined "
+                        f"dataset — masks.bin exists on only one of the two sources "
+                        f"({self.data_dir} vs {self.tactics_dir}). Batches will carry no "
+                        "legal_mask (full-vocabulary smoothing fallback in the loss)."
+                    )
+                mask_segments = None
+        else:
+            planes_segments = [(planes_m, 0, self.num_samples)]
+            mask_segments = [(masks_m, 0, self.num_samples)] if masks_m is not None else None
+        self.has_masks = mask_segments is not None
+
+        def _read_segments(segments, start: int, end: int) -> np.ndarray:
+            """Concatenated rows [start, end) across (array, global_begin, global_end) segments."""
+            pieces = []
+            for arr, seg_begin, seg_end in segments:
+                lo = max(start, seg_begin)
+                hi = min(end, seg_end)
+                if lo < hi:
+                    pieces.append(np.asarray(arr[lo - seg_begin : hi - seg_begin]))
+            if not pieces:
+                raise RuntimeError(f"no segment covers rows [{start}, {end})")
+            return pieces[0] if len(pieces) == 1 else np.concatenate(pieces)
+
         # Calculate bytes per sample
         bytes_per_sample = (
             int(np.prod(self.planes_shape))
@@ -736,6 +802,7 @@ class GpuResidentDataLoader:
             + 8  # moves (long)
             + 3 * torch.tensor([], dtype=self.storage_dtype).element_size()  # targets
             + 8  # plies (long)
+            + (MASK_PACKED_BYTES if mask_segments is not None else 0)  # packed legal masks
         )
 
         # Determine how many samples fit in GPU VRAM
@@ -785,11 +852,19 @@ class GpuResidentDataLoader:
                 (self.gpu_capacity, 3), dtype=self.storage_dtype, device=self.device
             )
             self.gpu_plies = torch.empty((self.gpu_capacity,), dtype=torch.long, device=self.device)
+            self.gpu_masks = (
+                torch.empty(
+                    (self.gpu_capacity, MASK_PACKED_BYTES), dtype=torch.uint8, device=self.device
+                )
+                if mask_segments is not None
+                else None
+            )
         else:
             self.gpu_planes = None
             self.gpu_moves = None
             self.gpu_targets = None
             self.gpu_plies = None
+            self.gpu_masks = None
 
         # Allocate pinned host RAM tensors for spillover (or full dataset if on CPU)
         if self.spillover_count > 0:
@@ -804,18 +879,35 @@ class GpuResidentDataLoader:
                 (self.spillover_count, 3), dtype=self.storage_dtype, pin_memory=pin
             )
             self.ram_plies = torch.empty((self.spillover_count,), dtype=torch.long, pin_memory=pin)
+            self.ram_masks = (
+                torch.empty(
+                    (self.spillover_count, MASK_PACKED_BYTES), dtype=torch.uint8, pin_memory=pin
+                )
+                if mask_segments is not None
+                else None
+            )
         else:
             self.ram_planes = None
             self.ram_moves = None
             self.ram_targets = None
             self.ram_plies = None
+            self.ram_masks = None
 
-        # Populate tensors from disk memmaps in streaming chunks (single copy)
+        # Populate tensors from the source arrays in streaming chunks (single
+        # copy). Planes and masks read segment-aware (master rows, then tactics
+        # rows) so neither multi-GB array is ever fully materialized in RAM.
         for start in range(0, self.num_samples, chunk_size):
             end = min(start + chunk_size, self.num_samples)
-            p_chunk = torch.from_numpy(np.array(planes_m[start:end], dtype=np.float32))
+            p_chunk = torch.from_numpy(
+                np.array(_read_segments(planes_segments, start, end), dtype=np.float32)
+            )
             m_chunk = torch.from_numpy(np.array(moves_m[start:end], dtype=np.int64))
             pl_chunk = torch.from_numpy(np.array(plies_m[start:end], dtype=np.int64))
+            mk_chunk = (
+                torch.from_numpy(np.array(_read_segments(mask_segments, start, end)))
+                if mask_segments is not None
+                else None
+            )
 
             if targets_m is not None:
                 t_chunk = torch.from_numpy(np.array(targets_m[start:end], dtype=np.float32))
@@ -835,6 +927,8 @@ class GpuResidentDataLoader:
                 self.gpu_moves[gpu_start:gpu_end].copy_(m_chunk[:chunk_slice_end])
                 self.gpu_targets[gpu_start:gpu_end].copy_(t_chunk[:chunk_slice_end])
                 self.gpu_plies[gpu_start:gpu_end].copy_(pl_chunk[:chunk_slice_end])
+                if mk_chunk is not None:
+                    self.gpu_masks[gpu_start:gpu_end].copy_(mk_chunk[:chunk_slice_end])
 
                 # Remainder goes to RAM
                 if end > self.gpu_capacity:
@@ -845,6 +939,8 @@ class GpuResidentDataLoader:
                     self.ram_moves[ram_start:ram_end].copy_(m_chunk[rem_slice])
                     self.ram_targets[ram_start:ram_end].copy_(t_chunk[rem_slice])
                     self.ram_plies[ram_start:ram_end].copy_(pl_chunk[rem_slice])
+                    if mk_chunk is not None:
+                        self.ram_masks[ram_start:ram_end].copy_(mk_chunk[rem_slice])
             else:
                 # All in RAM
                 ram_start = start - self.gpu_capacity
@@ -853,8 +949,13 @@ class GpuResidentDataLoader:
                 self.ram_moves[ram_start:ram_end].copy_(m_chunk)
                 self.ram_targets[ram_start:ram_end].copy_(t_chunk)
                 self.ram_plies[ram_start:ram_end].copy_(pl_chunk)
+                if mk_chunk is not None:
+                    self.ram_masks[ram_start:ram_end].copy_(mk_chunk)
 
-        # Explicitly release disk memmaps (close file handles)
+        # Explicitly release disk memmaps (close file handles). Planes/masks
+        # have been fully copied into the GPU/RAM buffers; segment references
+        # (including the tactics shards, which are not tracked in _memmaps)
+        # are dropped so every mapping can be released.
         for mm in self._memmaps:
             try:
                 mm._mmap.close()  # type: ignore[attr-defined]
@@ -862,13 +963,26 @@ class GpuResidentDataLoader:
                 logger.debug("memmap close failed", exc_info=True)
         self._memmaps.clear()
         del planes_m, moves_m, plies_m
+        if t_planes_m is not None:
+            try:
+                t_planes_m._mmap.close()  # type: ignore[attr-defined]
+            except (AttributeError, ValueError, OSError):
+                logger.debug("tactics planes memmap close failed", exc_info=True)
+        if t_masks_m is not None:
+            try:
+                t_masks_m._mmap.close()  # type: ignore[attr-defined]
+            except (AttributeError, ValueError, OSError):
+                logger.debug("tactics masks memmap close failed", exc_info=True)
+        planes_segments = None
+        mask_segments = None
 
         gpu_mb = (self.gpu_capacity * bytes_per_sample) / (1024 * 1024)
         ram_mb = (self.spillover_count * bytes_per_sample) / (1024 * 1024)
         print(
             f"[GpuResidentDataLoader] Loaded {self.num_samples:,} samples: "
             f"{self.gpu_capacity:,} in GPU VRAM ({gpu_mb:.1f} MB), "
-            f"{self.spillover_count:,} in RAM ({ram_mb:.1f} MB)."
+            f"{self.spillover_count:,} in RAM ({ram_mb:.1f} MB). "
+            f"legal masks: {'yes' if self.has_masks else 'NO (schema-1 dataset)'}"
         )
 
     def __len__(self) -> int:
@@ -887,10 +1001,12 @@ class GpuResidentDataLoader:
         self.gpu_moves = None
         self.gpu_targets = None
         self.gpu_plies = None
+        self.gpu_masks = None
         self.ram_planes = None
         self.ram_moves = None
         self.ram_targets = None
         self.ram_plies = None
+        self.ram_masks = None
         self.sample_weights = None
         if hasattr(self, "device") and getattr(self.device, "type", None) == "cuda":
             import gc
@@ -927,9 +1043,10 @@ class GpuResidentDataLoader:
             "moves": None,
             "targets": None,
             "plies": None,
+            "masks": None,
         }
 
-        def _staging(curr_bs: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        def _staging(curr_bs: int) -> tuple[torch.Tensor, ...]:
             bp = _buf["planes"]
             if bp is None or bp.shape[0] < curr_bs:
                 bp = torch.empty(
@@ -941,7 +1058,14 @@ class GpuResidentDataLoader:
                 bm = torch.empty((self.batch_size,), dtype=torch.long, device=self.device)
                 bt = torch.empty((self.batch_size, 3), dtype=self.storage_dtype, device=self.device)
                 bl = torch.empty((self.batch_size,), dtype=torch.long, device=self.device)
-                _buf.update({"planes": bp, "moves": bm, "targets": bt, "plies": bl})
+                bmk = (
+                    torch.empty(
+                        (self.batch_size, MASK_PACKED_BYTES), dtype=torch.uint8, device=self.device
+                    )
+                    if self.has_masks
+                    else None
+                )
+                _buf.update({"planes": bp, "moves": bm, "targets": bt, "plies": bl, "masks": bmk})
             assert (
                 _buf["moves"] is not None
                 and _buf["targets"] is not None
@@ -953,6 +1077,7 @@ class GpuResidentDataLoader:
                 _buf["moves"][:curr_bs].clone(),
                 _buf["targets"][:curr_bs].clone(),
                 _buf["plies"][:curr_bs].clone(),
+                _buf["masks"][:curr_bs].clone() if _buf["masks"] is not None else None,
             )
 
         for start in range(0, limit, self.batch_size):
@@ -963,34 +1088,45 @@ class GpuResidentDataLoader:
 
             if self.spillover_count == 0:
                 # 100% GPU VRAM resident: instantaneous tensor slice
-                yield {
+                batch = {
                     "planes": self.gpu_planes[idx],
                     "move": self.gpu_moves[idx],
                     "value_target": self.gpu_targets[idx],
                     "ply": self.gpu_plies[idx],
                 }
+                if self.has_masks:
+                    batch["legal_mask"] = decode_packed_masks(self.gpu_masks[idx])
+                yield batch
             elif self.gpu_capacity == 0:
                 # 100% Host RAM resident
                 idx_cpu = idx.cpu()
-                yield {
+                batch = {
                     "planes": self.ram_planes[idx_cpu].to(self.device, non_blocking=True),
                     "move": self.ram_moves[idx_cpu].to(self.device, non_blocking=True),
                     "value_target": self.ram_targets[idx_cpu].to(self.device, non_blocking=True),
                     "ply": self.ram_plies[idx_cpu].to(self.device, non_blocking=True),
                 }
+                if self.has_masks:
+                    batch["legal_mask"] = decode_packed_masks(
+                        self.ram_masks[idx_cpu].to(self.device, non_blocking=True)
+                    )
+                yield batch
             else:
                 # Tiered storage: blend GPU VRAM + host RAM spillover
                 mask_gpu = idx < self.gpu_capacity
                 if mask_gpu.all():
-                    yield {
+                    batch = {
                         "planes": self.gpu_planes[idx],
                         "move": self.gpu_moves[idx],
                         "value_target": self.gpu_targets[idx],
                         "ply": self.gpu_plies[idx],
                     }
+                    if self.has_masks:
+                        batch["legal_mask"] = decode_packed_masks(self.gpu_masks[idx])
+                    yield batch
                 elif (~mask_gpu).all():
                     idx_ram = (idx - self.gpu_capacity).cpu()
-                    yield {
+                    batch = {
                         "planes": self.ram_planes[idx_ram].to(self.device, non_blocking=True),
                         "move": self.ram_moves[idx_ram].to(self.device, non_blocking=True),
                         "value_target": self.ram_targets[idx_ram].to(
@@ -998,9 +1134,14 @@ class GpuResidentDataLoader:
                         ),
                         "ply": self.ram_plies[idx_ram].to(self.device, non_blocking=True),
                     }
+                    if self.has_masks:
+                        batch["legal_mask"] = decode_packed_masks(
+                            self.ram_masks[idx_ram].to(self.device, non_blocking=True)
+                        )
+                    yield batch
                 else:
                     curr_bs = end - start
-                    b_planes, b_moves, b_targets, b_plies = _staging(curr_bs)
+                    b_planes, b_moves, b_targets, b_plies, b_masks = _staging(curr_bs)
 
                     idx_gpu = idx[mask_gpu]
                     idx_ram = (idx[~mask_gpu] - self.gpu_capacity).cpu()
@@ -1021,9 +1162,16 @@ class GpuResidentDataLoader:
                     b_plies[mask_gpu] = self.gpu_plies[idx_gpu]
                     b_plies[~mask_gpu] = self.ram_plies[idx_ram].to(self.device, non_blocking=True)
 
-                    yield {
+                    batch = {
                         "planes": b_planes,
                         "move": b_moves,
                         "value_target": b_targets,
                         "ply": b_plies,
                     }
+                    if self.has_masks and b_masks is not None:
+                        b_masks[mask_gpu] = self.gpu_masks[idx_gpu]
+                        b_masks[~mask_gpu] = self.ram_masks[idx_ram].to(
+                            self.device, non_blocking=True
+                        )
+                        batch["legal_mask"] = decode_packed_masks(b_masks)
+                    yield batch

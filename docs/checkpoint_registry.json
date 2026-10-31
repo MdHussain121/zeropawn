@@ -1,7 +1,7 @@
 {
   "version": 1,
-  "updated": "2026-10-29",
-  "updated_by": "Stage A correctness remediation (branch fix/stage-a-correctness-20261029)",
+  "updated": "2026-10-31",
+  "updated_by": "Supervised-learning remediation (branch fix/supervised-learning-remediation-20261031, audit A-02 SLQ-01/SLQ-02): both surviving supervised checkpoints disqualified as warm-start sources; artifacts preserved unmodified",
   "verification_method": "Full SHA-256 recomputed from files on disk 2026-10-29 (never copied from reports); architecture and step metadata read from checkpoint headers via python.model.checkpoint_registry.inspect_checkpoint.",
   "authority": "models/manifest.json (reconciliation 2026-10-26) for lineage; this registry for verifiable on-disk status.",
   "architecture_required": {
@@ -11,14 +11,14 @@
     "num_actions": 4672
   },
   "warm_start_designation": "NONE",
-  "designation_note": "Unresolved pending a controlled comparison (Stage C/D): the historically documented guidance says scaled, while the de-facto warm start was finetune, and manifest warm_start_designation was 'NONE' as of 2026-10-26. No default may silently select random weights; an RL campaign must either designate an entry below (set designated_warm_start=true with evidence) or pass --allow-unverified-warm-start as a logged operator override.",
+  "designation_note": "No checkpoint is designated as an RL warm start. The two surviving supervised checkpoints are DISQUALIFIED (corrupted value heads, SLQ-01). A new designation requires the remediation roadmap P0-2 procedure: rebuilt dataset acceptance + seeded retraining + validation + registry validation of the new artifact.",
   "designation_procedure": "Edit the chosen verified entry: set designated_warm_start=true and add designation_evidence (comparison run, date, who/what approved). Then scripts/validate_checkpoints.py must pass.",
   "checkpoints": [
     {
       "path": "models/checkpoints_scaled/latest_checkpoint.pt",
       "sha256": "36e92cae05791c39ab4d5f34e5b2a4603916d8d581bc8897808531f36bf141a9",
       "size_bytes": 103673607,
-      "status": "verified",
+      "status": "disqualified",
       "role": "supervised_scaled_continuation",
       "step": 24325,
       "optimizer_state": "AdamW (supervised trainer; NOT resumable by the SGD RL trainer)",
@@ -29,13 +29,22 @@
       "designated_warm_start": false,
       "verified_at": "2026-10-29",
       "id": "ckpt-01-supervised_scaled_continuation",
-      "file": "models/checkpoints_scaled/latest_checkpoint.pt"
+      "file": "models/checkpoints_scaled/latest_checkpoint.pt",
+      "disqualified_at": "2026-10-31",
+      "disqualification": {
+        "reason": "superseded_value_head",
+        "finding": "SLQ-01 (Critical, A-02 supervised-learning audit)",
+        "detail": "Value head trained on corrupted value targets (masked rows decoded to a non-loss class by never-committed 2026-10-20 run-time code). Never valid as a value prior (MCTS init or RL warm start); policy-head measurements from these artifacts remain documented but no strength claim is attached.",
+        "evidence": "A-02 supervised-learning audit (audit/supervised-learning-quality-20261030 @ 4d7fe4f), remediated 2026-10-31 on fix/supervised-learning-remediation-20261031. Forensic chain: (1) scaled checkpoint's AdamW state carries step=24,325 with non-zero first/second moments for all 7 value-head tensors while the current dataset train split is 100% masked (255) and current code yields exactly zero value gradient on those bytes; (2) finetune checkpoint carries optimizer state for exactly all except the 7 value tensors, and its value weights are bit-identical to the scaled checkpoint's; (3) held-out probes: P(predict loss)=0.0000, per-class CE on loss rows = 18.1, WDL CE 6.8-7.0 vs uniform 1.099. Both value heads were trained on corrupted targets produced by the never-committed 2026-10-20 run-time code.",
+        "successor": "New baseline to be produced by the 2026-10-31 remediation: rebuilt dataset_training (schema-2, genuine WDL labels, receipts) + seeded controlled retraining. Files on disk are preserved unmodified for archaeology."
+      },
+      "prior_status": "verified"
     },
     {
       "path": "models/checkpoints_finetune/latest_checkpoint.pt",
       "sha256": "7e7fd868554867368d0e47d3d68d1b9a683edb11cc101c40416716728bea09ef",
       "size_bytes": 101532896,
-      "status": "verified",
+      "status": "disqualified",
       "role": "supervised_finetune_continuation",
       "step": 6000,
       "optimizer_state": "AdamW (supervised trainer; NOT resumable by the SGD RL trainer)",
@@ -46,7 +55,16 @@
       "designated_warm_start": false,
       "verified_at": "2026-10-29",
       "id": "ckpt-02-supervised_finetune_continuation",
-      "file": "models/checkpoints_finetune/latest_checkpoint.pt"
+      "file": "models/checkpoints_finetune/latest_checkpoint.pt",
+      "disqualified_at": "2026-10-31",
+      "disqualification": {
+        "reason": "superseded_value_head",
+        "finding": "SLQ-01 (Critical, A-02 supervised-learning audit)",
+        "detail": "Value head trained on corrupted value targets (masked rows decoded to a non-loss class by never-committed 2026-10-20 run-time code). Never valid as a value prior (MCTS init or RL warm start); policy-head measurements from these artifacts remain documented but no strength claim is attached.",
+        "evidence": "A-02 supervised-learning audit (audit/supervised-learning-quality-20261030 @ 4d7fe4f), remediated 2026-10-31 on fix/supervised-learning-remediation-20261031. Forensic chain: (1) scaled checkpoint's AdamW state carries step=24,325 with non-zero first/second moments for all 7 value-head tensors while the current dataset train split is 100% masked (255) and current code yields exactly zero value gradient on those bytes; (2) finetune checkpoint carries optimizer state for exactly all except the 7 value tensors, and its value weights are bit-identical to the scaled checkpoint's; (3) held-out probes: P(predict loss)=0.0000, per-class CE on loss rows = 18.1, WDL CE 6.8-7.0 vs uniform 1.099. Both value heads were trained on corrupted targets produced by the never-committed 2026-10-20 run-time code.",
+        "successor": "New baseline to be produced by the 2026-10-31 remediation: rebuilt dataset_training (schema-2, genuine WDL labels, receipts) + seeded controlled retraining. Files on disk are preserved unmodified for archaeology."
+      },
+      "prior_status": "verified"
     },
     {
       "path": "models/checkpoints_rl/phase4_ckpt_v5_step997.pt",

@@ -569,20 +569,45 @@ def check_split_integrity(
     val_dir: Path,
     exhaustive_states: bool = True,
     max_bounded_rows: int = 2000,
+    test_dir: Optional[Path] = None,
 ) -> List[CheckResult]:
-    """Layer D between two splits: group-ID disjointness + encoded-state overlap.
+    """Layer D between splits: group-ID disjointness + encoded-state overlap.
 
-    Returns check results only; callers decide exit codes. State overlap is
-    classified into same-target and conflicting-target duplicates. When
+    Checks the train/val pair, plus train/test and val/test when a test split
+    is provided (audit SLQ-09: an independent test split must be disjoint from
+    both). Returns check results only; callers decide exit codes. State overlap
+    is classified into same-target and conflicting-target duplicates. When
     ``exhaustive_states`` is False only the first ``max_bounded_rows`` rows of
     each split are compared and the result is BOUNDED, never "disjoint".
     """
     results: List[CheckResult] = []
-    train_dir, val_dir = Path(train_dir), Path(val_dir)
+    pairs: List[Tuple[str, Path, Path]] = [("val", train_dir, val_dir)]
+    if test_dir is not None:
+        pairs.append(("test", train_dir, test_dir))
+        pairs.append(("test-vs-val", val_dir, test_dir))
+    for label, a_dir, b_dir in pairs:
+        results.extend(
+            _check_pair_integrity(
+                a_dir, b_dir, exhaustive_states=exhaustive_states, max_bounded_rows=max_bounded_rows
+            )
+        )
+    return results
+
+
+def _check_pair_integrity(
+    a_dir: Path,
+    b_dir: Path,
+    exhaustive_states: bool,
+    max_bounded_rows: int,
+) -> List[CheckResult]:
+    """Layer D for one split pair: group-ID disjointness + encoded-state overlap."""
+    results: List[CheckResult] = []
+    a_dir, b_dir = Path(a_dir), Path(b_dir)
+    a_label, b_label = a_dir.name or "a", b_dir.name or "b"
 
     ids_ok = True
     id_sets: List[Tuple[str, set[int]]] = []
-    for label, d in (("train", train_dir), ("val", val_dir)):
+    for label, d in ((a_label, a_dir), (b_label, b_dir)):
         p = d / "game_ids.bin"
         if not p.is_file():
             results.append(
@@ -597,8 +622,8 @@ def check_split_integrity(
             ids = np.fromfile(p, dtype=np.uint64)
             id_sets.append((label, set(int(x) for x in np.unique(ids))))
     if ids_ok:
-        train_ids, val_ids = id_sets[0][1], id_sets[1][1]
-        shared = train_ids & val_ids
+        a_ids, b_ids = id_sets[0][1], id_sets[1][1]
+        shared = a_ids & b_ids
         results.append(
             CheckResult(
                 "group_id_disjointness",
@@ -606,15 +631,15 @@ def check_split_integrity(
                 (
                     f"{len(shared)} group IDs shared across splits"
                     if shared
-                    else f"0 shared group IDs (train {len(train_ids):,}, val {len(val_ids):,} unique)"
+                    else f"0 shared group IDs ({a_label} {len(a_ids):,}, {b_label} {len(b_ids):,} unique)"
                 ),
                 coverage="exhaustive (all rows)",
             )
         )
 
-    tr_meta, err_tr = _read_metadata(train_dir)
-    va_meta, err_va = _read_metadata(val_dir)
-    if err_tr or err_va or tr_meta is None or va_meta is None:
+    a_meta, err_a = _read_metadata(a_dir)
+    b_meta, err_b = _read_metadata(b_dir)
+    if err_a or err_b or a_meta is None or b_meta is None:
         results.append(
             CheckResult(
                 "encoded_state_overlap",
@@ -624,51 +649,53 @@ def check_split_integrity(
         )
         return results
 
-    tr_n = int(tr_meta["num_samples"])
-    va_n = int(va_meta["num_samples"])
+    a_n = int(a_meta["num_samples"])
+    b_n = int(b_meta["num_samples"])
     limit = None if exhaustive_states else max_bounded_rows
-    train_hashes, n_tr = _plane_row_hashes(train_dir / "planes.bin", tr_n, limit)
-    val_hashes, n_va = _plane_row_hashes(val_dir / "planes.bin", va_n, limit)
+    a_hashes, n_a = _plane_row_hashes(a_dir / "planes.bin", a_n, limit)
+    b_hashes, n_b = _plane_row_hashes(b_dir / "planes.bin", b_n, limit)
 
-    shared_keys = set(train_hashes) & set(val_hashes)
+    shared_keys = set(a_hashes) & set(b_hashes)
     same_target = 0
     conflicts: List[Dict[str, Any]] = []
-    tr_moves = np.fromfile(train_dir / "moves.bin", dtype=np.int16)
-    va_moves = np.fromfile(val_dir / "moves.bin", dtype=np.int16)
+    a_moves = np.fromfile(a_dir / "moves.bin", dtype=np.int16)
+    b_moves = np.fromfile(b_dir / "moves.bin", dtype=np.int16)
     for key in shared_keys:
-        tr_rows = train_hashes[key]
-        va_rows = val_hashes[key]
-        if int(tr_moves[tr_rows[0]]) == int(va_moves[va_rows[0]]):
+        a_rows = a_hashes[key]
+        b_rows = b_hashes[key]
+        if int(a_moves[a_rows[0]]) == int(b_moves[b_rows[0]]):
             same_target += 1
         else:
             conflicts.append(
                 {
                     "state_md5": key.hex(),
-                    "train_rows": tr_rows[:4],
-                    "val_rows": va_rows[:4],
-                    "train_move": int(tr_moves[tr_rows[0]]),
-                    "val_move": int(va_moves[va_rows[0]]),
+                    "a_rows": a_rows[:4],
+                    "b_rows": b_rows[:4],
+                    "a_move": int(a_moves[a_rows[0]]),
+                    "b_move": int(b_moves[b_rows[0]]),
                 }
             )
-    within_train_dupes = sum(len(v) - 1 for v in train_hashes.values() if len(v) > 1)
-    within_val_dupes = sum(len(v) - 1 for v in val_hashes.values() if len(v) > 1)
+    within_a_dupes = sum(len(v) - 1 for v in a_hashes.values() if len(v) > 1)
+    within_b_dupes = sum(len(v) - 1 for v in b_hashes.values() if len(v) > 1)
 
     if exhaustive_states:
         status = CheckStatus.FAIL if shared_keys else CheckStatus.PASS
-        coverage = f"exhaustive (train {n_tr:,} rows, val {n_va:,} rows)"
+        coverage = f"exhaustive ({a_label} {n_a:,} rows, {b_label} {n_b:,} rows)"
         detail = (
-            f"{len(shared_keys)} encoded states cross the split boundary "
+            f"{len(shared_keys)} encoded states cross the {a_label}/{b_label} boundary "
             f"(same-target: {same_target}, conflicting-target: {len(conflicts)}); "
-            f"within-split duplicate rows: train {within_train_dupes:,}, val {within_val_dupes:,}"
+            f"within-split duplicate rows: {a_label} {within_a_dupes:,}, {b_label} {within_b_dupes:,}"
             if shared_keys
             else (
-                f"0 cross-split encoded states; within-split duplicate rows: "
-                f"train {within_train_dupes:,}, val {within_val_dupes:,}"
+                f"0 cross-split encoded states ({a_label}/{b_label}); within-split duplicate rows: "
+                f"{a_label} {within_a_dupes:,}, {b_label} {within_b_dupes:,}"
             )
         )
     else:
         status = CheckStatus.BOUNDED if not shared_keys else CheckStatus.FAIL
-        coverage = f"first {n_tr:,} of {tr_n:,} train rows, first {n_va:,} of {va_n:,} val rows"
+        coverage = (
+            f"first {n_a:,} of {a_n:,} {a_label} rows, first {n_b:,} of {b_n:,} {b_label} rows"
+        )
         detail = (
             f"{len(shared_keys)} encoded states overlap in the bounded prefix "
             f"(same-target: {same_target}, conflicting-target: {len(conflicts)}); "
