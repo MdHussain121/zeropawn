@@ -191,7 +191,11 @@ def _assign_split_by_family(
     for pid in puzzles:
         root = find(pid)
         if root not in component_split:
-            component_split[root] = "train"
+            # A component's initial split is its FIRST member's hash-based
+            # candidate (not "train" — that default made every component
+            # train and left the val split permanently empty, a latent bug in
+            # this builder surfaced by the 2026-10-31 rebuild, audit SLQ-10).
+            component_split[root] = candidate_split[pid]
         if candidate_split[pid] == "train":
             component_split[root] = "train"
 

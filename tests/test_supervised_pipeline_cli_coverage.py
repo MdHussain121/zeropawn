@@ -11,7 +11,9 @@ Validates that:
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
+import numpy as np
 import pytest
 import torch
 
@@ -115,48 +117,72 @@ def test_interactive_dispatch_execution(tmp_path):
 
 
 def test_synthetic_end_to_end_pipeline(tmp_path):
-    """Fast hermetic end-to-end integration test:
-    Synthetic PGN -> build binary dataset -> train 2 steps on CPU -> save checkpoint -> reload model.
+    """Fast hermetic end-to-end integration test (audit SLQ-21 remediation):
+    Synthetic PGN -> builder helpers -> validation receipt -> certified
+    fail-closed data gate -> train 2 steps on CPU -> telemetry + stamped
+    checkpoint -> reload model.
+
+    This is the production consumption path: the data gate runs in its
+    default (certified) mode, so the fixture must carry role metadata and a
+    genuine validation receipt — exactly what the stale pre-remediation test
+    could not do.
     """
     import chess
     import chess.pgn
     from python.data.build_dataset import process_pgn_game, save_dataset_split
+    from python.data.dataset_validation import validate_split, write_receipt
 
-    # 1. Create a tiny synthetic PGN with 2 games
+    # 1. Create a tiny synthetic PGN with 3 games (different results so the
+    #    WDL labels cover all three classes).
     pgn_path = tmp_path / "synthetic_games.pgn"
     with open(pgn_path, "w", encoding="utf-8") as f:
         f.write(
             '[Event "Test"]\n[White "Player1"]\n[Black "Player2"]\n[Result "1-0"]\n\n'
             "1. e4 e5 2. Nf3 Nc6 3. Bb5 a6 4. Ba4 Nf6 5. O-O Be7 6. Re1 b5 7. Bb3 d6 8. c3 O-O 9. h3 Nb8 10. d4 Nbd7 1-0\n\n"
             '[Event "Test 2"]\n[White "Player3"]\n[Black "Player4"]\n[Result "0-1"]\n\n'
-            "1. d4 d5 2. c4 e6 3. Nc3 Nf6 4. Nf3 Be7 5. Bg5 O-O 6. e3 Nbd7 7. Rc1 c6 8. Bd3 dxc4 9. Bxc4 Nd5 10. Bxe7 Qxe7 0-1\n"
+            "1. d4 d5 2. c4 e6 3. Nc3 Nf6 4. Nf3 Be7 5. Bg5 O-O 6. e3 Nbd7 7. Rc1 c6 8. Bd3 dxc4 9. Bxc4 Nd5 10. Bxe7 Qxe7 0-1\n\n"
+            '[Event "Test 3"]\n[White "Player5"]\n[Black "Player6"]\n[Result "1/2-1/2"]\n\n'
+            "1. Nf3 Nf6 2. g3 g6 3. Bg2 Bg7 4. O-O O-O 5. d3 d6 6. e3 e5 7. Nc3 Nc6 8. h3 h6 9. Be3 Be6 10. Qd2 Qd7 1/2-1/2\n"
         )
 
-    # 2. Convert to binary dataset
+    # 2. Convert to binary dataset via the production helpers, placing games
+    #    deterministically so train/val are both non-empty.
     train_positions = []
     val_positions = []
+    game_no = 0
     with open(pgn_path, "r", encoding="utf-8") as f:
         while True:
             game = chess.pgn.read_game(f)
             if game is None:
                 break
-            gid, is_val, pos_list = process_pgn_game(game)
-            if is_val:
-                val_positions.extend(pos_list)
-            else:
+            gid, split, pos_list = process_pgn_game(game)
+            if game_no == 0:
                 train_positions.extend(pos_list)
+            else:
+                val_positions.extend(pos_list)
+            game_no += 1
 
-    if not val_positions and train_positions:
-        val_positions.append(train_positions.pop())
-
+    assert train_positions and val_positions
     ds_dir = tmp_path / "synth_ds"
     save_dataset_split(ds_dir / "train", train_positions, "train")
     save_dataset_split(ds_dir / "val", val_positions, "val")
 
     assert (ds_dir / "train" / "planes.bin").is_file()
     assert (ds_dir / "train" / "metadata.json").is_file()
+    assert (ds_dir / "train" / "stm.bin").is_file()
 
-    # 3. Train tiny model for 2 steps on CPU
+    # 3. Certify the dataset: genuine validation receipt binding the bytes.
+    reports = {
+        split: validate_split(
+            ds_dir / split, scan_planes="bounded", plane_scan_rows=100, check_build_record=False
+        )
+        for split in ("train", "val")
+    }
+    for split, report in reports.items():
+        assert report.overall == "pass", f"{split} fixture must validate"
+    write_receipt(ds_dir, reports, overall="pass")
+
+    # 4. Train tiny model for 2 steps on CPU through the CERTIFIED gate.
     ckpt_dir = tmp_path / "ckpts"
     metrics = train_supervised(
         train_dir=ds_dir / "train",
@@ -173,16 +199,36 @@ def test_synthetic_end_to_end_pipeline(tmp_path):
         num_filters=32,
         num_workers=0,
         gpu_resident=False,
+        seed=1234,
     )
     assert "total_loss" in metrics
 
-    # 4. Checkpoint reloading and inference verification
+    # 5. Durable telemetry (audit SLQ-02): manifest + JSONL stream must exist
+    #    and bind the run to the receipt-identified dataset.
+    manifest = json.loads((ckpt_dir / "run_manifest.json").read_text())
+    assert manifest["status"] == "completed"
+    assert manifest["seed"] == 1234
+    assert manifest["model"]["param_count"] > 0
+    assert manifest["dataset"]["train"]["certified"] is True
+    assert manifest["dataset"]["train"]["receipt_id"] is not None
+    telemetry_lines = (ckpt_dir / "telemetry.jsonl").read_text().splitlines()
+    events = [json.loads(line)["event"] for line in telemetry_lines]
+    assert "run_started" in events
+    assert "train_step" in events
+    assert "epoch_end" in events
+    assert "checkpoint_saved" in events
+
+    # 6. Checkpoint reloading and inference verification, with the SLQ-17
+    #    stamps and provenance metadata present.
     best_ckpt = ckpt_dir / "best_model.pt"
     assert best_ckpt.is_file()
     ckpt_data = torch.load(best_ckpt, map_location="cpu", weights_only=True)
     assert "model" in ckpt_data
     assert "metadata" in ckpt_data
     assert ckpt_data["metadata"]["architecture"] == "2 ResBlocks x 32 Filters"
+    assert ckpt_data.get("checkpoint_type") == "supervised"
+    assert ckpt_data.get("_optimizer_type") == "AdamW"
+    assert ckpt_data.get("run_metadata", {}).get("seed") == 1234
 
     model = ChessNet(in_channels=19, num_filters=32, num_blocks=2, num_actions=4672)
     model.load_state_dict(ckpt_data["model"])
@@ -195,3 +241,66 @@ def test_synthetic_end_to_end_pipeline(tmp_path):
     val_pred = model.predict_value(sample_input)
     assert val_pred.shape == (1,)
     assert -1.0 <= val_pred.item() <= 1.0
+
+
+def test_synthetic_end_to_end_window_skip(tmp_path):
+    """A non-finite micro-batch aborts its window: no optimizer advance, and
+    the skip is visible in the durable telemetry (audit SLQ-16)."""
+    from types import SimpleNamespace
+
+    from python.data.build_dataset import save_dataset_split
+
+    rng = np.random.default_rng(0)
+
+    def rows(n, outcomes, nan_row=None):
+        out = []
+        for i in range(n):
+            planes = rng.random((19, 8, 8), dtype=np.float32)
+            if nan_row is not None and i == nan_row:
+                planes[0, 0, 0] = float("nan")
+            out.append(
+                SimpleNamespace(
+                    planes=planes,
+                    move_idx=int(rng.integers(0, 4672)),
+                    outcome=outcomes[i % 3],
+                    game_id=500 + i,
+                    ply=10,
+                    pos_hash=0,
+                    legal_mask=np.packbits(np.ones(4672, dtype=bool)),
+                    stm=i % 2,
+                )
+            )
+        return out
+
+    ds_dir = tmp_path / "ds"
+    save_dataset_split(ds_dir / "train", rows(8, [0, 1, 2], nan_row=3), "train")
+    save_dataset_split(ds_dir / "val", rows(4, [0, 1, 2, 0]), "val")
+    ckpt_dir = tmp_path / "ckpts"
+    metrics = train_supervised(
+        train_dir=ds_dir / "train",
+        val_dir=ds_dir / "val",
+        batch_size=4,
+        micro_batch_size=2,
+        gradient_accumulation_steps=2,
+        base_lr=0.001,
+        warmup_steps=1,
+        epochs=1,
+        max_steps=20,
+        checkpoint_dir=ckpt_dir,
+        num_blocks=2,
+        num_filters=32,
+        num_workers=0,
+        gpu_resident=False,
+        # The synthetic rows carry NaN planes, which the plane scan rejects;
+        # the fail-closed gate would (correctly) refuse them. This test
+        # exercises the loop's skip path, so it opts out explicitly and loudly.
+        allow_uncertified_data=True,
+        verify_identity="stat",
+    )
+    telemetry_lines = (ckpt_dir / "telemetry.jsonl").read_text().splitlines()
+    records = [json.loads(line) for line in telemetry_lines]
+    skipped = [r for r in records if r.get("event") == "train_step" and r.get("window_skipped")]
+    assert skipped, "the NaN row's window must be reported as skipped in telemetry"
+    # The manifest records the run regardless of the skip.
+    manifest = json.loads((ckpt_dir / "run_manifest.json").read_text())
+    assert manifest["status"] == "completed"

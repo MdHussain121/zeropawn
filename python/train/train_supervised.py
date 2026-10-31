@@ -339,6 +339,12 @@ def train_step(
     moves = batch["move"].to(device, non_blocking=True)
     value_targets = batch["value_target"].to(device, non_blocking=True)
     plies = batch["ply"].to(device, non_blocking=True)
+    # The legal mask must ride with the batch: the disk-backed loader yields
+    # CPU tensors while the model runs on CUDA (the GPU-resident loader
+    # yields device tensors, so this is a no-op there).
+    legal_mask = batch.get("legal_mask")
+    if legal_mask is not None:
+        legal_mask = legal_mask.to(device, non_blocking=True)
 
     if zero_grad:
         optimizer.zero_grad(set_to_none=True)
@@ -356,7 +362,7 @@ def train_step(
         # only (SL-01); falls back to full-vocabulary smoothing when the batch
         # carries no mask stream (logged once).
         policy_loss = legal_masked_policy_loss(
-            policy_logits, moves, batch.get("legal_mask"), label_smoothing=0.05
+            policy_logits, moves, legal_mask, label_smoothing=0.05
         )
 
         # Value loss: Cross-Entropy with soft WDL targets + mask for first 10 plies
@@ -458,6 +464,9 @@ def evaluate(
             moves = batch["move"].to(device, non_blocking=True)
             value_targets = batch["value_target"].to(device, non_blocking=True)
             plies = batch["ply"].to(device, non_blocking=True)
+            batch_legal_mask = batch.get("legal_mask")
+            if batch_legal_mask is not None:
+                batch_legal_mask = batch_legal_mask.to(device, non_blocking=True)
             batch_sz = moves.size(0)
 
             autocast_context = (
@@ -474,7 +483,7 @@ def evaluate(
                 # the batch carries a mask stream), summed per-sample for
                 # exact averaging over the split.
                 per_sample_policy = legal_masked_policy_loss(
-                    policy_logits, moves, batch.get("legal_mask"), label_smoothing=0.05
+                    policy_logits, moves, batch_legal_mask, label_smoothing=0.05
                 )
                 policy_loss = per_sample_policy * batch_sz
                 log_wdl = F.log_softmax(wdl_logits, dim=-1)
@@ -729,7 +738,9 @@ def _build_run_metadata(
         "host": {
             "platform": _platform.platform(),
             "python": _platform.python_version(),
-            "torch": torch.__version__,
+            # str(): torch.__version__ is a TorchVersion instance, which the
+            # weights_only unpickler rejects on reload (SLQ-13 contract).
+            "torch": str(torch.__version__),
             "device": str(device),
             "device_name": torch.cuda.get_device_name(0) if device.type == "cuda" else "CPU",
         },
@@ -1243,10 +1254,11 @@ def train_supervised(
                     writer.add_scalar("train/lr", lr, global_step)
                     writer.add_scalar("perf/samples_per_sec", sps, global_step)
 
-                # Durable telemetry (audit SLQ-02): every log interval, plus the
-                # value-head gradient diagnostics proving WDL supervision
-                # reaches the value head.
-                if global_step % 20 == 0 or window_skip:
+                # Durable telemetry (audit SLQ-02): every optimizer window,
+                # including the value-head gradient diagnostics proving WDL
+                # supervision reaches the value head. Short runs and interrupted
+                # runs keep a complete step-level record.
+                if True:
                     telemetry.log(
                         {
                             "event": "train_step",
@@ -1336,6 +1348,16 @@ def train_supervised(
                         run_metadata=run_metadata,
                     )
                     telemetry.checkpoint_event(ckpt_dir / "best_model.pt", "best", global_step)
+                telemetry.log(
+                    {
+                        "event": "epoch_end",
+                        "epoch": epoch,
+                        "step": global_step,
+                        "val": val_metrics,
+                        "epoch_samples": epoch_samples,
+                        "max_steps_reached": True,
+                    }
+                )
                 break
 
             # End of epoch validation

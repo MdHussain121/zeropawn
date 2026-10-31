@@ -320,7 +320,10 @@ def save_dataset_split(
         "dtype_game_ids": "uint64",
         "dtype_plies": "int16",
         "dtype_stm": "uint8 (1 = white to move, 0 = black)",
-        "schema_version": 2,
+        # SCHEMA_VERSION constant (not a hardcoded 2): the validator compares
+        # this field against dataset_contract.SCHEMA_VERSION, and the
+        # discrepancy made helper-built splits fail validation (SLQ-08).
+        "schema_version": SCHEMA_VERSION,
         # Role declaration (SL-01/F-04 contract): the games builder produces
         # mover-relative WDL supervision for every replayed position.
         "role": "games_wdl",

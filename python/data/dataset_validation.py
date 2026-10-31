@@ -785,6 +785,12 @@ def verify_receipt(
     # split-level lookup still verifies the whole recorded artifact.
     recorded_dir = receipt.get("dataset_dir")
     base = Path(recorded_dir) if recorded_dir and Path(recorded_dir).is_dir() else dataset_dir
+    if not (recorded_dir and Path(recorded_dir).is_dir()) and base.name in ("train", "val", "test"):
+        # The receipt was written at the dataset root but the recorded root has
+        # since moved (e.g. a staged build promoted to its production location).
+        # The file identities are path-independent; resolve the recorded
+        # split-relative paths against the moved root, not the split directory.
+        base = base.parent
     reasons: List[str] = []
     if str(receipt.get("receipt_version", "")) != RECEIPT_VERSION:
         reasons.append(f"unknown receipt version {receipt.get('receipt_version')!r}")
