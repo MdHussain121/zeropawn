@@ -653,10 +653,176 @@ void test_abort_fn_stops_search() {
     std::cout << "[PASS] test_abort_fn_stops_search\n";
 }
 
+void test_perft_depth_limits() {
+    // Remediation F-02: negative and excessive depths must raise instead of
+    // recursing (perft(20000) previously overflowed the stack and killed the
+    // process; negative depths silently returned 1).
+    zeropawn::ChessGame game;
+    bool raised = false;
+    try {
+        game.perft(-1);
+    } catch (const std::invalid_argument&) {
+        raised = true;
+    }
+    TEST_CHECK(raised, "perft(-1) must raise std::invalid_argument");
+
+    raised = false;
+    try {
+        game.perft(zeropawn::ChessGame::MAX_PERFT_DEPTH + 1);
+    } catch (const std::invalid_argument&) {
+        raised = true;
+    }
+    TEST_CHECK(raised, "perft beyond MAX_PERFT_DEPTH must raise");
+
+    raised = false;
+    try {
+        game.perft(20000);
+    } catch (const std::invalid_argument&) {
+        raised = true;
+    }
+    TEST_CHECK(raised, "perft(20000) must raise instead of overflowing the stack");
+
+    // Depth 0 is the standard convention (1 node) and the reachable workload
+    // is unaffected.
+    TEST_CHECK(game.perft(0) == 1ULL, "perft(0) == 1");
+    TEST_CHECK(game.perft(4) == 197281ULL, "perft(4) still exact after validation");
+    std::cout << "[PASS] test_perft_depth_limits\n";
+}
+
+void test_apply_action_illegal_raises() {
+    // Remediation F-05: an in-range but ILLEGAL action previously mutated the
+    // game silently (pawn teleported a2->a5). It must raise and leave the
+    // state untouched; legal actions must still apply.
+    zeropawn::ChessGame game;
+    int idx = game.string_to_action("a2a5");
+    TEST_CHECK(idx >= 0, "a2a5 decodes to an in-range index");
+    std::string fen_before = game.get_fen();
+    uint64_t hash_before = game.get_hash();
+    bool raised = false;
+    try {
+        game.apply_action(idx);
+    } catch (const std::invalid_argument&) {
+        raised = true;
+    }
+    TEST_CHECK(raised, "apply_action(a2a5) must raise on an illegal action");
+    TEST_CHECK(game.get_fen() == fen_before, "FEN unchanged after illegal apply_action");
+    TEST_CHECK(game.get_hash() == hash_before, "hash unchanged after illegal apply_action");
+    TEST_CHECK(game.history_len() == 0, "history unchanged after illegal apply_action");
+
+    // A legal action still applies (hot path preserved for valid callers).
+    int legal_idx = game.legal_actions()[0];
+    game.apply_action(legal_idx);
+    TEST_CHECK(game.history_len() == 1, "legal action still applies");
+    std::cout << "[PASS] test_apply_action_illegal_raises\n";
+}
+
+void test_connect4_bounds_and_validation() {
+    // Remediation F-01: out-of-range cell() indices must raise, not read OOB.
+    zeropawn::Connect4 c4;
+    bool raised = false;
+    try {
+        c4.cell(6, 0);
+    } catch (const std::invalid_argument&) {
+        raised = true;
+    }
+    TEST_CHECK(raised, "cell(6,0) must raise");
+    raised = false;
+    try {
+        c4.cell(-1, 0);
+    } catch (const std::invalid_argument&) {
+        raised = true;
+    }
+    TEST_CHECK(raised, "cell(-1,0) must raise");
+    raised = false;
+    try {
+        c4.cell(0, 7);
+    } catch (const std::invalid_argument&) {
+        raised = true;
+    }
+    TEST_CHECK(raised, "cell(0,7) must raise");
+    TEST_CHECK(c4.cell(0, 0) == 0, "valid cell access still works");
+
+    // Remediation REM-02: illegal apply_action must raise instead of silently
+    // ignoring (out-of-range, full column, finished game).
+    raised = false;
+    try {
+        c4.apply_action(-1);
+    } catch (const std::invalid_argument&) {
+        raised = true;
+    }
+    TEST_CHECK(raised, "apply_action(-1) must raise");
+    raised = false;
+    try {
+        c4.apply_action(7);
+    } catch (const std::invalid_argument&) {
+        raised = true;
+    }
+    TEST_CHECK(raised, "apply_action(7) must raise");
+
+    zeropawn::Connect4 full;
+    // Alternating owners fill column 0 to the top without a vertical win.
+    for (int i = 0; i < zeropawn::Connect4::ROWS; ++i) {
+        full.apply_action(0);
+    }
+    TEST_CHECK(!full.is_terminal(), "alternating column fill does not end the game");
+    // Column 0 now holds ROWS pieces: applying again must raise.
+    raised = false;
+    try {
+        full.apply_action(0);
+    } catch (const std::invalid_argument&) {
+        raised = true;
+    }
+    TEST_CHECK(raised, "apply_action on a full column must raise");
+    TEST_CHECK(full.cell(zeropawn::Connect4::ROWS - 1, 0) == 2, "full column top cell unchanged");
+
+    // Remediation REM-01: string_to_action accepts only column digits.
+    TEST_CHECK(full.string_to_action("0") == 0, "\"0\" decodes to 0");
+    TEST_CHECK(full.string_to_action("6") == 6, "\"6\" decodes to 6");
+    TEST_CHECK(full.string_to_action("9") == -1, "\"9\" is undecodable");
+    TEST_CHECK(full.string_to_action("abc") == -1, "\"abc\" is undecodable");
+    TEST_CHECK(full.string_to_action("") == -1, "\"\" is undecodable");
+    TEST_CHECK(full.string_to_action("10") == -1, "multi-char strings are undecodable");
+    std::cout << "[PASS] test_connect4_bounds_and_validation\n";
+}
+
+void test_mcts_config_validation() {
+    // Remediation F-11: semantically invalid configurations must be rejected
+    // at MCTS construction instead of silently degrading search.
+    using Mutator = void (*)(zeropawn::MCTSConfig&);
+    auto expect_raise = [](const char* what, Mutator mutate) {
+        zeropawn::MCTSConfig cfg;
+        mutate(cfg);
+        bool raised = false;
+        try {
+            zeropawn::MCTS mcts(cfg);
+        } catch (const std::invalid_argument&) {
+            raised = true;
+        }
+        TEST_CHECK(raised, what);
+    };
+    expect_raise("negative c_puct must raise", [](zeropawn::MCTSConfig& c) { c.c_puct = -1.0f; });
+    expect_raise("zero dirichlet_alpha must raise", [](zeropawn::MCTSConfig& c) { c.dirichlet_alpha = 0.0f; });
+    expect_raise("negative dirichlet_weight must raise", [](zeropawn::MCTSConfig& c) { c.dirichlet_weight = -0.1f; });
+    expect_raise("negative fpu_reduction must raise", [](zeropawn::MCTSConfig& c) { c.fpu_reduction = -1.0f; });
+    expect_raise("negative virtual_loss must raise", [](zeropawn::MCTSConfig& c) { c.virtual_loss = -2; });
+    expect_raise("batch_size 0 must raise", [](zeropawn::MCTSConfig& c) { c.batch_size = 0; });
+    expect_raise("max_nodes 0 must raise", [](zeropawn::MCTSConfig& c) { c.max_nodes = 0; });
+
+    // The documented defaults and every legitimate configuration still work.
+    zeropawn::MCTSConfig valid;
+    valid.c_puct = 0.0f;      // 0 is allowed (pure exploitation)
+    valid.batch_size = 64;
+    valid.max_nodes = 1;
+    zeropawn::MCTS mcts(valid);
+    TEST_CHECK(mcts.get_config().batch_size == 64, "valid config constructed");
+    std::cout << "[PASS] test_mcts_config_validation\n";
+}
+
 int main() {
     test_stub();
     test_board_basics();
     test_perft();
+    test_perft_depth_limits();
     test_terminal();
     test_encoder();
     test_mcts();
@@ -664,9 +830,12 @@ int main() {
     test_mcts_exception_safety();
     test_mcts_batching();
     test_connect4();
+    test_connect4_bounds_and_validation();
     test_search_batched();
     test_apply_action_invalid_raises();
+    test_apply_action_illegal_raises();
     test_abort_fn_stops_search();
+    test_mcts_config_validation();
     std::cout << "\nAll C++ tests passed successfully.\n";
     return 0;
 }
