@@ -145,6 +145,25 @@ PYBIND11_MODULE(zeropawn_cpp, m) {
         .def("search", [](zeropawn::MCTS& mcts, const zeropawn::Game& game, int num_simulations,
                           py::function eval_fn, py::object batch_eval_fn = py::none(),
                           py::object abort_fn_obj = py::none()) {
+            // GIL discipline (remediation F-04): every py::object copy below
+            // (the abort_fn cast and its by-value lambda capture) happens with
+            // the GIL held, and every Python-object local is destroyed after
+            // the GIL has been reacquired. The previous implementation used
+            // py::call_guard<py::gil_scoped_release>, which released the GIL
+            // for the whole body — the afn incref, its capture copy, and the
+            // closure/parameter decrefs all ran without the GIL.
+            //
+            // Lifetime contract (remediation F-06): the Game wrapper handed to
+            // the evaluators is non-owning and valid only for the duration of
+            // the callback — it must never be stored. Callbacks must also not
+            // re-enter the owning MCTS (search/clear/advance_root), which
+            // would use a tree the search still holds raw pointers into
+            // (THR-06). Batching note (remediation F-17): with
+            // MCTSConfig.batch_size > 1 and no batch_evaluator, each leaf is
+            // evaluated individually through `evaluator` (measured ~2x slower
+            // than serial on no-op evaluators); pass batch_evaluator for
+            // real batched inference or prefer the serial path /
+            // search_batched in production.
             zeropawn::AbortFn abort = nullptr;
             if (!abort_fn_obj.is_none()) {
                 py::function afn = abort_fn_obj.cast<py::function>();
@@ -221,10 +240,23 @@ PYBIND11_MODULE(zeropawn_cpp, m) {
                 };
             }
 
-            return mcts.search(game, num_simulations, evaluator, batch_evaluator, abort);
+            zeropawn::SearchResult result;
+            {
+                // Inner release scope: the GIL is dropped only around the
+                // core search. Locals holding py::objects (abort, evaluator,
+                // batch_evaluator, and the function parameters) are destroyed
+                // after this block, with the GIL reacquired.
+                py::gil_scoped_release release;
+                result = mcts.search(game, num_simulations, evaluator, batch_evaluator, abort);
+            }
+            return result;
         }, py::arg("game"), py::arg("num_simulations"), py::arg("evaluator"),
            py::arg("batch_evaluator") = py::none(), py::arg("abort_fn") = py::none(),
-           py::call_guard<py::gil_scoped_release>())
+           "Run MCTS from `game`. The evaluator receives a non-owning Game wrapper that is\n"
+           "valid only for the duration of the callback (do not store it); callbacks must\n"
+           "not re-enter the owning MCTS. With batch_size > 1 and no batch_evaluator every\n"
+           "leaf is evaluated individually (no batching benefit); pass batch_evaluator for\n"
+           "batched inference or use search_batched.")
         .def("search_batched", [](zeropawn::MCTS& mcts, const zeropawn::Game& game, int num_simulations, py::object arg3, py::object arg4, py::object abort_fn_obj = py::none()) {
             // Legacy search_batched builds a fresh root per call and never
             // touches the retained tree, so a reuse_tree config would be a
@@ -248,11 +280,32 @@ PYBIND11_MODULE(zeropawn_cpp, m) {
             }
             py::function batch_fn;
             int batch_size = 16;
-            if (py::isinstance<py::function>(arg3) && py::isinstance<py::int_>(arg4)) {
+            // Accept anything integer-like: numpy integer scalars implement
+            // __index__ but are not PyLong instances on Windows (np.int64 does
+            // not subclass int), and the previous PyLong-only isinstance check
+            // rejected them with a TypeError (remediation F-12).
+            auto is_int_like = [](py::handle o) -> bool {
+                if (py::isinstance<py::int_>(o)) return true;
+                if (py::isinstance<py::function>(o) || py::isinstance<py::float_>(o)) return false;
+                PyObject* idx = PyNumber_Index(o.ptr());
+                if (!idx) {
+                    PyErr_Clear();
+                    return false;
+                }
+                Py_DECREF(idx);
+                return true;
+            };
+            auto as_int = [](py::handle o) -> int {
+                PyObject* idx = PyNumber_Index(o.ptr());
+                if (!idx) throw py::type_error("batch_size must be an integer");
+                py::object idx_obj = py::reinterpret_steal<py::object>(idx);
+                return idx_obj.cast<int>();
+            };
+            if (py::isinstance<py::function>(arg3) && is_int_like(arg4)) {
                 batch_fn = arg3.cast<py::function>();
-                batch_size = arg4.cast<int>();
-            } else if (py::isinstance<py::int_>(arg3) && py::isinstance<py::function>(arg4)) {
-                batch_size = arg3.cast<int>();
+                batch_size = as_int(arg4);
+            } else if (is_int_like(arg3) && py::isinstance<py::function>(arg4)) {
+                batch_size = as_int(arg3);
                 batch_fn = arg4.cast<py::function>();
             } else {
                 throw py::type_error("search_batched expects (game, num_simulations, batch_size, batch_evaluator) or (game, num_simulations, batch_evaluator, batch_size)");
@@ -279,13 +332,29 @@ PYBIND11_MODULE(zeropawn_cpp, m) {
                     auto py_policy = tuple[0].cast<py::array_t<float, py::array::c_style>>();
                     auto py_vals = tuple[1].cast<py::array_t<float, py::array::c_style>>();
 
+                    // Exact-shape validation (remediation F-12): the previous
+                    // implementation min-clamped short outputs and zero-filled
+                    // the remainder, silently corrupting priors/values. Malformed
+                    // evaluator output must fail loudly, mirroring the exact
+                    // validation of the `search` binding.
+                    if (static_cast<size_t>(py_policy.size()) !=
+                        static_cast<size_t>(n) * static_cast<size_t>(num_actions)) {
+                        throw std::runtime_error(
+                            "batch_evaluator policy shape must be (" + std::to_string(n) + ", " +
+                            std::to_string(num_actions) + "); got " +
+                            std::to_string(py_policy.size()) + " floats");
+                    }
+                    if (static_cast<size_t>(py_vals.size()) != static_cast<size_t>(n)) {
+                        throw std::runtime_error(
+                            "batch_evaluator values shape must be (" + std::to_string(n) +
+                            "); got " + std::to_string(py_vals.size()) + " floats");
+                    }
+
                     std::vector<float> policy(static_cast<size_t>(n) * static_cast<size_t>(num_actions));
-                    size_t p_size = std::min(policy.size(), static_cast<size_t>(py_policy.size()));
-                    std::memcpy(policy.data(), py_policy.data(), p_size * sizeof(float));
+                    std::memcpy(policy.data(), py_policy.data(), policy.size() * sizeof(float));
 
                     std::vector<float> values(static_cast<size_t>(n), 0.0f);
-                    size_t v_size = std::min(values.size(), static_cast<size_t>(py_vals.size()));
-                    std::memcpy(values.data(), py_vals.data(), v_size * sizeof(float));
+                    std::memcpy(values.data(), py_vals.data(), values.size() * sizeof(float));
 
                     return {std::move(policy), std::move(values)};
                 };
@@ -294,5 +363,9 @@ PYBIND11_MODULE(zeropawn_cpp, m) {
             }
             return result;
         }, py::arg("game"), py::arg("num_simulations"), py::arg("arg3"), py::arg("arg4"),
-           py::arg("abort_fn") = py::none());
+           py::arg("abort_fn") = py::none(),
+           "Run MCTS with flat-plane batched evaluation: batch_evaluator receives an\n"
+           "(n, state_size) float32 array and must return (policy (n, num_actions) float32,\n"
+           "values (n,) float32) — malformed shapes raise RuntimeError. Builds a fresh\n"
+           "local tree (does not touch any retained root); reuse_tree=true is rejected.");
 }
