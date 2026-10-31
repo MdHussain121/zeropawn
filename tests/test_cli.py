@@ -50,14 +50,23 @@ def test_cli_parser_build():
 
 
 def test_checkpoint_discovery():
-    """Verify that model checkpoints are discovered and sorted correctly."""
+    """Checkpoint discovery lists files; the default is registry-driven.
+
+    Audit M-2: the default no longer follows the listing ("newest on disk");
+    it is the designated, verified artifact or an actionable
+    DefaultCheckpointError.  A listing state can never become a silent default.
+    """
+    from python.model.checkpoint_registry import DefaultCheckpointError
+
     ckpts = get_available_checkpoints()
-    default_ckpt = get_default_checkpoint_path()
-    if not ckpts:
-        assert default_ckpt is None
-    else:
-        assert len(ckpts) > 0
-        assert default_ckpt is not None
+    assert isinstance(ckpts, list)
+    try:
+        default_ckpt = get_default_checkpoint_path()
+    except DefaultCheckpointError as e:
+        # Fail-closed contract: actionable diagnostic, no substitute artifact.
+        assert "Recovery:" in str(e)
+        default_ckpt = None
+    if default_ckpt is not None:
         assert default_ckpt.is_file()
         assert default_ckpt.suffix == ".pt"
 

@@ -25,6 +25,7 @@ from python.cli.common import (
     validate_fen_or_raise,
 )
 from python.hardware.profile import resolve_batch_size
+from python.model.checkpoint_registry import DefaultCheckpointError
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +83,10 @@ def register_parser(subparsers: argparse._SubParsersAction) -> None:
         "-c",
         type=str,
         default=None,
-        help="Path to neural network model checkpoint (default: auto-detect latest)",
+        help=(
+            "Path to neural network model checkpoint (default: the registry-designated "
+            "default). Pass '' explicitly to run model-less (uniform-policy evaluator)."
+        ),
     )
     search_parser.add_argument(
         "--top-moves",
@@ -112,7 +116,19 @@ def run_search(args: argparse.Namespace) -> int:
         return 1
 
     device = resolve_device(args.device)
-    ckpt_path = args.checkpoint or get_default_checkpoint_path()
+    ckpt_path = None
+    if args.checkpoint == "":
+        # Explicit model-less request (same convention as InferenceServer /
+        # UCIEngine): run the uniform-policy evaluator, loudly.
+        print_warning("No checkpoint requested (--checkpoint ''); using uniform evaluator.")
+    else:
+        try:
+            ckpt_path = args.checkpoint or get_default_checkpoint_path()
+        except DefaultCheckpointError as e:
+            # Fail closed (audit M-2): no designated default -> no arbitrary
+            # substitute.  Model-less runs require the explicit '' request.
+            print_error(str(e))
+            return 1
     model = None
     if ckpt_path and Path(ckpt_path).is_file():
         try:

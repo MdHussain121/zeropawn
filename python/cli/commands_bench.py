@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 
+from python.cli.common import print_error
 from python.cli.models import get_default_model_path
 from python.cli.runner import execute_script_with_monitoring
+from python.model.checkpoint_registry import DefaultCheckpointError
 
 
 def register_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -176,7 +178,11 @@ def register_parser(subparsers: argparse._SubParsersAction) -> None:
 
 
 def run_selfplay_bench(args: argparse.Namespace) -> int:
-    ckpt = args.checkpoint_path or str(get_default_model_path())
+    try:
+        ckpt = args.checkpoint_path or str(get_default_model_path())
+    except DefaultCheckpointError as e:
+        print_error(str(e))
+        return 1
     mode = "train" if args.mode == "training" else args.mode
     cmd_args = [
         "--mode",

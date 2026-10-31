@@ -29,6 +29,7 @@ from python.cli.common import (
     validate_fen_or_raise,
 )
 from python.cli.eval_callbacks import make_serial_eval_fn
+from python.model.checkpoint_registry import DefaultCheckpointError
 from python.common.progress import (
     Heartbeat,
     banner,
@@ -372,12 +373,13 @@ def run_batch_match(args: argparse.Namespace) -> int:
     if err:
         return _fail(err, "argument out of range", "fix the flagged argument, then see LOG")
 
-    ckpt_path = args.checkpoint or get_default_checkpoint_path()
-    if not ckpt_path:
+    try:
+        ckpt_path = args.checkpoint or get_default_checkpoint_path()
+    except DefaultCheckpointError as e:
         return _fail(
-            "No model checkpoint found! Please train or specify --checkpoint.",
-            "no checkpoint at default locations",
-            "pass --checkpoint <file.pt>, then see LOG",
+            "No usable default model checkpoint.",
+            str(e),
+            "restore/designate the registry default, or pass --checkpoint <file.pt>, then see LOG",
         )
     try:
         ckpt_path = safe_resolve(ckpt_path)
@@ -594,9 +596,10 @@ def run_live_game(args: argparse.Namespace) -> int:
         print_error(err)
         return 1
 
-    ckpt_path = args.checkpoint or get_default_checkpoint_path()
-    if not ckpt_path:
-        print_error("No model checkpoint found! Please specify --checkpoint.")
+    try:
+        ckpt_path = args.checkpoint or get_default_checkpoint_path()
+    except DefaultCheckpointError as e:
+        print_error(str(e))
         return 1
     try:
         ckpt_path = safe_resolve(ckpt_path)
@@ -775,9 +778,10 @@ def run_human_game(args: argparse.Namespace) -> int:
 
     print_banner("HUMAN VS AI CHESS", "Challenge our Neural Network Engine")
 
-    ckpt_path = args.checkpoint or get_default_checkpoint_path()
-    if not ckpt_path:
-        print_error("No model checkpoint found! Please specify --checkpoint.")
+    try:
+        ckpt_path = args.checkpoint or get_default_checkpoint_path()
+    except DefaultCheckpointError as e:
+        print_error(str(e))
         return 1
     try:
         ckpt_path = safe_resolve(ckpt_path)

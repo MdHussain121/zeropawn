@@ -513,12 +513,18 @@ def get_default_stockfish_path() -> Optional[Path]:
 
 
 def get_available_checkpoints() -> list[dict[str, Any]]:
-    """Scan and return all available checkpoints sorted by step or modification time."""
+    """Scan and return all available checkpoints sorted by step or modification time.
+
+    Listing only: this scan is informational (status/models commands).  The
+    DEFAULT checkpoint is resolved by :func:`get_default_checkpoint_path`
+    through the registry — never by "whatever this scan ranks first".
+    """
     import torch
 
     checkpoints: list[dict[str, Any]] = []
 
     dirs_to_check = [
+        REPO_ROOT / "models" / "checkpoints_baseline_20261031",
         REPO_ROOT / "models" / "checkpoints_rl",
         REPO_ROOT / "models" / "checkpoints_scaled",
         REPO_ROOT / "models" / "checkpoints",
@@ -585,26 +591,24 @@ def get_available_checkpoints() -> list[dict[str, Any]]:
     return checkpoints
 
 
-def get_default_checkpoint_path() -> Optional[Path]:
-    """Find best/latest checkpoint to use as default.
+def get_default_checkpoint_path() -> Path:
+    """Resolve the single authoritative default checkpoint (fail-closed).
 
-    Prefers fine-tuned model (strongest) over scaled baseline.
+    Registry-driven (``docs/checkpoint_registry.json``): the designated,
+    verified artifact, SHA-256-verified against its registry record at
+    resolution time (audit M-2, 2026-10-31).
+
+    Raises:
+        DefaultCheckpointError: when nothing trustworthy is designated, or the
+            designated artifact is missing or fails hash validation.  There is
+            deliberately NO fallback to "newest checkpoint on disk" — the
+            previous fallback silently ran a disqualified checkpoint on every
+            command.  Callers must surface the error (print + non-zero exit)
+            or let it propagate; never substitute a different artifact.
     """
-    candidates = [
-        REPO_ROOT / "models" / "checkpoints_finetune" / "best_model.pt",
-        REPO_ROOT / "models" / "checkpoints_rl" / "phase4_final_checkpoint.pt",
-        REPO_ROOT / "models" / "checkpoints_rl" / "latest_checkpoint.pt",
-        REPO_ROOT / "models" / "checkpoints_scaled" / "best_model.pt",
-    ]
-    for c in candidates:
-        if c.is_file():
-            return c
+    from python.model.checkpoint_registry import resolve_default_checkpoint
 
-    all_ckpts = get_available_checkpoints()
-    if all_ckpts:
-        return all_ckpts[0]["path"]
-
-    return None
+    return resolve_default_checkpoint(repo_root=REPO_ROOT).path
 
 
 def load_engine_model(
@@ -657,12 +661,63 @@ def load_engine_model(
     model.to(device)
     model.eval()
 
+    # Provenance report (audit M-2): every load states which artifact was
+    # selected and its registry standing.  Registry status is looked up by
+    # path (cheap); the hash check for the *default* artifact already ran in
+    # resolve_default_checkpoint, and explicit paths get a warning-level
+    # provenance note rather than a hard failure (operator's choice).
+    provenance_warning: Optional[str] = None
+    registry_entry_id: Optional[str] = None
+    registry_status: Optional[str] = None
+    try:
+        from python.model.checkpoint_registry import (
+            explicit_checkpoint_warnings,
+            load_registry,
+        )
+
+        provenance_warning = explicit_checkpoint_warnings(
+            path, repo_root=REPO_ROOT, verify_hash=False
+        )
+        if provenance_warning:
+            logger.warning("%s", provenance_warning)
+        registry = load_registry(REPO_ROOT)
+        for rec in registry.get("checkpoints", []):
+            rel = Path(str(rec.get("path", "")))
+            rec_path = (REPO_ROOT / rel) if rel.parts else None
+            try:
+                if rec_path is not None and rec_path.resolve() == path.resolve():
+                    registry_entry_id = str(rec.get("id"))
+                    registry_status = rec.get("status")
+                    break
+            except OSError:  # pragma: no cover - defensive
+                continue
+    except (FileNotFoundError, ValueError, OSError):
+        provenance_warning = provenance_warning or (
+            "checkpoint registry unavailable; provenance unverified"
+        )
+        logger.warning("%s", provenance_warning)
+
+    logger.info(
+        "Loaded checkpoint %s (step %s, %db/%df, device %s, registry %s/%s)%s",
+        path,
+        step,
+        num_blocks,
+        num_filters,
+        device,
+        registry_entry_id or "unregistered",
+        registry_status or "n/a",
+        f" — {provenance_warning}" if provenance_warning else "",
+    )
+
     info = {
         "step": step,
         "num_blocks": num_blocks,
         "num_filters": num_filters,
         "device": device,
         "path": path,
+        "registry_entry_id": registry_entry_id,
+        "registry_status": registry_status,
+        "provenance_warning": provenance_warning,
     }
     return model, info
 

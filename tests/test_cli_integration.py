@@ -189,21 +189,34 @@ def test_hardware_commands_execution(capsys):
 
 
 def test_search_command_execution():
-    """Test standalone search command in serial and batched modes."""
+    """Test standalone search command in serial and batched modes.
+
+    These smoke runs are deliberately model-less: ``--checkpoint ''`` is the
+    explicit uniform-evaluator request (audit M-2 made the default fail closed,
+    so a missing model can no longer be selected silently).
+    """
     startpos = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
 
     # Serial search
-    ret_serial = main(["search", "--fen", startpos, "--sims", "5", "--mode", "serial"])
+    ret_serial = main(
+        ["search", "--fen", startpos, "--sims", "5", "--mode", "serial", "--checkpoint", ""]
+    )
     assert ret_serial == 0
 
     # Batched search with explicit batch size
     ret_batched = main(
-        ["search", "--fen", startpos, "--sims", "5", "--mode", "batched", "--batch-size", "4"]
+        [
+            "search", "--fen", startpos, "--sims", "5", "--mode", "batched",
+            "--batch-size", "4", "--checkpoint", "",
+        ]
     )
     assert ret_batched == 0
 
     # Batched search with auto batch size
     ret_auto = main(
-        ["search", "--fen", startpos, "--sims", "5", "--mode", "batched", "--batch-size", "auto"]
+        [
+            "search", "--fen", startpos, "--sims", "5", "--mode", "batched",
+            "--batch-size", "auto", "--checkpoint", "",
+        ]
     )
     assert ret_auto == 0
