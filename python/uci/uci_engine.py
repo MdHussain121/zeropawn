@@ -116,6 +116,16 @@ class UCIEngine:
         # Conservative initial sims/s estimate; measured serial rate on this
         # hardware is 167-250 sims/s (docs/perf/BATCH_SWEEP_EXTENDED.json).
         self._sims_per_sec: float = 200.0
+        # Search-stall safety (remediation F-03): while a search thread is
+        # alive, the native MCTS/Game objects must not be touched from this
+        # thread — the search walks them with the GIL released. If a stop
+        # request does not end the search within ``_stall_timeout`` seconds
+        # (e.g. an evaluator stuck inside a GIL-releasing native call, where
+        # the in-search abort predicate cannot fire until it returns), the
+        # engine enters a stalled state and every state-mutating command is
+        # refused until the search thread actually finishes.
+        self._stall_timeout: float = 10.0
+        self._search_stalled: bool = False
 
         # Load model if checkpoint exists
         if self.checkpoint_path and Path(self.checkpoint_path).is_file():
@@ -241,15 +251,49 @@ class UCIEngine:
             return
         self._sims_per_sec = 0.7 * self._sims_per_sec + 0.3 * measured
 
-    def _wait_for_running_search(self, timeout: float = 10.0) -> None:
-        """Block until any in-flight search finishes (state-mutation safety)."""
+    def _wait_for_running_search(self, timeout: Optional[float] = None) -> bool:
+        """Block until any in-flight search finishes (state-mutation safety).
+
+        Returns **True** when it is safe to mutate ``self.mcts``/``self.game``.
+        If the search thread is still alive after ``timeout`` seconds (default
+        ``self._stall_timeout``) despite a stop request, the engine is marked
+        **stalled** and False is returned. Remediation F-03: the previous
+        implementation logged "proceeding unsafely" and returned anyway, which
+        let the main thread mutate the native MCTS/Game objects while the
+        search thread was still walking them with the GIL released
+        (use-after-free window). While stalled, every state-mutating command is
+        refused; the stalled state clears automatically once the search thread
+        finishes, because a finished thread short-circuits the wait below.
+        """
+        if timeout is None:
+            timeout = self._stall_timeout
         thread = self._search_thread
-        if thread is not None and thread.is_alive():
-            logger.warning("Command arrived during active search; waiting for bestmove")
-            self._stop_event.set()
-            thread.join(timeout=timeout)
-            if thread.is_alive():
-                logger.error("Search thread did not finish after stop; proceeding unsafely")
+        if thread is None or not thread.is_alive():
+            self._search_stalled = False
+            return True
+        logger.warning(
+            "Command arrived during active search; requesting stop and waiting up to %.1fs",
+            timeout,
+        )
+        self._stop_event.set()
+        thread.join(timeout=timeout)
+        if thread.is_alive():
+            self._search_stalled = True
+            logger.error(
+                "Search thread did not finish after %.1fs stop request; the engine will "
+                "REFUSE state-mutating commands (ucinewgame/position/setoption/go/model "
+                "load) until the search completes. Never mutating mcts/game while a "
+                "GIL-released search may reference them (remediation F-03).",
+                timeout,
+            )
+            sys.stdout.write(
+                "info string engine busy: previous search has not finished; "
+                "state-mutating commands are refused until it completes\n"
+            )
+            sys.stdout.flush()
+            return False
+        self._search_stalled = False
+        return True
 
     def _load_model(self, path: Union[str, Path]) -> bool:
         try:
@@ -456,8 +500,12 @@ class UCIEngine:
 
     def _start_search(self, sims: int, deadline_ms: Optional[float]) -> None:
         # Never overlap two searches: the previous one must have emitted its
-        # bestmove before a new tree/state is used.
-        self._wait_for_running_search()
+        # bestmove before a new tree/state is used. If the previous search is
+        # stalled (F-03), refuse to start another one instead of touching the
+        # state it still references.
+        if not self._wait_for_running_search():
+            logger.error("Refusing 'go infinite': previous search has not finished")
+            return
         # Fresh stop event per search: a "stop" that arrived before this "go"
         # belonged to the previous search and must not abort this one, while a
         # "stop" arriving after this point is guaranteed to be seen by the
@@ -514,14 +562,24 @@ class UCIEngine:
 
         elif cmd == "isready":
             if self.model is None and self.checkpoint_path:
-                self._load_model(self.checkpoint_path)
+                # Model load clears the MCTS tree; refuse it while a search is
+                # still running (F-03). readyok is still emitted so the GUI's
+                # handshake proceeds; the engine simply stays without weights
+                # until a later isready.
+                if self._wait_for_running_search():
+                    self._load_model(self.checkpoint_path)
+                else:
+                    logger.error("Refusing model load during unfinished search (isready)")
             sys.stdout.write("readyok\n")
             sys.stdout.flush()
 
         elif cmd == "setoption":
             # Several options rebuild the MCTS object or reload weights; those
-            # must not race an in-flight search.
-            self._wait_for_running_search()
+            # must not race an in-flight search. If the search is stalled
+            # (F-03), the whole command is refused.
+            if not self._wait_for_running_search():
+                logger.error("Refusing 'setoption' while a search has not finished")
+                return True
             try:
                 name_idx = tokens.index("name") + 1
                 val_idx = tokens.index("value") + 1 if "value" in tokens else None
@@ -601,7 +659,9 @@ class UCIEngine:
                 logger.debug("Failed parsing setoption: %s", e)
 
         elif cmd == "ucinewgame":
-            self._wait_for_running_search()
+            if not self._wait_for_running_search():
+                logger.error("Refusing 'ucinewgame' while a search has not finished")
+                return True
             self.mcts.clear()
             self.mcts.reset_root()
             self.game = self.zeropawn_cpp.ChessGame()
@@ -612,7 +672,9 @@ class UCIEngine:
             self.prev_fen = "startpos"
 
         elif cmd == "position":
-            self._wait_for_running_search()
+            if not self._wait_for_running_search():
+                logger.error("Refusing 'position' while a search has not finished")
+                return True
             idx = 1
             moves_idx = None
             if "moves" in tokens:
@@ -714,7 +776,12 @@ class UCIEngine:
                 # Budgeted searches run synchronously — the simulation budget
                 # itself bounds latency. A fresh stop event guards against a
                 # stale "stop" from a previous search aborting this one.
-                self._wait_for_running_search()
+                if not self._wait_for_running_search():
+                    logger.error(
+                        "Refusing 'go': previous search has not finished; its bestmove "
+                        "will be emitted when it completes"
+                    )
+                    return True
                 self._stop_event = threading.Event()
                 t_search0 = time.perf_counter()
                 self.search_and_respond(sims)
