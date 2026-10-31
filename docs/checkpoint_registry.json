@@ -1,7 +1,7 @@
 {
   "version": 1,
   "updated": "2026-10-31",
-  "updated_by": "Supervised-learning remediation (branch fix/supervised-learning-remediation-20261031, audit A-02 SLQ-01/SLQ-02): both surviving supervised checkpoints disqualified as warm-start sources; artifacts preserved unmodified",
+  "updated_by": "Supervised-learning remediation (fix/supervised-learning-remediation-20261031): new baseline ckpt-10 designated warm start per P0-2 acceptance criteria",
   "verification_method": "Full SHA-256 recomputed from files on disk 2026-10-29 (never copied from reports); architecture and step metadata read from checkpoint headers via python.model.checkpoint_registry.inspect_checkpoint.",
   "authority": "models/manifest.json (reconciliation 2026-10-26) for lineage; this registry for verifiable on-disk status.",
   "architecture_required": {
@@ -10,8 +10,8 @@
     "in_channels": 19,
     "num_actions": 4672
   },
-  "warm_start_designation": "NONE",
-  "designation_note": "No checkpoint is designated as an RL warm start. The two surviving supervised checkpoints are DISQUALIFIED (corrupted value heads, SLQ-01). A new designation requires the remediation roadmap P0-2 procedure: rebuilt dataset acceptance + seeded retraining + validation + registry validation of the new artifact.",
+  "warm_start_designation": "models/checkpoints_baseline_20261031/best_model.pt (ckpt-10-supervised_baseline_20261031)",
+  "designation_note": "The 2026-10-31 remediation baseline is the only designated warm start. It is a single-epoch seed-42 run on the rebuilt, receipt-certified dataset_training with a verified value head (P(loss|loss)=0.44, WDL CE 0.85); no strength/Elo claim is attached. The two 2026-10-20 checkpoints remain DISQUALIFIED (superseded_value_head).",
   "designation_procedure": "Edit the chosen verified entry: set designated_warm_start=true and add designation_evidence (comparison run, date, who/what approved). Then scripts/validate_checkpoints.py must pass.",
   "checkpoints": [
     {
@@ -147,6 +147,39 @@
       "designated_warm_start": false,
       "id": "ckpt-09-historical_certified_strongest_model",
       "file": "models/checkpoints_finetune/best_model.pt"
+    },
+    {
+      "id": "ckpt-10-supervised_baseline_20261031",
+      "path": "models/checkpoints_baseline_20261031/best_model.pt",
+      "file": "models/checkpoints_baseline_20261031/best_model.pt",
+      "sha256": "01cead16a445f5a228e78ec85da6f1e68bcf1e6de15c1f3219edda3b544b74ef",
+      "size_bytes": 103672539,
+      "status": "verified",
+      "role": "supervised_baseline",
+      "step": 4802,
+      "epoch": 1,
+      "best_val_loss": 3.295785920309608,
+      "optimizer_state": "AdamW (supervised trainer; NOT resumable by the SGD RL trainer)",
+      "checkpoint_kind": "supervised full trainer state",
+      "num_blocks": 12,
+      "num_filters": 128,
+      "designated_warm_start": true,
+      "verified_at": "2026-10-31",
+      "provenance": {
+        "run_id": "20261031-125838-b8868fd6",
+        "git_commit": "101bff6c73e5045ff56a4bc0505e0b24a41fcc03",
+        "seed": 42,
+        "dataset_build_dir": "data/dataset_training (2026-10-31 rebuild from filtered.pgn sha256 2d28cfa0...)",
+        "dataset_receipt_id": "sha256:156d528959dd463c",
+        "training": "1 epoch, 4801 optimizer steps, batch 512 (32x16), AdamW lr 2e-4 -> cosine, warmup 500; duration 1858 s; telemetry: models/checkpoints_baseline_20261031/telemetry.jsonl (4802 step records)"
+      },
+      "designation_evidence": {
+        "procedure": "remediation roadmap P0-2 (audit/supervised-learning-quality-20261030) acceptance criteria, executed 2026-10-31",
+        "dataset_acceptance": "certified games_wdl receipt; train masked_fraction 0.0000; 0 cross-split encoded states (exhaustive train/val, train/test, val/test); build record binds source sha256 2d28cfa0...",
+        "value_head_health": "held-out WDL CE 0.851 (game val) / 0.730 (independent test split) vs uniform 1.099; P(predict loss | true loss) = 0.442 (val) / 0.515 (test) vs 0.0000 on both disqualified predecessors; Brier 0.51/0.43",
+        "value_grad_flow": "telemetry value_grad_norm 0.24-0.48 throughout the run; window WDL-valid samples ~468/512",
+        "limits": "Single-epoch run: policy top-1 22.2% game-val / 23.2% game-test / 26.6% tactics-val \u2014 weaker than the disqualified 5-epoch predecessors' policy heads. This designation certifies PROVENANCE and VALUE-HEAD HEALTH ONLY. No strength, Elo, or superiority claim is attached (SLQ-04/SLQ-20 discipline)."
+      }
     }
   ],
   "excluded_from_registry": [

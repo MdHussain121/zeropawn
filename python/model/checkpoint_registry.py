@@ -169,7 +169,8 @@ def validate_warm_start(
     entry: Optional[Dict[str, Any]] = None
     if registry:
         for rec in registry.get("checkpoints", []):
-            if rec.get("sha256") == info.sha256 or rec.get("sha256", "").startswith(sha16):
+            rec_sha = rec.get("sha256")
+            if rec_sha and (rec_sha == info.sha256 or str(rec_sha).startswith(sha16)):
                 entry = rec
                 break
 
