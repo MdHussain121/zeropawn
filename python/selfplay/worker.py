@@ -1284,6 +1284,8 @@ class SelfPlayWorker:
             return False
         if getattr(summary, "termination_reason", "") == TERMINATION_ABORTED:
             return False
+        if getattr(summary, "length_plies", 0) <= 0:
+            return False
         return True
 
     def get_live_cache_stats(self) -> Dict[str, Any]:
@@ -1329,6 +1331,8 @@ class SelfPlayWorker:
         thread_id = threading.get_ident()
         while self.running:
             with self.counter_lock:
+                if not self.running:
+                    break
                 self.game_counter += 1
                 game_id = self.game_counter
             game = SelfPlayGame(
@@ -1401,10 +1405,10 @@ class SelfPlayWorker:
                 except Exception:
                     pass
 
-            # Shutdown-aborted game (audit SR-01): the positions list is empty
+            # Shutdown-aborted game (audit SR-01 / S-2 remediation): the positions list is empty
             # by contract and the summary carries no result — it is NOT sunk,
             # NOT counted as a played game, and NEVER recorded as a draw.
-            if not self.accepts_for_sink(summary):
+            if not self.running or not self.accepts_for_sink(summary):
                 with self.counter_lock:
                     self.aborted_games += 1
                 logger.info(

@@ -7,6 +7,8 @@ observed search throughput with a conservative cold-start default, and the
 UCI ``go`` path allocates with explicit margins.
 """
 
+from typing import Optional
+
 import numpy as np
 import pytest
 
@@ -150,7 +152,7 @@ class _SearchProbe:
         self.elapsed = elapsed
         self.budgets = []
 
-    def __call__(self, sims: int) -> str:
+    def __call__(self, sims: int, deadline_ms: Optional[float] = None) -> str:
         import time as _time
 
         self.budgets.append(sims)
@@ -173,6 +175,8 @@ def test_go_movetime_respects_budget(engine):
     probe = _SearchProbe(engine, elapsed=0.0)
     engine.search_and_respond = probe
     engine.handle_line("go movetime 1000")
+    if engine._search_thread is not None:
+        engine._search_thread.join(timeout=5.0)
     # cpu/serial cold estimate 40 sims/s, margin 0.9, 1s budget -> 36 sims
     assert probe.budgets == [36]
 
@@ -181,9 +185,13 @@ def test_go_wtime_btime_uses_clock_policy(engine):
     probe = _SearchProbe(engine, elapsed=0.0)
     engine.search_and_respond = probe
     engine.handle_line("go wtime 30000 btime 30000 winc 0 binc 0")
+    if engine._search_thread is not None:
+        engine._search_thread.join(timeout=5.0)
     # 30s clock -> 1000ms allocated -> int(40 * 0.8) = 32 sims
     assert probe.budgets == [32]
     engine.handle_line("go wtime 30000 btime 30000 winc 200 binc 200")
+    if engine._search_thread is not None:
+        engine._search_thread.join(timeout=5.0)
     # +200ms increment -> 1200ms -> int(40 * 0.8 * 1.2) = 38
     assert probe.budgets[-1] == 38
 
@@ -192,6 +200,8 @@ def test_go_movestogo(engine):
     probe = _SearchProbe(engine, elapsed=0.0)
     engine.search_and_respond = probe
     engine.handle_line("go movestogo 10 wtime 30000 btime 30000 winc 0 binc 0")
+    if engine._search_thread is not None:
+        engine._search_thread.join(timeout=5.0)
     # 30s / 10 moves = 3000ms -> int(40 * 0.8 * 3.0) = 96
     assert probe.budgets == [96]
 
@@ -200,6 +210,8 @@ def test_go_nodes_passthrough(engine):
     probe = _SearchProbe(engine, elapsed=0.0)
     engine.search_and_respond = probe
     engine.handle_line("go nodes 777")
+    if engine._search_thread is not None:
+        engine._search_thread.join(timeout=5.0)
     assert probe.budgets == [777]
 
 
@@ -208,11 +220,15 @@ def test_throughput_observation_updates_next_budget(engine):
     observation, not the conservative default."""
     engine.search_and_respond = _SearchProbe(engine, elapsed=1.0)  # 40 sims in 1.0s
     engine.handle_line("go nodes 40")
+    if engine._search_thread is not None:
+        engine._search_thread.join(timeout=5.0)
     k = ThroughputKey.from_engine(engine.device, engine.search_mode, engine.batch_size)
     assert engine.time_manager.observed_rate(k) == pytest.approx(40.0, rel=0.05)
 
     engine.search_and_respond = _SearchProbe(engine, elapsed=0.0)
     engine.handle_line("go wtime 30000 btime 30000 winc 0 binc 0")
+    if engine._search_thread is not None:
+        engine._search_thread.join(timeout=5.0)
     # 1000ms at the observed 40 sims/s with 0.8 margin -> 32 sims (same value
     # here by construction of the default; assert the observation is in use
     # via the estimator, and that a faster observation raises the budget).
@@ -221,6 +237,8 @@ def test_throughput_observation_updates_next_budget(engine):
     for _ in range(30):  # ...converged by repeated observation (EWMA)
         engine.time_manager.record(k, 400, 1.0)
     engine.handle_line("go wtime 30000 btime 30000 winc 0 binc 0")
+    if engine._search_thread is not None:
+        engine._search_thread.join(timeout=5.0)
     est = engine.time_manager.estimate_rate(k)
     assert est == pytest.approx(400.0, rel=1e-3)
     assert engine.search_and_respond.budgets[-1] == int(est * 0.8 * 1.0)

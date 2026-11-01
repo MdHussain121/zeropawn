@@ -453,22 +453,26 @@ class UCIEngine:
         abort_fn = self._make_abort_fn(deadline_ms)
 
         if self.game.is_game_over():
+            self._last_search_ran = False
             self.mcts.reset_root()
             self.last_engine_action = None
             self.last_engine_move = None
             self.prev_moves_at_search = None
             sys.stdout.write("bestmove 0000\n")
             sys.stdout.flush()
+            self._bestmove_emitted = True
             return "0000"
 
         legal_moves = self.game.legal_moves_uci()
         if not legal_moves:
+            self._last_search_ran = False
             self.mcts.reset_root()
             self.last_engine_action = None
             self.last_engine_move = None
             self.prev_moves_at_search = None
             sys.stdout.write("bestmove 0000\n")
             sys.stdout.flush()
+            self._bestmove_emitted = True
             return "0000"
 
         # Check opening book first if enabled
@@ -483,6 +487,7 @@ class UCIEngine:
             if book_res is not None:
                 book_move, _ = book_res
                 if book_move in legal_moves:
+                    self._last_search_ran = False
                     self.mcts.reset_root()
                     self.last_engine_action = None
                     self.last_engine_move = None
@@ -490,6 +495,7 @@ class UCIEngine:
                     sys.stdout.write(f"info depth 1 nodes 1 score cp 0 pv {book_move}\n")
                     sys.stdout.write(f"bestmove {book_move}\n")
                     sys.stdout.flush()
+                    self._bestmove_emitted = True
                     return book_move
 
         # Search with MCTS. The abort predicate enforces the wall-clock
@@ -501,11 +507,18 @@ class UCIEngine:
         )
         best_action = res.best_action
         best_move = self.game.action_to_string(best_action)
+        if not best_move or best_move not in legal_moves:
+            best_move = legal_moves[0] if legal_moves else "0000"
+            try:
+                best_action = self.game.string_to_action(best_move)
+            except Exception:
+                best_action = -1
         root_val = res.root_value
         self.last_engine_action = best_action
         self.last_engine_move = best_move
 
         actual_sims = int(getattr(res, "new_simulations", sims))
+        self._last_actual_sims = actual_sims
         elapsed = time.perf_counter() - start
         self._update_rate_estimate(actual_sims, elapsed)
 
@@ -514,6 +527,7 @@ class UCIEngine:
         sys.stdout.write(f"info depth 10 nodes {actual_sims} score cp {score_cp} pv {best_move}\n")
         sys.stdout.write(f"bestmove {best_move}\n")
         sys.stdout.flush()
+        self._bestmove_emitted = True
         return best_move
 
     def _search_worker(self, sims: int, deadline_ms: Optional[float]) -> None:
@@ -523,12 +537,40 @@ class UCIEngine:
         processed immediately. Any failure must still emit a bestmove so the
         GUI never waits forever.
         """
+        self._bestmove_emitted = False
+        self._last_search_ran = False
+        t_start = time.perf_counter()
         try:
-            self.search_and_respond(sims, deadline_ms)
+            try:
+                self.search_and_respond(sims, deadline_ms)
+            except TypeError:
+                self.search_and_respond(sims)
         except Exception as e:
             logger.exception("Search failed during go: %s", e)
-            sys.stdout.write("bestmove 0000\n")
-            sys.stdout.flush()
+            if not getattr(self, "_bestmove_emitted", False):
+                fallback = "0000"
+                try:
+                    legal = self.game.legal_moves_uci()
+                    if legal:
+                        fallback = legal[0]
+                except Exception:
+                    pass
+                sys.stdout.write(f"bestmove {fallback}\n")
+                sys.stdout.flush()
+                self._bestmove_emitted = True
+        finally:
+            t_elapsed = time.perf_counter() - t_start
+            if getattr(self, "_last_search_ran", False):
+                tm = getattr(self, "time_manager", None)
+                if tm is not None:
+                    try:
+                        tp_key = ThroughputKey.from_engine(
+                            self.device, self.search_mode, getattr(self, "batch_size", 1)
+                        )
+                        actual_sims = getattr(self, "_last_actual_sims", sims)
+                        tm.record(tp_key, actual_sims, t_elapsed)
+                    except Exception:
+                        logger.debug("throughput record failed", exc_info=True)
 
     def _start_search(self, sims: int, deadline_ms: Optional[float]) -> None:
         # Never overlap two searches: the previous one must have emitted its
@@ -536,13 +578,14 @@ class UCIEngine:
         # stalled (F-03), refuse to start another one instead of touching the
         # state it still references.
         if not self._wait_for_running_search():
-            logger.error("Refusing 'go infinite': previous search has not finished")
+            logger.error("Refusing 'go': previous search has not finished")
             return
         # Fresh stop event per search: a "stop" that arrived before this "go"
         # belonged to the previous search and must not abort this one, while a
         # "stop" arriving after this point is guaranteed to be seen by the
         # in-search abort predicate (the event object is already installed).
         self._stop_event = threading.Event()
+        self._bestmove_emitted = False
         thread = threading.Thread(
             target=self._search_worker, args=(sims, deadline_ms), daemon=True
         )
@@ -655,6 +698,7 @@ class UCIEngine:
                         )
                     else:
                         self.batch_size = max(1, min(64, int(opt_val)))
+                    self.search_mode = "serial" if self.batch_size == 1 else "batched"
                     self.mcts_config.batch_size = self.batch_size
                     self.mcts = self.zeropawn_cpp.MCTS(self.mcts_config)
                 elif opt_name == "device":
@@ -664,7 +708,20 @@ class UCIEngine:
                 elif opt_name == "searchmode":
                     from python.eval.match_runner import check_search_mode
 
-                    self.search_mode = check_search_mode(opt_val.lower())
+                    mode = check_search_mode(opt_val.lower())
+                    self.search_mode = mode
+                    if mode == "serial":
+                        self.batch_size = 1
+                    elif mode == "batched" and self.batch_size <= 1:
+                        from python.hardware.profile import resolve_batch_size
+
+                        self.batch_size = resolve_batch_size(
+                            "auto", workload="uci", device=self.device
+                        )
+                        if self.batch_size <= 1:
+                            self.batch_size = 8
+                    self.mcts_config.batch_size = self.batch_size
+                    self.mcts = self.zeropawn_cpp.MCTS(self.mcts_config)
                 elif opt_name == "ownbook":
                     self.use_book = opt_val.lower() in ("true", "1", "yes", "on")
                     if self.opening_book:
@@ -810,34 +867,13 @@ class UCIEngine:
                     i += 1
 
             sims, deadline_ms, infinite = self.allocate_time(arg_dict, side)
-            if infinite:
-                # Only "go infinite" runs asynchronously: it has no budget, so
-                # stdin must stay responsive for "stop"/"quit" to end it.
-                logger.info("go infinite: searching until stop")
-                self._start_search(sims, deadline_ms)
-            else:
-                # Budgeted searches run synchronously — the simulation budget
-                # itself bounds latency. A fresh stop event guards against a
-                # stale "stop" from a previous search aborting this one.
-                if not self._wait_for_running_search():
-                    logger.error(
-                        "Refusing 'go': previous search has not finished; its bestmove "
-                        "will be emitted when it completes"
-                    )
-                    return True
-                self._stop_event = threading.Event()
-                t_search0 = time.perf_counter()
-                self.search_and_respond(sims)
-                if getattr(self, "_last_search_ran", False):
-                    tm = getattr(self, "time_manager", None)
-                    if tm is not None:
-                        try:
-                            tp_key = ThroughputKey.from_engine(
-                                self.device, self.search_mode, getattr(self, "batch_size", 1)
-                            )
-                            tm.record(tp_key, sims, time.perf_counter() - t_search0)
-                        except Exception:
-                            logger.debug("throughput record failed", exc_info=True)
+            if not self._wait_for_running_search():
+                logger.error(
+                    "Refusing 'go': previous search has not finished; its bestmove "
+                    "will be emitted when it completes"
+                )
+                return True
+            self._start_search(sims, deadline_ms)
 
         elif cmd == "stop":
             # Honor stop promptly: the in-search abort predicate polls this
