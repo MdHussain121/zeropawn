@@ -117,7 +117,13 @@ class PuzzleEvaluator:
             valid_puzzles: list[Puzzle] = []
 
             for p in batch_puzzles:
-                g = zeropawn_cpp.ChessGame(p.fen)
+                # Strict FEN gate (chess remediation 2026-11-01): a malformed
+                # dataset row must skip the puzzle, not abort the batch —
+                # same contract as commands_puzzles.py.
+                try:
+                    g = zeropawn_cpp.ChessGame(p.fen)
+                except ValueError:
+                    continue
                 # Apply opponent move to reach puzzle position
                 if g.is_legal(p.opponent_move):
                     g.make_move_uci(p.opponent_move)
@@ -230,7 +236,10 @@ class PuzzleEvaluator:
             return policy.astype(np.float32), values
 
         for p in puzzles_to_eval:
-            g = zeropawn_cpp.ChessGame(p.fen)
+            try:
+                g = zeropawn_cpp.ChessGame(p.fen)
+            except ValueError:
+                continue  # malformed dataset row (strict FEN gate)
             if not g.is_legal(p.opponent_move):
                 continue
             g.make_move_uci(p.opponent_move)
