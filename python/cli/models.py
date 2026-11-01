@@ -115,9 +115,13 @@ def get_default_model_path() -> Path:
         DefaultCheckpointError: when no designated, verified checkpoint is
             available or the designated artifact fails validation.
     """
+    import python.cli.common as _common
     from python.model.checkpoint_registry import resolve_default_checkpoint
 
-    return resolve_default_checkpoint(repo_root=REPO_ROOT).path
+    # Read REPO_ROOT through the module (not the import-time binding) so test
+    # fakes that patch python.cli.common.REPO_ROOT are honored — the same
+    # dynamic seam every other CLI family uses.
+    return resolve_default_checkpoint(repo_root=_common.REPO_ROOT).path
 
 
 def try_get_default_model_path() -> Optional[Path]:
