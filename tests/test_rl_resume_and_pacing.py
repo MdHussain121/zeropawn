@@ -79,11 +79,26 @@ def test_classify_optimizer_state_variants():
     assert classify_optimizer_state({"optimizer": _opt_state({"momentum_buffer": 1})}) == "SGD"
     # SGD before its first step has no per-param state.
     assert classify_optimizer_state({"optimizer": _opt_state({})}) == "empty"
-    # A stamp always wins.
+    # Audit RL-09: the stamp no longer wins over contradicting contents — a
+    # forged "SGD" stamp on Adam-family state classifies as AdamW so it can
+    # never pass resume selection.
     assert (
         classify_optimizer_state(
             {"_optimizer_type": "SGD", "optimizer": _opt_state({"exp_avg": 1})}
         )
+        == "AdamW"
+    )
+    # An agreeing stamp is honored.
+    assert (
+        classify_optimizer_state(
+            {"_optimizer_type": "SGD", "optimizer": _opt_state({"momentum_buffer": 1})}
+        )
+        == "SGD"
+    )
+    # A stamp is authoritative when the state carries no per-param entries
+    # (a first-save RL checkpoint legitimately has none yet).
+    assert (
+        classify_optimizer_state({"_optimizer_type": "SGD", "optimizer": _opt_state({})})
         == "SGD"
     )
     # Unrecognizable keys.
@@ -336,6 +351,8 @@ def test_rl_resume_refuses_different_buffer_generation(tmp_path):
         model=ChessNet(num_blocks=2, num_filters=32),
         replay_buffer=buf_other,
         batch_size=8,
+        warmup_steps=5,
+        total_steps=100,
         checkpoint_dir=tmp_path / "gen_ckpt_dir",
         sync_weights_path=tmp_path / "gen_sync.pt",
     )
