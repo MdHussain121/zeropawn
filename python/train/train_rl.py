@@ -732,7 +732,6 @@ class RLTrainer:
                     detail,
                 )
             try:
-                saved_sched = ckpt["scheduler"]
                 if scheduler_override:
                     saved_base_lr = saved_sched.get("base_lr")
                     saved_min_lr = saved_sched.get("min_lr")

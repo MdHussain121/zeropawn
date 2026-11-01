@@ -594,6 +594,17 @@ def register_parser(subparsers: argparse._SubParsersAction) -> None:
             "live replay buffer (loudly logged; the live buffer state is never rewound)."
         ),
     )
+    parser.add_argument(
+        "--allow-scheduler-geometry-mismatch",
+        action="store_true",
+        default=False,
+        help=(
+            "Audit RL-07 override: on full resume, adopt the checkpoint's scheduler geometry "
+            "(warmup/total steps) even when it differs from this run's configuration instead "
+            "of refusing (loudly logged; without it a foreign-geometry checkpoint fails "
+            "closed)."
+        ),
+    )
     # ────────────────────────────────────────────────────────────────────────
     # Order matters for merge-safety: the supervised argument set may already
     # register --data-role/--allow-uncertified-data; the idempotent helper runs
@@ -1642,6 +1653,9 @@ def run_training(args: argparse.Namespace) -> int:
                 allow_uncertified_eval=bool(getattr(args, "allow_uncertified_eval", False)),
                 require_certified_eval=bool(getattr(args, "require_certified_eval", True)),
                 allow_buffer_mismatch=bool(getattr(args, "allow_buffer_mismatch", False)),
+                allow_scheduler_geometry_mismatch=bool(
+                    getattr(args, "allow_scheduler_geometry_mismatch", False)
+                ),
             )
         else:
             orchestrator = Phase4Orchestrator(
@@ -1689,6 +1703,9 @@ def run_training(args: argparse.Namespace) -> int:
                 allow_uncertified_eval=bool(getattr(args, "allow_uncertified_eval", False)),
                 require_certified_eval=bool(getattr(args, "require_certified_eval", True)),
                 allow_buffer_mismatch=bool(getattr(args, "allow_buffer_mismatch", False)),
+                allow_scheduler_geometry_mismatch=bool(
+                    getattr(args, "allow_scheduler_geometry_mismatch", False)
+                ),
             )
 
         code = orchestrator.run()
