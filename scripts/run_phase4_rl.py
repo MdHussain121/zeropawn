@@ -66,7 +66,7 @@ from python.selfplay.replay_buffer import ReplayBuffer
 from python.selfplay.metrics import MetricsTracker, query_gpu_metrics, query_process_memory
 from python.train.train_rl import RLTrainer
 from python.eval.puzzles import PuzzleEvaluator, load_puzzles
-from python.eval.match_runner import MatchRunner, eval_config_hash, default_mcts_seed
+from python.eval.match_runner import MatchRunner, eval_config_hash
 from python.common.progress import ProgressReporter
 from python.common.progress import (
     Heartbeat,
@@ -305,6 +305,9 @@ class Phase4Orchestrator:
         stockfish_elo: Optional[int] = 1500,
         allow_unverified_warm_start: bool = False,
         allow_buffer_mismatch: bool = False,
+        # Audit RL-07: adopt a resumed checkpoint's foreign scheduler geometry
+        # (warmup/total) only when the operator acknowledges it explicitly.
+        allow_scheduler_geometry_mismatch: bool = False,
         is_verify_mode: bool = False,
         skip_baseline_eval: bool = False,
         data_role: Optional[str] = None,
@@ -380,6 +383,7 @@ class Phase4Orchestrator:
         # Explicit operator override permitting a checkpoint whose buffer
         # snapshot contradicts the live buffer (audit SR-04; loudly logged).
         self.allow_buffer_mismatch = bool(allow_buffer_mismatch)
+        self.allow_scheduler_geometry_mismatch = bool(allow_scheduler_geometry_mismatch)
         self.gpu_cache_capacity = gpu_cache_capacity
         self.human_cache_size = human_cache_size
         self.tablebase_path = tablebase_path
@@ -600,6 +604,10 @@ class Phase4Orchestrator:
         # Identity of the most recently saved eval checkpoint (provenance).
         self._last_saved_ckpt_name: str = ""
         self._last_saved_ckpt_path: str = ""
+        # Audit RL-27: the shutdown banner used to read this attribute with a
+        # getattr fallback of 'unknown' while nothing ever assigned it; it is
+        # initialized here and set by stop() when the final save succeeds.
+        self._last_final_ckpt: str = ""
         self._active_checkpoint_path = ""
         self._tb_files_found = 0
         self._tb_enabled = False
@@ -630,21 +638,67 @@ class Phase4Orchestrator:
                 pass
 
         logger.info(f"Initializing Replay Buffer at {buf_dir} (capacity {actual_capacity})...")
-        self.buffer = ReplayBuffer(
-            buffer_dir=buf_dir,
-            capacity=actual_capacity,
-            initial_human_mix=0.25,
-            final_human_mix=0.05,
-            taper_steps=50_000,
-            human_data_dir=human_data_dir,
-            human_cache_size=self.human_cache_size,
-            gpu_device=self.train_device if self.train_device == "cuda" else None,
-            create_new=self.reset_buffer,
-            tactical_csv_path=self.tactical_csv_path,
-            tactical_mix=self.tactical_mix,
-            data_role=self.data_role,
-            allow_uncertified_data=self.allow_uncertified_data,
-        )
+
+        def _build_replay_buffer(with_human_data: bool) -> ReplayBuffer:
+            # Audit RL-25: the human/tactical cache composition is derived from
+            # the run seed when one is given (same --seed → same cache).
+            return ReplayBuffer(
+                buffer_dir=buf_dir,
+                capacity=actual_capacity,
+                initial_human_mix=0.25,
+                final_human_mix=0.05,
+                taper_steps=50_000,
+                human_data_dir=human_data_dir if with_human_data else None,
+                human_cache_size=self.human_cache_size,
+                gpu_device=self.train_device if self.train_device == "cuda" else None,
+                create_new=self.reset_buffer,
+                tactical_csv_path=self.tactical_csv_path,
+                tactical_mix=self.tactical_mix,
+                data_role=self.data_role,
+                allow_uncertified_data=self.allow_uncertified_data,
+                cache_rng_seed=(self.seed + 9176) if self.seed is not None else None,
+            )
+
+        # Audit RL-03: the human-data consumption gate lives inside buffer
+        # construction, which precedes auto-resume selection — an uncertified
+        # or invalid OPTIONAL human dataset therefore blocked even
+        # crash-recovery resume of a valid RL checkpoint. The gate stays hard
+        # for fresh and warm starts; only when a genuinely resumable RL
+        # checkpoint exists may the run continue WITHOUT the human mix (human
+        # data is optional by architecture). The dataset itself is never
+        # bypassed: it is simply not consumed this run, loudly.
+        from python.data.dataset_contract import DatasetContractError
+
+        self.human_data_disabled_for_recovery = False
+        try:
+            self.buffer = _build_replay_buffer(with_human_data=True)
+        except DatasetContractError as gate_exc:
+            if self.reset_buffer or self.is_verify_mode:
+                raise
+            if resume_checkpoint is not None:
+                # Explicit resume: a resumable checkpoint is already named.
+                recovered = resume_checkpoint
+            else:
+                # Crash-recovery scan without a live buffer (the selection
+                # scan tolerates that; the authoritative buffer reconciliation
+                # still runs fail-closed inside load_checkpoint).
+                self.buffer = None
+                recovered = self._select_resume_checkpoint()
+            if recovered is None:
+                # No resumable checkpoint: this is a fresh/warm start and the
+                # dataset requirement stands. Re-raise the original error.
+                raise
+            self.buffer = _build_replay_buffer(with_human_data=False)
+            self.human_data_disabled_for_recovery = True
+            resume_checkpoint = recovered
+            logger.warning(
+                "[RECOVERY] Human-data gate rejected the dataset (%s). A resumable RL "
+                "checkpoint exists (%s), so this run continues WITHOUT the optional human "
+                "mix (audit RL-03). The dataset was not bypassed and is not consumed; "
+                "certify or fix it before the next fresh start.",
+                gate_exc,
+                Path(recovered).name,
+            )
 
         # Detect resumable checkpoint if explicitly provided, else auto-resume from
         # the best SGD-compatible RL checkpoint (never by filename ordering — the
@@ -847,11 +901,20 @@ class Phase4Orchestrator:
             artifact_ticket=self.artifact_ticket,
         )
 
+        # Audit RL-03: record the recovery decision durably in the run ledger
+        # so a run that trained without the human mix is identifiable from its
+        # checkpoints alone.
+        if getattr(self, "human_data_disabled_for_recovery", False):
+            cfg = dict(self.trainer.run_metadata.get("config") or {})
+            cfg["human_data"] = "disabled_for_recovery"
+            self.trainer.run_metadata["config"] = cfg
+
         if is_resuming:
             self.trainer.load_checkpoint(
                 resume_checkpoint,
                 allow_buffer_mismatch=self.allow_buffer_mismatch,
                 reset_buffer=self.reset_buffer,
+                allow_scheduler_geometry_mismatch=self.allow_scheduler_geometry_mismatch,
             )
             if hasattr(self.trainer, "direct_server") and self.trainer.direct_server is not None:
                 self.server.model_version = self.trainer.direct_server.model_version
@@ -1094,51 +1157,58 @@ class Phase4Orchestrator:
         # Per-game durability (F-15): every completed match game is persisted
         # the moment it finishes, so an interrupted evaluation keeps its
         # evidence and a resumed run can deduplicate by (step, seed, color).
+        #
+        # Audit RL-21: the previous code wrote a 14-column header and then a
+        # dead second block re-wrote a 16-column header for a file that by
+        # then always existed, while _persist_match_game appended 16-column
+        # rows — a permanently ragged ledger. One authoritative header now,
+        # upgraded in place only while header-only (eval-history policy);
+        # files with data rows in an older schema must be archived instead so
+        # per-game evidence is never mixed across schemas. The trailing
+        # ``adjudicated`` column carries the RL-20 value-cutoff provenance.
         self.match_games_csv_path = self.log_dir / "match_games.csv"
-        if not self.match_games_csv_path.exists():
-            with open(self.match_games_csv_path, "w", newline="", encoding="utf-8") as f:
-                csv.writer(f).writerow(
-                    [
-                        "timestamp",
-                        "step",
-                        "model_version",
-                        "checkpoint_file",
-                        "model_sha256",
-                        "opening_idx",
-                        "engine_is_white",
-                        "result",
-                        "seed",
-                        "stockfish_elo",
-                        "stockfish_nodes",
-                        "mcts_sims",
-                        "search_mode",
-                        "plies",
-                    ]
+        match_headers = [
+            "timestamp",
+            "step",
+            "model_version",
+            "checkpoint_file",
+            "model_sha256",
+            "opening_idx",
+            "engine_is_white",
+            "result",
+            "seed",
+            "stockfish_elo",
+            "stockfish_nodes",
+            "mcts_sims",
+            "search_mode",
+            "plies",
+            "commit",
+            "partial",
+            "adjudicated",
+        ]
+        match_need_write = True
+        if self.match_games_csv_path.exists():
+            with open(self.match_games_csv_path, "r", newline="", encoding="utf-8") as f:
+                first_line = f.readline().strip()
+                has_data_rows = bool(f.readline().strip())
+            if first_line == ",".join(match_headers):
+                match_need_write = False
+            elif has_data_rows:
+                raise RuntimeError(
+                    f"{self.match_games_csv_path} has data rows with an older column "
+                    "schema; archive it (or point --log-dir elsewhere) so per-game "
+                    "match evidence is not mixed across schemas."
                 )
-
-        # Per-game durability ledger: one row per completed match game.
-        if not self.match_games_csv_path.exists():
-            with open(self.match_games_csv_path, "w", newline="", encoding="utf-8") as f:
-                csv.writer(f).writerow(
-                    [
-                        "timestamp",
-                        "step",
-                        "model_version",
-                        "checkpoint_file",
-                        "model_sha256",
-                        "opening_idx",
-                        "engine_is_white",
-                        "result",
-                        "seed",
-                        "stockfish_elo",
-                        "stockfish_nodes",
-                        "mcts_sims",
-                        "search_mode",
-                        "plies",
-                        "commit",
-                        "partial",
-                    ]
+            else:
+                logger.info(
+                    "[EVAL] Upgrading header-only %s with new provenance columns",
+                    self.match_games_csv_path,
                 )
+        if match_need_write:
+            with open(self.match_games_csv_path, "w", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow(match_headers)
+                f.flush()
+                os.fsync(f.fileno())
 
     @staticmethod
     def _git_commit() -> str:
@@ -1291,6 +1361,11 @@ class Phase4Orchestrator:
                 "entropy_bonus": self.entropy_bonus,
                 "max_reuse_ratio": self.max_reuse_ratio,
                 "human_data_dir": getattr(self, "human_data_dir", None),
+                # Audit RL-03: True when a resumable checkpoint let this run
+                # proceed without the (gated) optional human dataset.
+                "human_data_disabled_for_recovery": bool(
+                    getattr(self, "human_data_disabled_for_recovery", False)
+                ),
                 "data_role": self.data_role,
                 "allow_uncertified_data": self.allow_uncertified_data,
                 "device": self.device,
@@ -1381,6 +1456,8 @@ class Phase4Orchestrator:
             len(game.get("moves", []) or []),
             self._run_commit,
             int(partial),
+            # Audit RL-20: value-cutoff adjudication provenance.
+            int(bool(game.get("adjudicated", False))),
         ]
         with open(self.match_games_csv_path, "a", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow(row)
@@ -1627,6 +1704,12 @@ class Phase4Orchestrator:
             openings_path=self.openings_path,
             num_workers=8,
             search_mode="serial",
+            # Audit RL-27: eval games are seeded from the run's --seed when
+            # one is given (previously the match always used the MatchRunner
+            # default regardless of the run seed), and the eval-history row
+            # below records THIS seed rather than the compile-time MCTS
+            # default.
+            seed=int(self.seed) if self.seed is not None else 42,
         )
         try:
             match_pgn_dir = self.log_dir / "matches"
@@ -1688,7 +1771,10 @@ class Phase4Orchestrator:
             match_res["engine_losses"],
             round(match_res["draw_rate"], 4),
             match_res["total_games"],
-            default_mcts_seed(),
+            # Audit RL-27: the seed the match actually ran with (the compile-time
+            # MCTS default was recorded here before, even when the run seeded
+            # the match from --seed).
+            int(match_runner.seed),
             eval_config_hash(
                 self.stockfish_nodes,
                 eval_sims,
@@ -1752,6 +1838,22 @@ class Phase4Orchestrator:
             if sprt_decision != "ACCEPT_H1":
                 eligible = False
                 gate_reason = f"SPRT {sprt_decision}: {sprt_detail}"
+        elif eligible:
+            # Audit RL-16: with SPRT disabled (the default), a threshold pass on
+            # a ~±90-140 Elo CI sample is PROVISIONAL evidence. Never present it
+            # as statistically validated promotion.
+            adjudicated = int(match_res.get("adjudicated_games", 0) or 0)
+            logger.warning(
+                "[PROMOTION] PROVISIONAL: promoting on threshold evidence only — SPRT is "
+                "disabled (promotion_sprt_max_games=0) and a %d-game match has an Elo CI of "
+                "roughly ±90-140. Enable --promotion-sprt-max-games for statistically "
+                "supported promotion.%s",
+                int(match_res.get("total_games", 0) or 0),
+                f" {adjudicated} of the completed games were value-cutoff adjudicated "
+                "(see the match_games.csv adjudicated column)."
+                if adjudicated
+                else "",
+            )
         previous_best = self._best_eval_comp_score
         promotion_decision = "skipped"
         promotion_generation = ""
@@ -2420,7 +2522,12 @@ class Phase4Orchestrator:
                     "Skipping baseline Evaluation Cycle 0 per user directive (--skip-baseline-eval). Proceeding directly to continuous self-play and training."
                 )
             else:
-                self._event("EVAL_START", "baseline Evaluation Cycle 0 (Model v0)")
+                self._event(
+                    "EVAL_START",
+                    # Audit RL-27: report the model version actually being
+                    # evaluated (v0 was only correct for a random-init run).
+                    f"baseline Evaluation Cycle 0 (Model v{self.server.model_version})",
+                )
                 if self.is_verify_mode:
                     self.run_eval_cycle(max_puzzles=10, match_openings=1)
                 else:
@@ -2720,6 +2827,9 @@ class Phase4Orchestrator:
                 keep_last_n=self.keep_checkpoints,
             )
             self._known_ckpt_names.add(Path(final_ckpt).name)
+            # Audit RL-27: record the final checkpoint so the shutdown banner
+            # reports the real artifact instead of a permanent 'unknown'.
+            self._last_final_ckpt = str(final_ckpt)
             self._event("CHECKPOINT", f"saved {final_ckpt} sha={short_hash(final_ckpt)} (final)")
         except Exception as exc:
             logger.error("Final checkpoint save failed during shutdown: %s", exc)
@@ -2880,6 +2990,34 @@ def main() -> None:
             "Base warm-start checkpoint path. Must exist, be readable, match the "
             "12x128 architecture and be a designated warm start in "
             "docs/checkpoint_registry.json, or the run fails closed."
+        ),
+    )
+    # Audit RL-37: the shutdown banner has advertised `--resume` for a long
+    # time while the standalone parser never defined it — explicit crash
+    # recovery had to rely on auto-resume alone. This is the full-resume path
+    # (model + SGD optimizer + scheduler + RNG + buffer state), distinct from
+    # the weights-only warm start of --base-checkpoint.
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help=(
+            "Full resume from an RL checkpoint (model, SGD optimizer, scheduler, RNG and "
+            "buffer state). Takes precedence over --base-checkpoint, which is ignored when "
+            "this is given. The checkpoint must pass resume eligibility (quarantine, "
+            "optimizer family, scheduler geometry, buffer association; see "
+            "--allow-buffer-mismatch / --allow-scheduler-geometry-mismatch for the explicit "
+            "overrides)."
+        ),
+    )
+    parser.add_argument(
+        "--allow-scheduler-geometry-mismatch",
+        action="store_true",
+        help=(
+            "Audit RL-07 override: on full resume, adopt the checkpoint's scheduler geometry "
+            "(warmup/total steps) even when it differs from this run's configuration instead "
+            "of refusing. Without it a foreign-geometry checkpoint fails closed with an "
+            "actionable error."
         ),
     )
     # Audit SR-02 / SLQ-07 (fixed independently on both branches): this option
@@ -3083,8 +3221,10 @@ def main() -> None:
             log_dir=args.log_dir,
             checkpoint_dir=args.checkpoint_dir,
             base_checkpoint=args.base_checkpoint,
+            resume_checkpoint=args.resume,
             allow_unverified_warm_start=args.allow_unverified_warm_start,
             allow_buffer_mismatch=args.allow_buffer_mismatch,
+            allow_scheduler_geometry_mismatch=args.allow_scheduler_geometry_mismatch,
             device=args.device,
             train_device=args.train_device,
             infer_device=args.infer_device,
@@ -3134,8 +3274,10 @@ def main() -> None:
             log_dir=args.log_dir,
             checkpoint_dir=args.checkpoint_dir,
             base_checkpoint=args.base_checkpoint,
+            resume_checkpoint=args.resume,
             allow_unverified_warm_start=args.allow_unverified_warm_start,
             allow_buffer_mismatch=args.allow_buffer_mismatch,
+            allow_scheduler_geometry_mismatch=args.allow_scheduler_geometry_mismatch,
             device=args.device,
             train_device=args.train_device,
             infer_device=args.infer_device,

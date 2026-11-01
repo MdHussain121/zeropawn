@@ -454,15 +454,21 @@ class GpuResidentReplayCache:
             )
 
         if n >= self.capacity:
-            self.gpu_planes.copy_(p_t[-self.capacity :])
-            self.gpu_visits.copy_(v_t[-self.capacity :])
-            self.gpu_outcomes.copy_(o_t[-self.capacity :])
-            self.gpu_full_search.copy_(f_t[-self.capacity :])
-            self.gpu_versions.copy_(ver_t[-self.capacity :])
-            self.gpu_game_ids.copy_(gid_t[-self.capacity :])
-            self.write_head = 0
-            self.size = self.capacity
-            self.total_added += n
+            # Audit RL-12: the full-overwrite fast path mutates the ring
+            # counters and every cache tensor, so it must hold the same lock
+            # as the incremental path and the sampler — otherwise a concurrent
+            # sample_batch can observe a torn overwrite (new counters with
+            # half-copied rows).
+            with self._lock:
+                self.gpu_planes.copy_(p_t[-self.capacity :])
+                self.gpu_visits.copy_(v_t[-self.capacity :])
+                self.gpu_outcomes.copy_(o_t[-self.capacity :])
+                self.gpu_full_search.copy_(f_t[-self.capacity :])
+                self.gpu_versions.copy_(ver_t[-self.capacity :])
+                self.gpu_game_ids.copy_(gid_t[-self.capacity :])
+                self.write_head = 0
+                self.size = self.capacity
+                self.total_added += n
             return
 
         start = self.write_head
@@ -720,9 +726,18 @@ class ReplayBuffer:
         data_role: Optional[str] = None,
         allow_uncertified_data: bool = False,
         selfplay_sampling_policy: str = "ring_uniform",
+        cache_rng_seed: Optional[int] = None,
     ) -> None:
         self.buffer_dir = Path(buffer_dir)
         self.buffer_dir.mkdir(parents=True, exist_ok=True)
+        # Audit RL-26: capacity=0 previously crashed deep in file creation
+        # (seek to a negative offset); refuse it with an actionable message.
+        capacity = int(capacity)
+        if capacity <= 0:
+            raise ValueError(
+                f"ReplayBuffer capacity must be > 0 (got {capacity}). The CLI enforces "
+                "10,000..2,000,000; tests and tools should pass a small positive capacity."
+            )
         self.capacity = capacity
         self.in_channels = in_channels
         self.height = height
@@ -758,6 +773,14 @@ class ReplayBuffer:
         # existed) and for the last self-play sampling shape.
         self.staleness_fallback_count = 0
         self.last_selfplay_rows = 0
+        # Audit RL-25: cache composition (which rows a human/tactical cache
+        # preloads) previously used a fresh unseeded generator on every load,
+        # so the cache was irreproducible even under --seed. When the caller
+        # provides a seed, one persistent seeded generator drives every cache
+        # load and refresh; unseeded callers keep the entropy-seeded behavior.
+        self._cache_rng: Optional[np.random.Generator] = (
+            np.random.default_rng(int(cache_rng_seed)) if cache_rng_seed is not None else None
+        )
         self.last_selfplay_source: Optional[str] = None
         # Records rejected by insertion validation (telemetry; a nonzero value
         # means a producer bug was caught before it could enter the buffer).
@@ -1774,6 +1797,18 @@ class ReplayBuffer:
         else:
             logger.warning(f"Human dataset not found at {p}. Proceeding without human mix.")
 
+    def _cache_sample_rng(self) -> np.random.Generator:
+        """Audit RL-25: the generator that picks cache composition.
+
+        Seeded runs get one persistent seeded generator (same --seed → same
+        cache composition across restarts); unseeded runs keep entropy-seeded
+        draws. Refreshes advance the same generator, so the sequence stays
+        deterministic for a seeded run.
+        """
+        if self._cache_rng is not None:
+            return self._cache_rng
+        return np.random.default_rng()
+
     def _load_human_cache(
         self,
         cache_size: int = 20_000,
@@ -1820,7 +1855,7 @@ class ReplayBuffer:
             if n >= total:
                 indices = np.arange(total)
             else:
-                indices = np.random.default_rng().choice(total, size=n, replace=False)
+                indices = self._cache_sample_rng().choice(total, size=n, replace=False)
             planes_np = np.ascontiguousarray(self.human_dataset.planes[indices], dtype=np.float32)
             moves_np = np.ascontiguousarray(self.human_dataset.moves[indices], dtype=np.int64)
             outcomes_np = np.ascontiguousarray(self.human_dataset.outcomes[indices], dtype=np.int64)
@@ -1988,7 +2023,7 @@ class ReplayBuffer:
             else:
                 # Same O(n) sampler as the human cache: the legacy replace=False path
                 # permutes the entire pool, which scales with dataset size.
-                indices = np.random.default_rng().choice(total, size=n, replace=False)
+                indices = self._cache_sample_rng().choice(total, size=n, replace=False)
                 planes_np = np.ascontiguousarray(
                     self.tactical_pool.planes[indices], dtype=np.float32
                 )
@@ -2316,10 +2351,12 @@ class ReplayBuffer:
         if batch_size <= 0:
             raise ValueError(f"batch_size must be > 0, got {batch_size}")
 
-        tactical_available = (
-            getattr(self, "tactical_pool_size", 0) > 0
-            or getattr(self, "_tactical_cache_size", 0) > 0
-        )
+        # Audit RL-13: tactical demand must come from an actually-loaded
+        # tactical cache, never from a restored meta counter alone. A stale
+        # ``tactical_pool_size`` with no pool/cache used to under-fill the
+        # batch and crash the shuffle permutation with an IndexError; the
+        # saved value remains metadata only.
+        tactical_available = getattr(self, "_tactical_cache_size", 0) > 0
         if tactical_available and self.tactical_mix > 0.0:
             num_tactical = int(round(batch_size * self.tactical_mix))
         else:
@@ -2471,7 +2508,8 @@ class ReplayBuffer:
         )
 
         # Shuffle mini-batch to interleave human, tactical, and self-play samples
-        perm = np.random.permutation(batch_size)
+        # (audit RL-40: over the ASSEMBLED length — never index past it).
+        perm = np.random.permutation(len(planes))
         batch = {
             "planes": planes[perm],
             "visits": visits[perm],
@@ -2501,10 +2539,12 @@ class ReplayBuffer:
             device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
         )
 
-        tactical_available = (
-            getattr(self, "tactical_pool_size", 0) > 0
-            or getattr(self, "_tactical_cache_size", 0) > 0
-        )
+        # Audit RL-13: tactical demand must come from an actually-loaded
+        # tactical cache, never from a restored meta counter alone. A stale
+        # ``tactical_pool_size`` with no pool/cache used to under-fill the
+        # batch and crash the shuffle permutation with an IndexError; the
+        # saved value remains metadata only.
+        tactical_available = getattr(self, "_tactical_cache_size", 0) > 0
         if tactical_available and self.tactical_mix > 0.0:
             num_tactical = int(round(batch_size * self.tactical_mix))
         else:
@@ -2661,25 +2701,25 @@ class ReplayBuffer:
                     h_moves_np = self._human_gpu_moves[h_indices].cpu().numpy()
                     h_outcomes_np = self._human_gpu_outcomes[h_indices].cpu().numpy()
                 else:
-                    valid_mask = np.array(self.human_dataset.outcomes) != 255
-                    valid_indices = np.nonzero(valid_mask)[0]
-                    if len(valid_indices) == 0:
-                        h_indices = np.array([], dtype=np.int64)
-                        h_planes_np = np.zeros((0, 19, 8, 8), dtype=np.float32)
-                        h_moves_np = np.zeros((0,), dtype=np.int64)
-                        h_outcomes_np = np.zeros((0,), dtype=np.int64)
-                        num_human = 0
-                    else:
-                        h_indices = np.random.choice(
-                            valid_indices, size=min(num_human, len(valid_indices)), replace=False
-                        )
-                        h_planes_np = np.array(
-                            self.human_dataset.planes[h_indices], dtype=np.float32
-                        )
-                        h_moves_np = np.array(self.human_dataset.moves[h_indices], dtype=np.int64)
-                        h_outcomes_np = np.array(
-                            self.human_dataset.outcomes[h_indices], dtype=np.int64
-                        )
+                    # Audit RL-10: draw the human contribution uniformly from
+                    # the whole dataset, exactly like every other human path
+                    # (GPU cache, CPU cache, numpy sampler). Outcome-255 rows
+                    # are consumed as policy-only supervision and masked out
+                    # of the WDL loss by ignore_index=255; filtering them on
+                    # this path alone made the disk fallback disagree with
+                    # the cache paths, and its empty/partial-result branch
+                    # could shrink or crash the batch (audit RL-40). Value
+                    # supervision accounting is reported by the trainer from
+                    # the batch's outcome/game-id provenance instead.
+                    human_len = len(self.human_dataset)
+                    h_indices = np.random.randint(0, human_len, size=num_human)
+                    h_planes_np = np.array(
+                        self.human_dataset.planes[h_indices], dtype=np.float32
+                    )
+                    h_moves_np = np.array(self.human_dataset.moves[h_indices], dtype=np.int64)
+                    h_outcomes_np = np.array(
+                        self.human_dataset.outcomes[h_indices], dtype=np.int64
+                    )
 
                 h_visits_np = np.zeros((num_human, self.num_actions), dtype=np.float32)
                 _valid_h = (h_moves_np >= 0) & (h_moves_np < self.num_actions)
@@ -2797,7 +2837,11 @@ class ReplayBuffer:
         )
 
         if len(batch_planes) > 1:
-            perm = torch.randperm(batch_size, device=dev)
+            # Audit RL-40: shuffle over the ASSEMBLED batch length. Every
+            # requested source now delivers exactly its requested rows, but
+            # the permutation must never index past the assembled batch even
+            # if a source under-delivers (the historical stale-tactical crash).
+            perm = torch.randperm(planes.shape[0], device=dev)
             planes = planes[perm]
             visits = visits[perm]
             outcomes = outcomes[perm]

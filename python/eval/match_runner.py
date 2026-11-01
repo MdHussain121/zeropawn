@@ -623,6 +623,7 @@ class MatchRunner:
         max_plies: int = 150,
         game_seed: Optional[int] = None,
         move_log: Optional[list] = None,
+        info_log: Optional[dict] = None,
     ) -> str:
         """Play single game between engine and Stockfish worker with cache reuse and adjudication.
 
@@ -630,10 +631,13 @@ class MatchRunner:
         (Black won), or "1/2-1/2" (draw), regardless of engine color.
         If ``game_seed`` is given the worker MCTS is re-seeded for this game
         (deterministic per game). If ``move_log`` (a list) is given, the
-        game's UCI moves are appended to it.
+        game's UCI moves are appended to it. If ``info_log`` (a dict) is
+        given, it records whether the result was adjudicated and why
+        (audit RL-20: value-cutoff adjudication must be measurable so an
+        uncalibrated value head cannot silently fabricate match wins).
         """
         result, moves = self._play_game_impl(
-            opening_fen, engine_is_white, ctx, max_plies, game_seed
+            opening_fen, engine_is_white, ctx, max_plies, game_seed, info=info_log
         )
         if move_log is not None:
             move_log.extend(moves)
@@ -646,6 +650,7 @@ class MatchRunner:
         ctx: MatchWorkerContext,
         max_plies: int = 150,
         game_seed: Optional[int] = None,
+        info: Optional[dict] = None,
     ) -> tuple[str, list[str]]:
         """Play single game; return (board-relative result, UCI moves)."""
         require_serial_search(self.search_mode, "MatchRunner._play_game_worker")
@@ -657,8 +662,17 @@ class MatchRunner:
             ctx.mcts.set_seed(game_seed)
         moves: list[str] = []
         last_engine_action: Optional[int] = None
+        # Audit RL-20: record every adjudicated ending so promotion evidence
+        # can separate value-head-decided games from natural ones.
+        adjudication_info: dict = {}
 
-        def _finish(result: str) -> tuple[str, list[str]]:
+        def _finish(result: str, reason: Optional[str] = None) -> tuple[str, list[str]]:
+            if reason is not None:
+                adjudication_info["adjudicated"] = True
+                adjudication_info["adjudication_reason"] = reason
+            if info is not None:
+                info.update(adjudication_info)
+                info.setdefault("adjudicated", False)
             return (result, moves)
 
         plies = 0
@@ -671,7 +685,7 @@ class MatchRunner:
 
             # Adjudication: 50-move countdown reaches >= 60 plies (30 full moves no progress)
             if game.half_move_clock() >= 60:
-                return _finish("1/2-1/2")
+                return _finish("1/2-1/2", reason="fifty_move_countdown")
 
             # NOTE: ChessGame.side_to_move() returns bool (True = White to move).
             # Never compare it with == 0 / == 1 (True == 0 is False).
@@ -723,7 +737,10 @@ class MatchRunner:
                     consecutive_hopeless += 1
                     if consecutive_hopeless >= 4:
                         # Engine forfeits: engine loses board-relatively.
-                        return _finish("0-1" if engine_is_white else "1-0")
+                        return _finish(
+                            "0-1" if engine_is_white else "1-0",
+                            reason="value_cutoff_loss",
+                        )
                 else:
                     consecutive_hopeless = 0
 
@@ -731,7 +748,10 @@ class MatchRunner:
                     consecutive_winning += 1
                     if consecutive_winning >= 4:
                         # Engine adjudicated winner board-relatively.
-                        return _finish("1-0" if engine_is_white else "0-1")
+                        return _finish(
+                            "1-0" if engine_is_white else "0-1",
+                            reason="value_cutoff_win",
+                        )
                 else:
                     consecutive_winning = 0
             else:
@@ -827,20 +847,24 @@ class MatchRunner:
             worker_ctx = ctx_queue.get()
             try:
                 moves_w: list[str] = []
+                info_w: dict = {}
                 res_w = self._play_game_worker(
                     fen,
                     engine_is_white=True,
                     ctx=worker_ctx,
                     game_seed=self.seed + 2 * idx,
                     move_log=moves_w,
+                    info_log=info_w,
                 )
                 moves_b: list[str] = []
+                info_b: dict = {}
                 res_b = self._play_game_worker(
                     fen,
                     engine_is_white=False,
                     ctx=worker_ctx,
                     game_seed=self.seed + 2 * idx + 1,
                     move_log=moves_b,
+                    info_log=info_b,
                 )
                 return (
                     {
@@ -850,6 +874,9 @@ class MatchRunner:
                         "result": res_w,
                         "moves": moves_w,
                         "seed": self.seed + 2 * idx,
+                        # Audit RL-20: value-cutoff adjudication provenance.
+                        "adjudicated": bool(info_w.get("adjudicated", False)),
+                        "adjudication_reason": info_w.get("adjudication_reason"),
                     },
                     {
                         "opening_idx": idx,
@@ -858,6 +885,8 @@ class MatchRunner:
                         "result": res_b,
                         "moves": moves_b,
                         "seed": self.seed + 2 * idx + 1,
+                        "adjudicated": bool(info_b.get("adjudicated", False)),
+                        "adjudication_reason": info_b.get("adjudication_reason"),
                     },
                 )
             finally:
@@ -965,6 +994,17 @@ class MatchRunner:
             "games": games,
             "pgn_path": pgn_saved,
             "elapsed_sec": round(time.time() - start_time, 2),
+            # Audit RL-20: how many of the completed games were decided by
+            # adjudication rather than natural termination, split by cause.
+            # A promotion decision backed mostly by value-cutoff wins is
+            # exactly the uncalibrated-value-head risk this surfaces.
+            "adjudicated_games": sum(1 for g in games if g.get("adjudicated")),
+            "adjudicated_value_cutoff_wins": sum(
+                1 for g in games if g.get("adjudication_reason") == "value_cutoff_win"
+            ),
+            "adjudicated_value_cutoff_losses": sum(
+                1 for g in games if g.get("adjudication_reason") == "value_cutoff_loss"
+            ),
         }
 
     def close(self) -> None:

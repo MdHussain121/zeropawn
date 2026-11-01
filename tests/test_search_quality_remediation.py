@@ -605,7 +605,7 @@ def test_f15_on_game_result_persists_each_game(monkeypatch):
 
     results = ["1-0", "1/2-1/2", "0-1"]
 
-    def instant_game(fen, engine_is_white, ctx, game_seed, move_log):
+    def instant_game(fen, engine_is_white, ctx, game_seed, move_log, info_log=None):
         return results[game_seed % 3]
 
     runner._play_game_worker = instant_game
@@ -632,7 +632,7 @@ def test_f15_interrupted_match_returns_partial_tally(monkeypatch):
 
     persisted = []
 
-    def slow_game(fen, engine_is_white, ctx, game_seed, move_log):
+    def slow_game(fen, engine_is_white, ctx, game_seed, move_log, info_log=None):
         time.sleep(0.05)
         return "1/2-1/2"
 

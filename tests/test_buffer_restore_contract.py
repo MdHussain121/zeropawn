@@ -64,10 +64,15 @@ def _reload(tmp_path: Path, name: str, capacity: int = 64) -> ReplayBuffer:
 
 
 def _trainer_on(tmp_path: Path, buffer: ReplayBuffer, name: str) -> RLTrainer:
+    # Same geometry as _trainer(): a full resume continues the SAME run, so
+    # the reload trainer must not change the schedule (audit RL-07 refuses
+    # foreign scheduler geometry on resume).
     return RLTrainer(
         model=ChessNet(num_blocks=2, num_filters=32),
         replay_buffer=buffer,
         batch_size=8,
+        warmup_steps=5,
+        total_steps=100,
         checkpoint_dir=tmp_path / f"ckpt_{name}",
         sync_weights_path=tmp_path / f"sync_{name}.pt",
     )

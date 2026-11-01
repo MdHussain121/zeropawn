@@ -450,7 +450,7 @@ def test_run_match_interrupt_preserves_completed_games(tmp_path, monkeypatch):
     # Patch out the instance bound method (workers call self._play_game_worker).
     slow = threading.Event()
 
-    def fake_play(opening_fen, engine_is_white, ctx, max_plies=150, game_seed=None, move_log=None):
+    def fake_play(opening_fen, engine_is_white, ctx, max_plies=150, game_seed=None, move_log=None, info_log=None):  # noqa: E501 - RL-20 adds the info_log channel
         if opening_fen == fens[1]:
             # Deterministic interrupt: openings 0 and 2 finish well before this
             # one raises.

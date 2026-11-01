@@ -146,6 +146,7 @@ class SprtMatchRunner:
         base_cfg_dict: dict[str, float],
         game_seed: int,
         max_plies: int = 150,
+        info: Optional[dict] = None,
     ) -> tuple[str, list[str]]:
         cfg_cand = zeropawn_cpp.MCTSConfig()
         cfg_cand.c_puct = cand_cfg_dict.get("c_puct", 2.0)
@@ -171,12 +172,24 @@ class SprtMatchRunner:
         plies = 0
         consecutive_hopeless = 0
         consecutive_winning = 0
+        # Audit RL-20: record adjudicated endings so SPRT evidence can be
+        # audited for value-cutoff-decided games (symmetric between arms, but
+        # still value-head-dependent).
+        adj: dict[str, object] = {"adjudicated": False, "adjudication_reason": None}
+
+        def _done(result: str, reason: Optional[str] = None) -> tuple[str, list[str]]:
+            if reason is not None:
+                adj["adjudicated"] = True
+                adj["adjudication_reason"] = reason
+            if info is not None:
+                info.update(adj)
+            return result, moves
 
         while plies < max_plies:
             if game.is_game_over():
                 break
             if game.half_move_clock() >= 60:
-                return "1/2-1/2", moves
+                return _done("1/2-1/2", reason="fifty_move_countdown")
 
             white_to_move = bool(game.side_to_move())
             cand_turn = white_to_move == cand_white
@@ -189,7 +202,7 @@ class SprtMatchRunner:
 
             if not move_uci or not game.is_legal(move_uci):
                 loser_is_white = white_to_move
-                return ("0-1" if loser_is_white else "1-0"), moves
+                return _done("0-1" if loser_is_white else "1-0")
 
             # Root-value adjudication: 4 consecutive plies beyond ±0.92 ends the
             # game (both sides see the same evidence; symmetric between arms).
@@ -197,7 +210,9 @@ class SprtMatchRunner:
                 consecutive_hopeless += 1
                 if consecutive_hopeless >= 4:
                     loser_is_white = white_to_move
-                    return ("0-1" if loser_is_white else "1-0"), moves
+                    return _done(
+                        "0-1" if loser_is_white else "1-0", reason="value_cutoff_loss"
+                    )
             else:
                 consecutive_hopeless = 0
 
@@ -205,7 +220,7 @@ class SprtMatchRunner:
                 consecutive_winning += 1
                 if consecutive_winning >= 4:
                     winner_is_white = white_to_move
-                    return ("1-0" if winner_is_white else "0-1"), moves
+                    return _done("1-0" if winner_is_white else "0-1", reason="value_cutoff_win")
             else:
                 consecutive_winning = 0
 
@@ -215,8 +230,8 @@ class SprtMatchRunner:
 
         if game.is_checkmate():
             loser_is_white = bool(game.side_to_move())
-            return ("0-1" if loser_is_white else "1-0"), moves
-        return "1/2-1/2", moves
+            return _done("0-1" if loser_is_white else "1-0")
+        return _done("1/2-1/2")
 
     def run_sprt(
         self,
@@ -289,14 +304,24 @@ class SprtMatchRunner:
             t0 = time.time()
             batch_results: list[dict[str, Any]] = []
             with concurrent.futures.ThreadPoolExecutor(max_workers=self.workers) as executor:
-                futures = {
-                    executor.submit(
-                        self.play_single_game, fen, cand_white, cand_cfg, base_cfg, seed
-                    ): (p_idx, opening_idx, fen, cand_white, seed)
-                    for (p_idx, opening_idx, fen, cand_white, seed) in tasks
-                }
+                futures = {}
+                for (p_idx, opening_idx, fen, cand_white, seed) in tasks:
+                    # Audit RL-20: per-game adjudication provenance.
+                    game_info: dict[str, object] = {}
+                    futures[
+                        executor.submit(
+                            self.play_single_game,
+                            fen,
+                            cand_white,
+                            cand_cfg,
+                            base_cfg,
+                            seed,
+                            150,
+                            game_info,
+                        )
+                    ] = (p_idx, opening_idx, fen, cand_white, seed, game_info)
                 for fut in concurrent.futures.as_completed(futures):
-                    p_idx, opening_idx, fen, cand_white, seed = futures[fut]
+                    p_idx, opening_idx, fen, cand_white, seed, game_info = futures[fut]
                     board_res, moves = fut.result()
                     if board_res == "1/2-1/2":
                         cand_outcome = "draw"
@@ -315,6 +340,8 @@ class SprtMatchRunner:
                             "cand_outcome": cand_outcome,
                             "moves": moves,
                             "seed": seed,
+                            "adjudicated": bool(game_info.get("adjudicated", False)),
+                            "adjudication_reason": game_info.get("adjudication_reason"),
                         }
                     )
 
@@ -374,6 +401,13 @@ class SprtMatchRunner:
             "final_status": final_status,
             "games_count": len(games_played),
             "pgn_path": str(pgn_file),
+            # Audit RL-20: adjudication provenance for the SPRT evidence.
+            "adjudicated_games": sum(1 for g in games_played if g.get("adjudicated")),
+            "adjudicated_value_cutoff_wins": sum(
+                1
+                for g in games_played
+                if g.get("adjudicated") and g.get("cand_outcome") == "win"
+            ),
         }
 
 
