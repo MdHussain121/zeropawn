@@ -61,7 +61,7 @@ def train_opening_step(
     planes = batch["planes"].to(device, memory_format=torch.channels_last, non_blocking=True)
     moves = batch["move"].to(device, non_blocking=True)
     value_targets = batch["value_target"].to(device, non_blocking=True)
-    batch["ply"].to(device, non_blocking=True)
+    plies = batch["ply"].to(device, non_blocking=True)
 
     optimizer.zero_grad(set_to_none=True)
 
@@ -84,9 +84,15 @@ def train_opening_step(
         else:
             policy_loss = F.cross_entropy(policy_logits, moves, label_smoothing=0.05)
 
-        # WDL cross-entropy (for opening plies, WDL is gently regularized toward neutral prior)
+        # WDL cross-entropy: apply WDL loss mask (ply >= 10 and value target non-zero) (DI-21)
         log_wdl = F.log_softmax(wdl_logits, dim=-1)
-        ce_wdl = -(value_targets * log_wdl).sum(dim=-1).mean()
+        val_mask = ((plies >= 10) & (value_targets.sum(dim=-1) > 0)).float()
+        valid_count = val_mask.sum()
+        if valid_count > 0:
+            per_sample_wdl = -(value_targets * log_wdl).sum(dim=-1)
+            ce_wdl = (per_sample_wdl * val_mask).sum() / valid_count
+        else:
+            ce_wdl = torch.tensor(0.0, device=device, dtype=wdl_logits.dtype)
 
         total_loss = policy_weight * policy_loss + wdl_weight * ce_wdl
 
@@ -198,6 +204,7 @@ def train_opening_policy(
     num_filters: int = 128,
     seed: int = 42,
     device_name: Optional[str] = None,
+    allow_uncertified_data: bool = False,
 ) -> Dict[str, Any]:
     """Execute opening policy fine-tuning."""
     setup_environment()
@@ -228,6 +235,9 @@ def train_opening_policy(
         model.load_state_dict(st)
     model.train()
 
+    # DI-21: Require validated dataset before consumption
+    from python.data.dataset_validation import require_validated_dataset
+
     # Load opening datasets (and optional extra datasets such as tactical puzzles or Syzygy endgames)
     train_datasets = []
     val_datasets = []
@@ -235,8 +245,18 @@ def train_opening_policy(
     op_train_dir = Path(opening_data_dir) / "train"
     op_val_dir = Path(opening_data_dir) / "val"
     if op_train_dir.is_dir():
+        require_validated_dataset(
+            op_train_dir,
+            allow_uncertified=allow_uncertified_data,
+            consumer="opening-policy-trainer[train]",
+        )
         train_datasets.append(BinaryChessDataset(op_train_dir))
     if op_val_dir.is_dir():
+        require_validated_dataset(
+            op_val_dir,
+            allow_uncertified=allow_uncertified_data,
+            consumer="opening-policy-trainer[val]",
+        )
         val_datasets.append(BinaryChessDataset(op_val_dir))
 
     if extra_data_dirs:
@@ -244,8 +264,18 @@ def train_opening_policy(
             if ed:
                 ed_path = Path(ed)
                 if (ed_path / "train").is_dir():
+                    require_validated_dataset(
+                        ed_path / "train",
+                        allow_uncertified=allow_uncertified_data,
+                        consumer="opening-policy-trainer[extra_train]",
+                    )
                     train_datasets.append(BinaryChessDataset(ed_path / "train"))
                 if (ed_path / "val").is_dir():
+                    require_validated_dataset(
+                        ed_path / "val",
+                        allow_uncertified=allow_uncertified_data,
+                        consumer="opening-policy-trainer[extra_val]",
+                    )
                     val_datasets.append(BinaryChessDataset(ed_path / "val"))
 
     if not train_datasets:
@@ -326,7 +356,13 @@ def train_opening_policy(
     # General dataset if mixed training enabled
     gen_train_loader = None
     if general_data_dir and (Path(general_data_dir) / "train").is_dir():
-        gen_train_ds = BinaryChessDataset(Path(general_data_dir) / "train")
+        gen_train_path = Path(general_data_dir) / "train"
+        require_validated_dataset(
+            gen_train_path,
+            allow_uncertified=allow_uncertified_data,
+            consumer="opening-policy-trainer[general_train]",
+        )
+        gen_train_ds = BinaryChessDataset(gen_train_path)
         gen_train_loader = DataLoader(
             gen_train_ds, batch_size=batch_size, shuffle=True, drop_last=True
         )

@@ -64,8 +64,10 @@ class FilterStats:
         self.total_seen: int = 0
         self.passed_rated: int = 0
         self.passed_rating_2200: int = 0
+        self.passed_bot_purge: int = 0
         self.passed_normal_term: int = 0
         self.passed_time_control: int = 0
+        self.passed_base_time: int = 0
         self.passed_min_plies: int = 0
         self.total_kept: int = 0
 
@@ -77,13 +79,17 @@ class FilterStats:
         pct_rated = (self.passed_rated / self.total_seen * 100) if self.total_seen else 0
         print(f"2. Rated games:                  {self.passed_rated:>8} ({pct_rated:5.1f}%)")
         pct_2200 = (self.passed_rating_2200 / self.total_seen * 100) if self.total_seen else 0
-        print(f"3. Both players >= 2200:         {self.passed_rating_2200:>8} ({pct_2200:5.2f}%)")
+        print(f"3. Rating threshold:             {self.passed_rating_2200:>8} ({pct_2200:5.2f}%)")
+        pct_bot = (self.passed_bot_purge / self.total_seen * 100) if self.total_seen else 0
+        print(f"4. Human accounts (BOTs purged): {self.passed_bot_purge:>8} ({pct_bot:5.2f}%)")
         pct_term = (self.passed_normal_term / self.total_seen * 100) if self.total_seen else 0
-        print(f"4. Normal termination:           {self.passed_normal_term:>8} ({pct_term:5.2f}%)")
+        print(f"5. Normal termination:           {self.passed_normal_term:>8} ({pct_term:5.2f}%)")
         pct_tc = (self.passed_time_control / self.total_seen * 100) if self.total_seen else 0
-        print(f"5. Time control (>=180s):        {self.passed_time_control:>8} ({pct_tc:5.2f}%)")
+        print(f"6. Time control:                 {self.passed_time_control:>8} ({pct_tc:5.2f}%)")
+        pct_base = (self.passed_base_time / self.total_seen * 100) if self.total_seen else 0
+        print(f"7. Base time (>=600s):           {self.passed_base_time:>8} ({pct_base:5.2f}%)")
         pct_plies = (self.passed_min_plies / self.total_seen * 100) if self.total_seen else 0
-        print(f"6. Min length (>=20 plies):      {self.passed_min_plies:>8} ({pct_plies:5.2f}%)")
+        print(f"8. Min length:                   {self.passed_min_plies:>8} ({pct_plies:5.2f}%)")
         print("-" * 60)
         pct_kept = (self.total_kept / self.total_seen * 100) if self.total_seen else 0
         print(f"Total games kept:                {self.total_kept:>8} ({pct_kept:5.2f}%)")
@@ -129,6 +135,41 @@ def is_normal_termination(headers: dict[str, str]) -> bool:
     return term.lower() == "normal"
 
 
+def is_bot_account(headers: dict[str, str]) -> bool:
+    """Check if either player is an engine or BOT account."""
+    w_title = headers.get("WhiteTitle", "").strip().upper()
+    b_title = headers.get("BlackTitle", "").strip().upper()
+    if w_title == "BOT" or b_title == "BOT":
+        return True
+    w = headers.get("White", "").lower()
+    b = headers.get("Black", "").lower()
+    if "bot" in w or "bot" in b:
+        return True
+    if "engine" in w or "engine" in b:
+        return True
+    return False
+
+
+def parse_base_seconds(tc_str: str) -> Optional[int]:
+    """Parse TimeControl header into base seconds."""
+    if not tc_str or tc_str == "-":
+        return None
+    try:
+        parts = tc_str.split("+")
+        return int(parts[0])
+    except (ValueError, IndexError):
+        return None
+
+
+def check_base_time(headers: dict[str, str], min_base_seconds: int = 600) -> bool:
+    """Check if base time in TimeControl is >= min_base_seconds."""
+    tc = headers.get("TimeControl", "")
+    base = parse_base_seconds(tc)
+    if base is None:
+        return False
+    return base >= min_base_seconds
+
+
 def check_time_control(headers: dict[str, str], min_seconds: int = 180) -> bool:
     """Check if game time control meets the minimum estimated duration threshold."""
     tc = headers.get("TimeControl", "")
@@ -172,6 +213,8 @@ def filter_games(
     min_rating: int = 2200,
     min_plies: int = 20,
     min_tc_seconds: int = 180,
+    min_base_seconds: Optional[int] = None,
+    purge_bots: bool = False,
     max_kept: Optional[int] = None,
 ) -> Iterator[chess.pgn.Game]:
     """Filter raw PGN games yielding parsed chess.pgn.Game objects."""
@@ -198,15 +241,25 @@ def filter_games(
             continue
         stats.passed_rating_2200 += 1
 
+        # Filter step 2b: Bot purge (DI-08)
+        if purge_bots and is_bot_account(headers):
+            continue
+        stats.passed_bot_purge += 1
+
         # Filter step 3: Normal termination
         if not is_normal_termination(headers):
             continue
         stats.passed_normal_term += 1
 
         # Filter step 4: Time control filter
-        if not check_time_control(headers, min_tc_seconds):
+        if min_tc_seconds > 0 and not check_time_control(headers, min_tc_seconds):
             continue
         stats.passed_time_control += 1
+
+        # Filter step 4b: Base time control filter (>= 600s)
+        if min_base_seconds is not None and not check_base_time(headers, min_base_seconds):
+            continue
+        stats.passed_base_time += 1
 
         # Filter step 5: Minimum length in plies
         game = chess.pgn.read_game(io.StringIO(raw_game_str))
@@ -288,17 +341,21 @@ def run_filter(
     min_rating: int = 2200,
     min_plies: int = 20,
     min_tc_seconds: int = 180,
+    min_base_seconds: Optional[int] = None,
+    purge_bots: bool = False,
     max_kept: Optional[int] = None,
     log_interval: int = 1000,
 ) -> FilterStats:
     """Run full filtering pipeline and save matching games to output PGN."""
     print("=" * 60)
-    print("LICHESS 2200+ FILTER RUNNER")
-    print(f"Source: {input_source}")
-    print(f"Output: {output_pgn_path}")
-    print(f"Min rating: {min_rating}")
-    print(f"Min plies:  {min_plies}")
-    print(f"Min TC sec: {min_tc_seconds}s")
+    print("LICHESS FILTER RUNNER")
+    print(f"Source:           {input_source}")
+    print(f"Output:           {output_pgn_path}")
+    print(f"Min rating:       {min_rating}")
+    print(f"Min plies:        {min_plies}")
+    print(f"Min TC sec:       {min_tc_seconds}s")
+    print(f"Min base sec:     {min_base_seconds}s" if min_base_seconds is not None else "Min base sec:     none")
+    print(f"Purge BOTs:       {purge_bots}")
     print(TIME_CONTROL_JUSTIFICATION)
     print("=" * 60)
 
@@ -327,6 +384,8 @@ def run_filter(
                 min_rating=min_rating,
                 min_plies=min_plies,
                 min_tc_seconds=min_tc_seconds,
+                min_base_seconds=min_base_seconds,
+                purge_bots=purge_bots,
                 max_kept=max_kept,
             ):
                 game.accept(exporter)
@@ -387,6 +446,15 @@ def main() -> None:
         "--min-tc", type=int, default=180, help="Minimum estimated seconds (base + 40*inc)."
     )
     parser.add_argument(
+        "--min-base-seconds",
+        type=int,
+        default=None,
+        help="Minimum base time in seconds from TimeControl.",
+    )
+    parser.add_argument(
+        "--purge-bots", action="store_true", default=False, help="Purge BOT and engine accounts."
+    )
+    parser.add_argument(
         "--max-kept", type=int, default=None, help="Stop after keeping this many games."
     )
     parser.add_argument(
@@ -420,6 +488,8 @@ def main() -> None:
                 ("min_rating", args.min_rating, "user" if args.min_rating != 2200 else "default"),
                 ("min_plies", args.min_plies, "user" if args.min_plies != 20 else "default"),
                 ("min_tc", args.min_tc, "user" if args.min_tc != 180 else "default"),
+                ("min_base_seconds", args.min_base_seconds, "user" if args.min_base_seconds is not None else "default"),
+                ("purge_bots", args.purge_bots, "user" if args.purge_bots else "default"),
                 ("max_kept", args.max_kept, "user" if args.max_kept is not None else "default"),
                 (
                     "log_interval",
@@ -437,6 +507,8 @@ def main() -> None:
             min_rating=args.min_rating,
             min_plies=args.min_plies,
             min_tc_seconds=args.min_tc,
+            min_base_seconds=args.min_base_seconds,
+            purge_bots=args.purge_bots,
             max_kept=args.max_kept,
             log_interval=args.log_interval,
         )

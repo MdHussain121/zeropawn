@@ -135,11 +135,34 @@ def eval_config_hash(
     num_workers: int,
     policy_target_temp: Optional[float] = None,
     entropy_bonus: Optional[float] = None,
+    stockfish_elo: Optional[int] = None,
+    seed: Optional[int] = None,
 ) -> str:
-    """Short stable hash of the eval-match configuration for CSV provenance."""
+    """Short stable hash of the eval-match configuration for CSV provenance.
+
+    Audit DI-15: binds actual openings file content SHA-256 (falling back to filename
+    only if unreadable), plus optional stockfish_elo and match seed.
+    """
     import hashlib
 
-    canonical = f"{stockfish_nodes}|{mcts_sims}|{c_puct}|{Path(openings_path).name}|{num_workers}"
+    p = Path(openings_path)
+    if p.is_file():
+        try:
+            h = hashlib.sha256()
+            with open(p, "rb") as fh:
+                for chunk in iter(lambda: fh.read(65536), b""):
+                    h.update(chunk)
+            openings_id = h.hexdigest()[:12]
+        except Exception:
+            openings_id = p.name
+    else:
+        openings_id = p.name
+
+    canonical = f"{stockfish_nodes}|{mcts_sims}|{c_puct}|{openings_id}|{num_workers}"
+    if stockfish_elo is not None:
+        canonical += f"|sf_elo={stockfish_elo}"
+    if seed is not None:
+        canonical += f"|seed={seed}"
     if policy_target_temp is not None:
         canonical += f"|temp={policy_target_temp}"
     if entropy_bonus is not None:

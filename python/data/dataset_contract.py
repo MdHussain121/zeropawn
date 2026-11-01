@@ -23,6 +23,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional
+import numpy as np
 
 # Schema of the binary split arrays (planes/moves/outcomes/game_ids/plies and
 # optional value/policy/dtz targets). Bump when the layout changes.
@@ -95,7 +96,7 @@ ROLE_POLICY_TACTICS = DatasetRole(
         "(OUTCOME_UNAVAILABLE) for every row whose solution does not deliver checkmate. "
         "Mate-delivering rows carry a genuine mover-relative win label (outcome=0) at "
         "ply=10, and the loaders pass that label through so the trainer's WDL mask "
-        "(ply >= 10 ∧ non-zero target) supervises the value head for them (audit SLQ-06 "
+        "(ply >= 10 and non-zero target) supervises the value head for them (audit SLQ-06 "
         "contract decision: a genuinely available and supported target is never silently "
         "discarded, and unavailable targets remain masked)."
     ),
@@ -139,6 +140,9 @@ _KIND_TO_ROLE: Dict[str, DatasetRole] = {
     "dataset_tactics": ROLE_POLICY_TACTICS,
     "endgame_syzygy": ROLE_SYZYGY,
     "syzygy": ROLE_SYZYGY,
+    "openings": ROLE_GAMES_WDL,
+    "opening": ROLE_GAMES_WDL,
+    "openings_policy": ROLE_GAMES_WDL,
     "unified": ROLE_UNIFIED,
     "unified_training": ROLE_UNIFIED,
 }
@@ -238,6 +242,60 @@ def bytes_per_sample() -> int:
     )
 
 
+def remap_syzygy_outcomes(outcomes: Any) -> Any:
+    """Remap 5-class Syzygy outcomes into 3-class mover-relative targets (DI-06).
+
+    Convention:
+      0, 1 (Win / Cursed Win) -> 0 (Win for side to move)
+      2 (Draw) -> 1 (Draw)
+      3, 4 (Blessed Loss / Loss) -> 2 (Loss for side to move)
+      255 (OUTCOME_UNAVAILABLE) -> 255 (Masked / unavailable)
+
+    Supports numpy ndarray or torch Tensor, or scalar integers.
+    Raises ValueError on out-of-domain values.
+    """
+    if isinstance(outcomes, np.ndarray):
+        arr = outcomes.copy()
+        mask_255 = (arr == OUTCOME_UNAVAILABLE)
+        invalid = (~mask_255) & ((arr < 0) | (arr > 4))
+        if np.any(invalid):
+            bad_vals = np.unique(arr[invalid]).tolist()
+            raise ValueError(f"Invalid Syzygy outcome value(s): {bad_vals}; expected 0..4 or 255")
+        res = np.empty_like(arr)
+        res[mask_255] = OUTCOME_UNAVAILABLE
+        res[(arr == 0) | (arr == 1)] = OUTCOME_WIN
+        res[arr == 2] = OUTCOME_DRAW
+        res[(arr == 3) | (arr == 4)] = OUTCOME_LOSS
+        return res
+
+    import torch
+    if isinstance(outcomes, torch.Tensor):
+        t = outcomes.clone()
+        mask_255 = (t == OUTCOME_UNAVAILABLE)
+        invalid = (~mask_255) & ((t < 0) | (t > 4))
+        if invalid.any():
+            bad_vals = torch.unique(t[invalid]).tolist()
+            raise ValueError(f"Invalid Syzygy outcome value(s): {bad_vals}; expected 0..4 or 255")
+        res = torch.empty_like(t)
+        res[mask_255] = OUTCOME_UNAVAILABLE
+        res[(t == 0) | (t == 1)] = OUTCOME_WIN
+        res[t == 2] = OUTCOME_DRAW
+        res[(t == 3) | (t == 4)] = OUTCOME_LOSS
+        return res
+
+    # Scalar int
+    val = int(outcomes)
+    if val == OUTCOME_UNAVAILABLE:
+        return OUTCOME_UNAVAILABLE
+    if val in (0, 1):
+        return OUTCOME_WIN
+    if val == 2:
+        return OUTCOME_DRAW
+    if val in (3, 4):
+        return OUTCOME_LOSS
+    raise ValueError(f"Invalid Syzygy outcome value: {val}; expected 0..4 or 255")
+
+
 @dataclass
 class BuildRecord:
     """Provenance record for a dataset build (written next to the output).
@@ -260,6 +318,17 @@ class BuildRecord:
 
     def to_dict(self) -> Dict[str, Any]:
         from datetime import datetime, timezone
+        import sys
+
+        env = {
+            "python": sys.version.split()[0],
+        }
+        if "torch" in sys.modules:
+            import torch
+            env["torch"] = getattr(torch, "__version__", None)
+        if "numpy" in sys.modules:
+            import numpy as _np
+            env["numpy"] = getattr(_np, "__version__", None)
 
         return {
             "build_record_version": BUILD_RECORD_VERSION,
@@ -268,6 +337,7 @@ class BuildRecord:
             "schema_version": self.schema_version,
             "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "git_commit": self.git_commit,
+            "environment": env,
             "source": self.source,
             "config": self.config,
             "label_semantics": self.label_semantics,

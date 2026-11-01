@@ -638,6 +638,31 @@ class RLTrainer:
                 ledger.get("failure_reason"),
             )
 
+        # Dataset identity compatibility check (DI-04 / P1-5)
+        saved_dataset = None
+        if isinstance(ledger, dict) and isinstance(ledger.get("dataset"), dict):
+            saved_dataset = ledger.get("dataset")
+        elif isinstance(ckpt.get("provenance"), dict) and isinstance(ckpt["provenance"].get("dataset"), dict):
+            saved_dataset = ckpt["provenance"].get("dataset")
+
+        if saved_dataset and getattr(self.buffer, "human_data_gate", None) is not None:
+            saved_human = saved_dataset.get("human", {}) if isinstance(saved_dataset, dict) else {}
+            saved_receipt_id = saved_human.get("receipt_id")
+            gate = self.buffer.human_data_gate
+            curr_receipt_id = (
+                f"sha256:{hashlib.sha256(json.dumps(gate.receipt, sort_keys=True).encode()).hexdigest()[:16]}"
+                if isinstance(gate.receipt, dict)
+                else None
+            )
+            if saved_receipt_id and curr_receipt_id and saved_receipt_id != curr_receipt_id:
+                logger.warning(
+                    "[DATASET-MISMATCH] Resumed RL checkpoint '%s' was trained on human dataset receipt %s, "
+                    "but current run is gated against human dataset receipt %s.",
+                    Path(path_str).name,
+                    saved_receipt_id,
+                    curr_receipt_id,
+                )
+
         self.model.load_state_dict(ckpt.get("model"))
 
         # Continuation lineage: a resumed run is a NEW run whose ledger names the
@@ -1351,6 +1376,28 @@ class RLTrainer:
             ledger = dict(ledger)
             ledger["last_update_at"] = time.time()
             ledger["step"] = int(self.step_num)
+
+        # Bind dataset identity into checkpoint provenance (DI-04 / P1-5)
+        if getattr(self.buffer, "human_data_gate", None) is not None:
+            gate = self.buffer.human_data_gate
+            receipt = gate.receipt
+            receipt_id = (
+                f"sha256:{hashlib.sha256(json.dumps(receipt, sort_keys=True).encode()).hexdigest()[:16]}"
+                if isinstance(receipt, dict)
+                else None
+            )
+            dataset_info = {
+                "human": {
+                    "data_dir": str(gate.data_dir),
+                    "role": gate.role.name if gate.role else None,
+                    "certified": gate.certified,
+                    "receipt_id": receipt_id,
+                    "masked_fraction": gate.masked_fraction,
+                    "num_samples": gate.num_samples,
+                }
+            }
+            ledger["dataset"] = dataset_info
+
         self.run_metadata = ledger
 
         provenance = dict(self.provenance) if self.provenance else {}
@@ -1656,6 +1703,14 @@ class RLTrainer:
             outcomes_idx = outcomes.long()
             if outcomes_idx.ndim > 1 and outcomes_idx.shape[-1] == 1:
                 outcomes_idx = outcomes_idx.squeeze(-1)
+            # Safety gate (DI-06): RL WDL loss expects 3-class mover-relative targets or 255
+            invalid_outcomes = (outcomes_idx != 255) & ((outcomes_idx < 0) | (outcomes_idx > 2))
+            if invalid_outcomes.any():
+                bad_vals = torch.unique(outcomes_idx[invalid_outcomes]).tolist()
+                raise ValueError(
+                    f"Outcomes contain invalid classes for 3-class WDL head: {bad_vals}. "
+                    "Syzygy 5-class outcomes must be remapped to 3-class via remap_syzygy_outcomes."
+                )
             if (outcomes_idx != 255).any():
                 wdl_loss = F.cross_entropy(
                     wdl_logits.float(), outcomes_idx, ignore_index=255
