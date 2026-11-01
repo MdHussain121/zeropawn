@@ -3,6 +3,8 @@ build*/
 _build/
 cmake-build-*/
 tools/
+# ...but the re-runnable audit evidence tools are deliverables, not build output
+!audit-reports/**/tools/
 *.o
 *.obj
 *.exe
