@@ -539,6 +539,7 @@ class UCIEngine:
         """
         self._bestmove_emitted = False
         self._last_search_ran = False
+        self._last_actual_sims = None
         t_start = time.perf_counter()
         try:
             try:
@@ -546,6 +547,8 @@ class UCIEngine:
             except TypeError:
                 self.search_and_respond(sims)
         except Exception as e:
+            self._last_search_ran = False
+            self._last_actual_sims = 0
             logger.exception("Search failed during go: %s", e)
             if not getattr(self, "_bestmove_emitted", False):
                 fallback = "0000"
@@ -567,8 +570,11 @@ class UCIEngine:
                         tp_key = ThroughputKey.from_engine(
                             self.device, self.search_mode, getattr(self, "batch_size", 1)
                         )
-                        actual_sims = getattr(self, "_last_actual_sims", sims)
-                        tm.record(tp_key, actual_sims, t_elapsed)
+                        actual_sims = getattr(self, "_last_actual_sims", None)
+                        if actual_sims is None:
+                            actual_sims = sims
+                        if actual_sims > 0:
+                            tm.record(tp_key, actual_sims, t_elapsed)
                     except Exception:
                         logger.debug("throughput record failed", exc_info=True)
 

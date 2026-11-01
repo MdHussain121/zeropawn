@@ -557,3 +557,191 @@ def test_s8_dirichlet_monte_carlo_distribution_bounds():
     max_dev = float(np.max(np.abs(emp_obs - mc_freq)))
     # sampling noise bound for 400 trials ~ 1.96*sqrt(p(1-p)/400) <= 0.049
     assert max_dev < 0.06, f"Dirichlet mixture deviation {max_dev:.4f} exceeded bound 0.06"
+
+
+# ==============================================================================
+# S-1 Additional: Honest EWMA Completed Simulation Accounting
+# ==============================================================================
+
+def test_s1_ewma_records_actual_sims_not_planned_budget():
+    """Verify that SearchTimeManager records only actual completed simulations,
+    not the requested/planned simulation budget."""
+    engine = UCIEngine(checkpoint_path="", use_book=False, device="cpu")
+    engine.handle_line("uci")
+    engine.handle_line("position startpos")
+
+    recorded_sims = []
+    orig_record = engine.time_manager.record
+
+    def record_mock(key, sims, elapsed):
+        recorded_sims.append(sims)
+        orig_record(key, sims, elapsed)
+
+    engine.time_manager.record = record_mock
+
+    # Run search with 2ms movetime
+    assert engine.handle_line("go movetime 2") is True
+    if engine._search_thread is not None:
+        engine._search_thread.join(timeout=3.0)
+
+    assert len(recorded_sims) == 1
+    # Must record actual completed simulations, matching _last_actual_sims
+    assert recorded_sims[0] == engine._last_actual_sims
+    assert recorded_sims[0] > 0
+
+
+# ==============================================================================
+# S-2 Additional: Completed Game Preservation on Shutdown
+# ==============================================================================
+
+def test_s2_healthy_game_preserved_on_shutdown():
+    """Verify that a game completing normally with plies > 0 is accepted for sink
+    and counted as completed, not discarded as an aborted 0-ply game."""
+    s_valid = GameSummary(
+        game_id=10,
+        length_plies=30,
+        result="1-0",
+        resigned=False,
+        resigned_side_white=None,
+        would_have_resigned=False,
+        is_false_resign=False,
+        duration_sec=2.0,
+        total_simulations=150,
+        model_version=1,
+        aborted=False,
+        termination_reason="checkmate",
+    )
+    assert SelfPlayWorker.accepts_for_sink(s_valid) is True
+
+
+# ==============================================================================
+# S-4 Additional: Transposition Dedup Prior Assignment & Parity
+# ==============================================================================
+
+def test_s4_legacy_batched_transposition_dedup_assigns_priors_and_matches_reference():
+    """Crafted Connect4 transposition: multiple paths in the same batch reach
+    the exact same board state. Verifies that duplicate nodes receive evaluated
+    priors and that production search_batched matches the independent reference."""
+    g0 = zeropawn_cpp.Connect4()
+    g_0 = zeropawn_cpp.Connect4(); g_0.apply_action(0)
+    g_1 = zeropawn_cpp.Connect4(); g_1.apply_action(1)
+    g_02 = zeropawn_cpp.Connect4(); g_02.apply_action(0); g_02.apply_action(2)
+    g_12 = zeropawn_cpp.Connect4(); g_12.apply_action(1); g_12.apply_action(2)
+    g_021 = zeropawn_cpp.Connect4(); g_021.apply_action(0); g_021.apply_action(2); g_021.apply_action(1)
+    g_120 = zeropawn_cpp.Connect4(); g_120.apply_action(1); g_120.apply_action(2); g_120.apply_action(0)
+    g_trans = zeropawn_cpp.Connect4(); g_trans.apply_action(0); g_trans.apply_action(2); g_trans.apply_action(1); g_trans.apply_action(3)
+
+    hashes = {
+        g0.get_hash(): ([0.5, 0.5, 0, 0, 0, 0, 0], 0.0),
+        g_0.get_hash(): ([0, 0, 1.0, 0, 0, 0, 0], 0.0),
+        g_1.get_hash(): ([0, 0, 1.0, 0, 0, 0, 0], 0.0),
+        g_02.get_hash(): ([0, 1.0, 0, 0, 0, 0, 0], 0.0),
+        g_12.get_hash(): ([1.0, 0, 0, 0, 0, 0, 0], 0.0),
+        g_021.get_hash(): ([0, 0, 0, 1.0, 0, 0, 0], 0.0),
+        g_120.get_hash(): ([0, 0, 0, 1.0, 0, 0, 0], 0.0),
+        g_trans.get_hash(): ([0.1, 0.1, 0.1, 0.1, 0.4, 0.1, 0.1], 0.5),
+    }
+
+    plane_to_eval = {}
+    for g in [g0, g_0, g_1, g_02, g_12, g_021, g_120, g_trans]:
+        plane_to_eval[g.encode_state().tobytes()] = hashes[g.get_hash()]
+
+    def eval_fn(g):
+        h = g.get_hash()
+        if h in hashes:
+            p, v = hashes[h]
+            return list(p), v
+        return [1.0 / 7] * 7, 0.0
+
+    def raw_batch_eval(planes):
+        n = len(planes)
+        pols = np.zeros((n, 7), dtype=np.float32)
+        vals = np.zeros(n, dtype=np.float32)
+        for i in range(n):
+            key = planes[i].tobytes()
+            if key in plane_to_eval:
+                p, v = plane_to_eval[key]
+                pols[i] = p
+                vals[i] = v
+            else:
+                pols[i] = 1.0 / 7
+                vals[i] = 0.0
+        return pols, vals
+
+    cfg = {"c_puct": 2.0, "fpu": 0.2, "fpu_reduction": 0.2, "virtual_loss": 1, "add_noise": False, "seed": 42}
+    sims = 20
+    ref_res, stats = ref_mcts.reference_legacy_batched_search(g0, sims, eval_fn, cfg, 4)
+    assert stats["dedup_attaches"] > 0, "Transposition dedup must fire"
+
+    m = zeropawn_cpp.MCTS()
+    prod_res = m.search_batched(g0.clone(), sims, 4, raw_batch_eval)
+    prod_visits = np.round(np.array(prod_res.action_visits[:7]) * sims).astype(int)
+    ref_visits = np.round(np.array(ref_res[2][:7]) * sims).astype(int)
+
+    assert prod_res.best_action == ref_res[0]
+    assert np.array_equal(prod_visits, ref_visits)
+    assert abs(prod_res.root_value - ref_res[1]) < 1e-6
+
+
+# ==============================================================================
+# S-8 Additional: PUCT Mathematical Contract & Virtual Loss Hygiene
+# ==============================================================================
+
+def test_s8_puct_cpuct_zero_first_action_tie_break():
+    """Under c_puct=0 and uniform evaluation, selection is purely greedy and
+    strictly breaks ties by lowest legal action index."""
+    g = zeropawn_cpp.ChessGame()
+    cfg = _make_cfg(c_puct=0.0, noise=False)
+    m = zeropawn_cpp.MCTS(cfg)
+    num_act = g.num_actions()
+
+    def uniform_eval(game):
+        return [1.0 / num_act] * num_act, 0.0
+
+    res = m.search(g, 20, uniform_eval)
+    first_legal = g.legal_actions()[0]
+    raw = np.array(res.action_visits) * 20.0
+    assert int(round(raw[first_legal])) == 20
+    assert res.best_action == first_legal
+
+
+def test_s8_puct_root_fpu_base_zero_spreading():
+    """Root FPU base is fixed 0.0 (independent of root eval). With constant +0.9
+    evaluations, root children are explored broadly rather than repeatedly visiting
+    the first child."""
+    g = zeropawn_cpp.ChessGame()
+    cfg = _make_cfg(c_puct=2.0, fpu=0.2, noise=False)
+    m = zeropawn_cpp.MCTS(cfg)
+    num_act = g.num_actions()
+
+    def high_eval(game):
+        return [1.0 / num_act] * num_act, 0.9
+
+    res = m.search(g, 10, high_eval)
+    raw = np.array(res.action_visits) * 10.0
+    explored_children = int((raw > 0).sum())
+    assert explored_children == 10, "Root FPU base-0 must explore all 10 distinct children"
+
+
+def test_s8_virtual_loss_and_alloc_free_hygiene():
+    """Verify that active virtual losses always unwind to 0 after searches
+    including exception interruptions."""
+    g = zeropawn_cpp.ChessGame()
+    cfg = _make_cfg(batch_size=4)
+    m = zeropawn_cpp.MCTS(cfg)
+
+    call_count = 0
+    def failing_after_3_eval(game):
+        nonlocal call_count
+        call_count += 1
+        if call_count > 3:
+            raise RuntimeError("Injected mid-search failure")
+        return [1.0 / g.num_actions()] * g.num_actions(), 0.0
+
+    try:
+        m.search(g, 30, failing_after_3_eval)
+    except Exception:
+        pass
+
+    assert m.total_active_virtual_losses() == 0, "Virtual losses must be fully unwound"
+
