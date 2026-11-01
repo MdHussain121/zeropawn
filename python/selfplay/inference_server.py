@@ -209,15 +209,29 @@ class InferenceServer:
             state_dict = ckpt
 
         # Build the replacement module off to the side (no lock needed).
+        # Audit RL-39: the .to()/copy_ kernels below are enqueued on the
+        # CALLER's current stream; record a completion event for them so the
+        # serving stream can be ordered behind the copies before the new
+        # weights are published (the pre-push sync_event only orders work
+        # submitted before this method was entered).
+        copy_done_event = None
         try:
             new_model = self._create_model_from_checkpoint(path).to(self.device)
             new_model.load_state_dict(state_dict)
             new_model.eval()
             if self.channels_last and self.device.type == "cuda":
                 new_model = new_model.to(memory_format=torch.channels_last)
+            if self.device.type == "cuda" and torch.cuda.is_available():
+                copy_done_event = torch.cuda.Event()
+                copy_done_event.record()
         except Exception as e:
             logger.exception("Invalid checkpoint %s; keeping old weights", path)
             return self._record_reload_failure(path, "invalid checkpoint", str(e))
+        if copy_done_event is not None and self.stream is not None:
+            try:
+                self.stream.wait_event(copy_done_event)
+            except Exception as e:
+                logger.debug("wait_event failed on stream: %s", e)
         with self._weights_lock:
             self.model = new_model
             self.model_version += 1
@@ -251,6 +265,15 @@ class InferenceServer:
             except Exception as e:
                 logger.debug("wait_event failed on stream: %s", e)
 
+        # Audit RL-39: the dev_state transfer, load_state_dict copy_ kernels
+        # and the channels_last conversion above run on the caller's current
+        # stream (the trainer's train stream during a weight push). The
+        # pre-push sync_event only orders work submitted before this call, so
+        # record a completion event for the copies themselves and make the
+        # serving stream wait on it BEFORE the swap publishes new_model —
+        # otherwise a concurrent forward pass could read parameters while
+        # train-stream copy kernels are still writing them.
+        copy_done_event = None
         try:
             cur_blocks = getattr(self.model, "num_blocks", 12)
             cur_filters = getattr(self.model, "num_filters", 128)
@@ -263,11 +286,20 @@ class InferenceServer:
             new_model.eval()
             if self.channels_last and self.device.type == "cuda":
                 new_model = new_model.to(memory_format=torch.channels_last)
+            if self.device.type == "cuda" and torch.cuda.is_available():
+                copy_done_event = torch.cuda.Event()
+                copy_done_event.record()
         except Exception as e:
             logger.exception("Failed to load state_dict weights; keeping old weights")
             return self._record_reload_failure(
                 "<state_dict push>", "invalid state dict", str(e)
             )
+
+        if copy_done_event is not None and self.stream is not None:
+            try:
+                self.stream.wait_event(copy_done_event)
+            except Exception as e:
+                logger.debug("wait_event failed on stream: %s", e)
 
         with self._weights_lock:
             self.model = new_model
