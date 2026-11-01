@@ -288,6 +288,13 @@ def run_finetune(args: argparse.Namespace) -> int:
 
     ckpt_dir = REPO_ROOT / "models" / "checkpoints_finetune"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
+    from python.common.artifacts import ProductionWriteTicket
+
+    # This command is a production launcher for the finetune tree; the ticket
+    # records the destination it is authorized to write (audit CKP-04).
+    ticket = ProductionWriteTicket.issue_for_launcher(
+        "zeropawn finetune", reason=f"checkpoint_dir={ckpt_dir}"
+    )
     metrics = train_supervised(
         train_dir=str(tr_dir),
         val_dir=str(va_dir),
@@ -303,6 +310,7 @@ def run_finetune(args: argparse.Namespace) -> int:
         gpu_budget_gb=args.gpu_budget,
         num_workers=int(args.workers),
         gpu_resident=not args.no_gpu_resident,
+        artifact_ticket=ticket,
     )
     print_success(
         f"Fine-tune done. val_loss={metrics.get('total_loss', float('nan')):.4f} "
