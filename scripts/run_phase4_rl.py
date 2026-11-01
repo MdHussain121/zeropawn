@@ -285,8 +285,9 @@ class Phase4Orchestrator:
         buffer_capacity: int = 500_000,
         checkpoint_dir: str = "models/checkpoints_rl",
         log_dir: str = "runs/phase4_rl",
-        base_checkpoint: Optional[str] = "models/checkpoints_scaled/best_model.pt",
+        base_checkpoint: Optional[str] = "default",
         resume_checkpoint: Optional[str] = None,
+        pipelined: bool = False,
         human_data_dir: str = (
             "data/dataset_training/train"
             if Path("data/dataset_training/train").is_dir()
@@ -377,6 +378,9 @@ class Phase4Orchestrator:
         self.num_concurrent_games = num_concurrent_games
         self.is_verify_mode = is_verify_mode
         self.skip_baseline_eval = skip_baseline_eval
+        self.pipelined = bool(pipelined)
+        self._consecutive_train_failures = 0
+        self._max_consecutive_train_failures = 5
         self.data_role = data_role
         self.allow_uncertified_data = allow_uncertified_data
         self.allow_uncertified_eval = allow_uncertified_eval
@@ -709,6 +713,30 @@ class Phase4Orchestrator:
             resume_checkpoint = self._select_resume_checkpoint()
 
         is_resuming = resume_checkpoint is not None
+        if not is_resuming:
+            if base_checkpoint == "default":
+                # Default warm-start: canonical resolution via registry (audit F-13)
+                from python.cli.common import get_default_checkpoint_path
+                from python.model.checkpoint_registry import DefaultCheckpointError
+
+                try:
+                    resolved_default = get_default_checkpoint_path()
+                    base_checkpoint = str(resolved_default)
+                    logger.info(
+                        "[WARM-START] Canonical default checkpoint resolved: %s",
+                        base_checkpoint,
+                    )
+                except DefaultCheckpointError as e:
+                    raise RuntimeError(
+                        "Refusing to start Phase 4 RL: cannot resolve a trustworthy "
+                        f"default warm-start checkpoint.\n{e}"
+                    ) from e
+            elif base_checkpoint is not None and (
+                base_checkpoint == ""
+                or (isinstance(base_checkpoint, str) and base_checkpoint.strip().lower() == "none")
+            ):
+                base_checkpoint = None
+
         active_checkpoint = resume_checkpoint if is_resuming else base_checkpoint
         self._resumed_from = str(resume_checkpoint) if is_resuming else None
         self._active_checkpoint_path = (
@@ -855,6 +883,7 @@ class Phase4Orchestrator:
             tablebase_max_pieces=self.tablebase_max_pieces,
             position_sink=sink,
             seed=self.seed,
+            pipelined=self.pipelined,
         )
         self.disable_resign_prob = 0.15
 
@@ -979,6 +1008,11 @@ class Phase4Orchestrator:
         # Load puzzles
         self.puzzles = load_puzzles(self.puzzle_csv_path)
         logger.info(f"Loaded {len(self.puzzles)} fixed Lichess puzzles for 6-hour evaluation.")
+
+    @property
+    def _warm_start_info(self) -> Optional[dict]:
+        """Backward-compatibility alias for self._warm_start_record (audit F-12)."""
+        return self._warm_start_record
 
     def _select_resume_checkpoint(self) -> Optional[str]:
         """Pick the best RL-resumable checkpoint in ``checkpoint_dir``, or None.
@@ -2126,7 +2160,8 @@ class Phase4Orchestrator:
         emit_report(text)
         self._heartbeat.notify()
 
-    def _event(self, tag: str, message: str) -> None:
+    def _event(self, tag: str, *messages: str) -> None:
+        message = " | ".join(str(m) for m in messages if m)
         logger.info("EVENT %s: %s", tag, message)
         self._emit(event_line(tag, message))
 
@@ -2644,7 +2679,23 @@ class Phase4Orchestrator:
 
                 # RL Training Step (busy-time measured for the duty fraction)
                 busy_t0 = time.perf_counter()
-                train_metrics = self.trainer.train_step()
+                try:
+                    train_metrics = self.trainer.train_step()
+                    self._consecutive_train_failures = 0
+                except Exception as exc:
+                    self._consecutive_train_failures += 1
+                    logger.error(
+                        f"[TRAIN ERROR] step failed ({self._consecutive_train_failures}/{self._max_consecutive_train_failures}): {exc}",
+                        exc_info=True,
+                    )
+                    self._event("TRAIN_STEP_FAILED", f"error={exc} consecutive={self._consecutive_train_failures}")
+                    if self._consecutive_train_failures >= self._max_consecutive_train_failures:
+                        raise RuntimeError(
+                            f"Phase 4 trainer encountered {self._consecutive_train_failures} consecutive train_step failures; stopping: {exc}"
+                        ) from exc
+                    time.sleep(0.5)
+                    continue
+
                 self._train_busy_sec += time.perf_counter() - busy_t0
                 self._last_train_metrics = train_metrics
                 step = train_metrics["step"]
@@ -2665,9 +2716,10 @@ class Phase4Orchestrator:
                 # Live status line every 10 s (counters only)
                 self._maybe_status(train_metrics)
 
-                # Periodic Telemetry Flush every 50 steps (or every 5 steps in verify mode) or upon reaching max_steps
+                # Periodic Telemetry Flush every 50 steps (or every 5 steps in verify mode) or on step 1 or upon reaching max_steps
                 if (
-                    step % 50 == 0
+                    self._steps_this_run == 1
+                    or step % 50 == 0
                     or (self.is_verify_mode and step % 5 == 0)
                     or (self.max_steps is not None and self._steps_this_run >= self.max_steps)
                 ):
@@ -2857,6 +2909,30 @@ class Phase4Orchestrator:
             logger.error("Final checkpoint save failed during shutdown: %s", exc)
             self._event("SHUTDOWN", f"final checkpoint failed: {exc}")
         try:
+            # F-15: Ensure at least one telemetry row is logged and durably flushed before close
+            if getattr(self, "metrics_tracker", None) is not None:
+                step_val = int(getattr(self.trainer, "step_num", 0) or 0)
+                buf_size = len(self.buffer) if hasattr(self, "buffer") and self.buffer is not None else 0
+                buf_total = getattr(self.buffer, "total_added", 0) if hasattr(self, "buffer") and self.buffer is not None else 0
+                buf_head = getattr(self.buffer, "write_head", 0) if hasattr(self, "buffer") and self.buffer is not None else 0
+                buf_schema = getattr(self.buffer, "schema_version", None) if hasattr(self, "buffer") and self.buffer is not None else None
+                m_ver = getattr(self.server, "model_version", 0) if hasattr(self, "server") and self.server is not None else 0
+                self.metrics_tracker.flush_final(
+                    step=step_val,
+                    buffer_size=buf_size,
+                    model_version=m_ver,
+                    buffer_total_added=buf_total,
+                    buffer_write_head=buf_head,
+                    buffer_schema_version=buf_schema,
+                    games_aborted=getattr(self.worker, "aborted_games", 0) + getattr(self, "_aborted_games_seen", 0),
+                    games_invalid=getattr(self.worker, "invalid_games", 0) + getattr(self, "_invalid_games_seen", 0),
+                    records_rejected=getattr(self.buffer, "rejected_records", 0) + getattr(self, "_records_rejected", 0) if hasattr(self, "buffer") and self.buffer is not None else 0,
+                    checkpoint_file=getattr(self, "_last_saved_ckpt_name", None) or getattr(self, "_last_final_ckpt", None),
+                )
+                logger.info("[TELEMETRY] flush_final completed (total rows written: %d)", getattr(self.metrics_tracker, "rows_written", 0))
+        except Exception as exc:
+            logger.error("Telemetry final flush failed during shutdown: %s", exc)
+        try:
             self.metrics_tracker.close()
         except Exception as exc:
             logger.error("Metrics close failed during shutdown: %s", exc)
@@ -2898,7 +2974,7 @@ class Phase4Orchestrator:
             logger.debug("post-run cleanup skipped: %s", e)
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Phase 4: Long RL Run Orchestrator")
     parser.add_argument(
         "--max-hours", type=float, default=72.0, help="Total hours to run (default 72.0)"
@@ -3007,11 +3083,20 @@ def main() -> None:
     parser.add_argument(
         "--base-checkpoint",
         type=str,
-        default="models/checkpoints_scaled/best_model.pt",
+        default="default",
         help=(
-            "Base warm-start checkpoint path. Must exist, be readable, match the "
-            "12x128 architecture and be a designated warm start in "
-            "docs/checkpoint_registry.json, or the run fails closed."
+            "Base warm-start checkpoint path ('default' resolves canonically via "
+            "docs/checkpoint_registry.json; 'none' or '' forces random initialization). "
+            "Must exist, be readable, match the 12x128 architecture and be an eligible warm start."
+        ),
+    )
+    parser.add_argument(
+        "--pipelined",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable pipelined dispatch between MCTS and GPU inference (F-01). "
+            "Default: False (disabled until a >10% speedup bar is proven)."
         ),
     )
     # Audit RL-37: the shutdown banner has advertised `--resume` for a long
@@ -3223,6 +3308,11 @@ def main() -> None:
         help="Do not abort when the evaluation puzzle set is uncertified "
         "(equivalent to --allow-uncertified-eval for the startup gate).",
     )
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
     args = parser.parse_args()
 
     if args.test_verify:
@@ -3249,6 +3339,7 @@ def main() -> None:
             log_dir=args.log_dir,
             checkpoint_dir=args.checkpoint_dir,
             base_checkpoint=args.base_checkpoint,
+            pipelined=args.pipelined,
             resume_checkpoint=args.resume,
             allow_unverified_warm_start=args.allow_unverified_warm_start,
             allow_buffer_mismatch=args.allow_buffer_mismatch,
@@ -3303,6 +3394,7 @@ def main() -> None:
             log_dir=args.log_dir,
             checkpoint_dir=args.checkpoint_dir,
             base_checkpoint=args.base_checkpoint,
+            pipelined=args.pipelined,
             resume_checkpoint=args.resume,
             allow_unverified_warm_start=args.allow_unverified_warm_start,
             allow_buffer_mismatch=args.allow_buffer_mismatch,

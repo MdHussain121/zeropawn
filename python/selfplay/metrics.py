@@ -166,6 +166,8 @@ class MetricsTracker:
         # written wider/narrower than its header.
         self.run_id: Optional[str] = None
         self._extra_rows_last: Dict[str, Any] = {}
+        # Audit F-15: track durable row writes to verify CSV is never left header-only.
+        self.rows_written: int = 0
 
     def _default_headers(self) -> list:
         """Canonical telemetry header (append-only; never reorder/rename)."""
@@ -510,6 +512,7 @@ class MetricsTracker:
                         with open(self.csv_path, "a", newline="", encoding="utf-8") as f:
                             writer = csv.writer(f)
                             writer.writerow(row)
+                            self.rows_written += 1
                             # Audit SUS-01: an append without flush could be torn
                             # by a crash mid-write. Flush then fsync so a completed
                             # row is durable and a torn row cannot be half-written.
@@ -523,6 +526,21 @@ class MetricsTracker:
 
         self.last_flush_time = time.perf_counter()
         return metrics
+
+    def flush_final(
+        self,
+        step: int = 0,
+        buffer_size: Optional[int] = None,
+        model_version: Optional[int] = None,
+        **kwargs: Any,
+    ) -> None:
+        """Ensure at least one durable telemetry record is written before close (audit F-15)."""
+        if self.rows_written == 0 and self.csv_path is not None:
+            try:
+                self.log_step(step=step, buffer_size=buffer_size, model_version=model_version, **kwargs)
+            except Exception as e:
+                logger.warning("Final telemetry flush failed: %s", e)
+        self.close()
 
     def close(self) -> None:
         """Close TensorBoard writer."""
