@@ -338,6 +338,11 @@ bool MCTS::advance_root(int my_action, int opp_action, const Game& new_state) {
     std::fill(new_root->virtual_losses.begin(), new_root->virtual_losses.end(), 0);
     safe_delete_tree(root_);
     root_ = std::move(new_root);
+    int retained = 0;
+    for (int n : root_->visit_counts) {
+        retained += n;
+    }
+    last_retained_visits_ = retained;
     return true;
 }
 
@@ -377,6 +382,11 @@ bool MCTS::advance_root(int action, const Game& new_state) {
     std::fill(new_root->virtual_losses.begin(), new_root->virtual_losses.end(), 0);
     safe_delete_tree(root_);
     root_ = std::move(new_root);
+    int retained = 0;
+    for (int n : root_->visit_counts) {
+        retained += n;
+    }
+    last_retained_visits_ = retained;
     return true;
 }
 
@@ -932,6 +942,7 @@ SearchResult MCTS::search_batched(const Game& root_state, int num_simulations,
         std::unique_ptr<Game> state;
         uint64_t hash = 0;
         std::vector<std::vector<std::pair<Node*, int>>> paths;
+        std::vector<Node*> duplicate_nodes;
     };
 
     int sims_done = 0;
@@ -1021,6 +1032,9 @@ SearchResult MCTS::search_batched(const Game& root_state, int num_simulations,
             auto hit = hash_index.find(h);
             if (hit != hash_index.end()) {
                 batch[hit->second].paths.push_back(std::move(search_path));
+                if (curr_node != batch[hit->second].node) {
+                    batch[hit->second].duplicate_nodes.push_back(curr_node);
+                }
                 sims_done++;
                 continue;
             }
@@ -1063,6 +1077,12 @@ SearchResult MCTS::search_batched(const Game& root_state, int num_simulations,
             }
             set_priors(*leaf.node, policy_row.data(), static_cast<int>(policy_row.size()),
                        num_actions, false);
+            for (Node* dup_node : leaf.duplicate_nodes) {
+                if (dup_node) {
+                    set_priors(*dup_node, policy_row.data(), static_cast<int>(policy_row.size()),
+                               num_actions, false);
+                }
+            }
             cache_insert(leaf.hash, std::move(policy_row), v);
             for (auto& path : leaf.paths) {
                 backup_path(path, v);

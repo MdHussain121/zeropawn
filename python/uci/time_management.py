@@ -18,10 +18,12 @@ This module replaces the constant with an explicit, deterministic estimator:
 - Budgets are converted to simulations with an explicit purpose margin
   (movetime: hard deadline, 10% headroom; real clocks: 20% headroom).
 
-Mid-search interruption is NOT supported by the native MCTS (single C++ call
-with no stop callback), so ``stop`` remains a no-op while a search is running
-(unchanged UCI contract); this estimator keeps the predicted search time
-within the allocated budget instead.
+The native MCTS search provides an in-search abort callback (abort_fn) that
+periodically checks both wall-clock deadlines and UCI stop requests during
+the simulation loop (approximately every 32 simulations in serial mode, or
+per batch in batched mode). This time manager allocates conservative initial
+simulation budgets and wall-clock deadlines, ensuring responsive cancellation
+and hard time-boundary enforcement.
 """
 
 from __future__ import annotations
