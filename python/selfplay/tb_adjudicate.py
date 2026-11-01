@@ -5,12 +5,15 @@ Contract specifications:
 - Never called inside search or C++ code.
 - Fast string filter on FEN: piece count <= max_pieces and castling == "-".
 - python-chess board constructed and probed ONLY when the filter passes.
+- Strict board validity check (board.is_valid()) rejects impossible/corrupt states (SY-06).
 - Thread-safe probing with lock wait-time telemetry.
+- Resource management: singleton path changes and explicit close release file handles (SY-05).
 - Result mapping:
-    Win  (+2 in syzygy) -> +1 (decisive win for side to move)
-    Loss (-2 in syzygy) -> -1 (decisive loss for side to move)
-    Draw ( 0), Cursed Win (+1), Blessed Loss (-1) -> 0 (draw)
-- Missing table falls through (returns None) and is counted.
+    Win  (+2 in syzygy, halfmove_clock == 0) -> +1 (decisive win for side to move)
+    Loss (-2 in syzygy, halfmove_clock == 0) -> -1 (decisive loss for side to move)
+    Decisive (+2 / -2) with halfmove_clock > 0 -> None (ineligible decisive; no fabricated draw) (SY-01)
+    Draw ( 0), Cursed Win (+1), Blessed Loss (-1) -> 0 (draw under FIDE rule-50)
+- Missing table or ineligible state falls through (returns None) and is counted.
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ import logging
 import os
 import threading
 import time
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import chess
@@ -34,6 +38,12 @@ class TablebaseAdjudicator:
     _init_lock: threading.Lock = threading.Lock()
 
     def __init__(self, tablebase_path: Optional[str] = None, max_pieces: int = 5) -> None:
+        if tablebase_path:
+            p = Path(tablebase_path)
+            if not p.is_absolute() and not p.is_dir():
+                candidate = Path(__file__).resolve().parent.parent.parent / p
+                if candidate.is_dir():
+                    tablebase_path = str(candidate)
         self.tablebase_path = tablebase_path
         self.max_pieces = max_pieces
         self.tablebase: Optional[chess.syzygy.Tablebase] = None
@@ -45,6 +55,8 @@ class TablebaseAdjudicator:
         self.probes_total: int = 0
         self.probes_decisive: int = 0
         self.probes_draw: int = 0
+        self.probes_halfmove_ineligible: int = 0
+        self.invalid_positions: int = 0
         self.missing_tables: int = 0
 
         # Timing telemetry (cumulative seconds)
@@ -62,6 +74,22 @@ class TablebaseAdjudicator:
                 logger.error("Failed to open tablebase at %s: %s", tablebase_path, e)
                 self.tablebase = None
 
+    def close(self) -> None:
+        """Close opened tablebase file handles cleanly (SY-05)."""
+        with self._probe_lock:
+            if self.tablebase is not None:
+                try:
+                    self.tablebase.close()
+                except Exception as e:
+                    logger.debug("Error closing tablebase: %s", e)
+                self.tablebase = None
+
+    def __enter__(self) -> "TablebaseAdjudicator":
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.close()
+
     @classmethod
     def get_instance(
         cls,
@@ -73,7 +101,9 @@ class TablebaseAdjudicator:
             if cls._instance is None:
                 cls._instance = cls(tablebase_path=tablebase_path, max_pieces=max_pieces)
             elif tablebase_path is not None and cls._instance.tablebase_path != tablebase_path:
-                # Update tablebase path if changed
+                # Update tablebase path if changed: safely close old handles to prevent leaks (SY-05)
+                if cls._instance is not None:
+                    cls._instance.close()
                 cls._instance = cls(tablebase_path=tablebase_path, max_pieces=max_pieces)
             return cls._instance
 
@@ -81,11 +111,8 @@ class TablebaseAdjudicator:
     def reset_instance(cls) -> None:
         """Reset singleton (useful for testing)."""
         with cls._init_lock:
-            if cls._instance is not None and cls._instance.tablebase is not None:
-                try:
-                    cls._instance.tablebase.close()
-                except Exception:
-                    pass
+            if cls._instance is not None:
+                cls._instance.close()
             cls._instance = None
 
     @staticmethod
@@ -118,10 +145,11 @@ class TablebaseAdjudicator:
 
         Returns:
             outcome:
-                +1 if side to move has decisive win
-                -1 if side to move has decisive loss
-                 0 if draw (including cursed-win / blessed-loss)
-                None if position doesn't qualify, tablebase disabled, or missing table.
+                +1 if side to move has decisive win (halfmove_clock == 0)
+                -1 if side to move has decisive loss (halfmove_clock == 0)
+                 0 if draw (including cursed-win / blessed-loss under rule 50)
+                None if position doesn't qualify, tablebase disabled, missing table,
+                     invalid board state, or decisive position with halfmove_clock > 0.
             metadata: dict with timing and telemetry.
         """
         if self.tablebase is None:
@@ -149,23 +177,75 @@ class TablebaseAdjudicator:
             t_probe_start = time.perf_counter()
             try:
                 board = chess.Board(fen)
+            except Exception as e:
+                self.invalid_positions += 1
+                t_probe = time.perf_counter() - t_probe_start
+                self.total_probe_time_sec += t_probe
+                return None, {
+                    "qualified": True,
+                    "invalid": True,
+                    "error": f"malformed_fen: {e}",
+                    "piece_count": pc,
+                    "filter_time_us": t_filter * 1e6,
+                    "probe_time_us": t_probe * 1e6,
+                    "lock_wait_us": lock_wait * 1e6,
+                }
+
+            # SY-06: Strict board validity check
+            if not board.is_valid():
+                self.invalid_positions += 1
+                t_probe = time.perf_counter() - t_probe_start
+                self.total_probe_time_sec += t_probe
+                return None, {
+                    "qualified": True,
+                    "invalid": True,
+                    "error": "invalid_board_state",
+                    "status": int(board.status()),
+                    "piece_count": pc,
+                    "filter_time_us": t_filter * 1e6,
+                    "probe_time_us": t_probe * 1e6,
+                    "lock_wait_us": lock_wait * 1e6,
+                }
+
+            try:
                 # Probe WDL
                 # Syzygy WDL returns:
                 #  2: win
-                #  1: cursed win (win within 50 moves? Drawn by 50-move rule)
+                #  1: cursed win (win requires >50 moves without capture/pawn move; drawn under rule 50)
                 #  0: draw
-                # -1: blessed loss (loss saved by 50-move rule)
+                # -1: blessed loss (loss defended by 50-move rule; drawn under rule 50)
                 # -2: loss
                 raw_wdl = self.tablebase.probe_wdl(board)
                 self.probes_total += 1
+                halfmove_clock = board.halfmove_clock
 
-                if raw_wdl == 2:
-                    outcome = 1
-                    self.probes_decisive += 1
-                elif raw_wdl == -2:
-                    outcome = -1
-                    self.probes_decisive += 1
+                # Rule-50 safeguard (SY-01):
+                # Decisive adjudication (+1/-1) is strictly valid when halfmove_clock == 0.
+                # If halfmove_clock > 0, decisive outcome cannot be guaranteed before the 50-move limit
+                # without DTZ tables. Ineligible decisive positions return None (do not fabricate draw).
+                if raw_wdl in (2, -2):
+                    if halfmove_clock == 0:
+                        outcome = 1 if raw_wdl == 2 else -1
+                        self.probes_decisive += 1
+                    else:
+                        self.probes_halfmove_ineligible += 1
+                        t_probe = time.perf_counter() - t_probe_start
+                        self.total_probe_time_sec += t_probe
+                        return None, {
+                            "qualified": True,
+                            "piece_count": pc,
+                            "raw_wdl": raw_wdl,
+                            "halfmove_ineligible": True,
+                            "halfmove_clock": halfmove_clock,
+                            "filter_time_us": t_filter * 1e6,
+                            "probe_time_us": t_probe * 1e6,
+                            "lock_wait_us": lock_wait * 1e6,
+                        }
                 else:
+                    # raw_wdl in (1, 0, -1):
+                    # 0 is a theoretical draw.
+                    # +1 (cursed win) / -1 (blessed loss) cannot be won within 50 moves even with clock 0,
+                    # so under FIDE rules they are draws regardless of halfmove clock.
                     outcome = 0
                     self.probes_draw += 1
 
@@ -177,6 +257,7 @@ class TablebaseAdjudicator:
                     "piece_count": pc,
                     "raw_wdl": raw_wdl,
                     "outcome": outcome,
+                    "halfmove_clock": halfmove_clock,
                     "filter_time_us": t_filter * 1e6,
                     "probe_time_us": t_probe * 1e6,
                     "lock_wait_us": lock_wait * 1e6,
@@ -218,6 +299,8 @@ class TablebaseAdjudicator:
             "probes_total": self.probes_total,
             "probes_decisive": self.probes_decisive,
             "probes_draw": self.probes_draw,
+            "probes_halfmove_ineligible": self.probes_halfmove_ineligible,
+            "invalid_positions": self.invalid_positions,
             "missing_tables": self.missing_tables,
             "avg_filter_time_us": avg_filter_us,
             "avg_probe_time_us": avg_probe_us,
