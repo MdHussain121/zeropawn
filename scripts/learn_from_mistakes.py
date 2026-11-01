@@ -360,13 +360,25 @@ def main() -> None:
         )
         total_time = time.time() - t0
 
-        final_ckpt = Path("models/checkpoints_rl/curriculum_final_latest.pt")
-        torch.save(
+        # Audit CKP-09: this model-only payload used to be written into
+        # models/checkpoints_rl/ where auto-resume discovery could adopt it as a
+        # step-0 "resume point". It now lands in the curriculum tree, is written
+        # atomically, and declares what it is; it is weights-only by design and
+        # can therefore only be used as a weights source.
+        from python.train.train_supervised import _atomic_torch_save
+
+        final_ckpt = Path("models/checkpoints_curriculum/curriculum_final_latest.pt")
+        final_ckpt.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_torch_save(
             {
+                "checkpoint_type": "curriculum",
                 "model": model.state_dict(),
                 "source": "autonomous_curriculum",
                 "start_rating": start_r,
                 "end_rating": end_r,
+                "num_blocks": getattr(model, "num_blocks", 12),
+                "num_filters": getattr(model, "num_filters", 128),
+                "weights_only_container": True,
                 "timestamp": time.time(),
             },
             final_ckpt,
@@ -521,6 +533,7 @@ def main() -> None:
     out_file = Path(args.output)
     out_file.parent.mkdir(parents=True, exist_ok=True)
     checkpoint_payload = {
+        "checkpoint_type": "mistake_learner",
         "model": model.state_dict(),
         "optimizer": learner.optimizer.state_dict() if hasattr(learner, "optimizer") else None,
         "num_blocks": info.get("num_blocks", 12),
@@ -530,7 +543,12 @@ def main() -> None:
         "mistakes_mined": results["total_mistakes_mined"],
         "timestamp": time.time(),
     }
-    torch.save(checkpoint_payload, out_file)
+    # Atomic + locked + single shared implementation with the CLI writer
+    # (audit CKP-09): the two mistake-learner producers used to write different
+    # payload shapes with different durability guarantees.
+    from python.train.train_supervised import _atomic_torch_save
+
+    _atomic_torch_save(checkpoint_payload, out_file)
     console.print(f"[green]✔[/green] Updated weights saved to [bold]{out_file}[/bold]")
 
     summary_table = Table(title="Tactical Learning Summary", box=box.ROUNDED)

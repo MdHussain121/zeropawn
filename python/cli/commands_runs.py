@@ -206,9 +206,21 @@ def run_runs_recover(args: argparse.Namespace) -> int:
         console.print(f"[bold red]Run directory not found: {args.run_id}[/bold red]")
         return 1
 
-    # Check for latest checkpoint in models/checkpoints_rl
+    # Check for latest checkpoint in models/checkpoints_rl. Candidates are
+    # validated with the RL inspector so the suggestion is always a structurally
+    # usable checkpoint, never merely the newest .pt by mtime (audit INF-03).
+    from python.train.train_rl import inspect_rl_checkpoint, is_resumable_candidate
+
     ckpt_dir = REPO_ROOT / "models" / "checkpoints_rl"
     latest_ckpt = ckpt_dir / "latest_checkpoint.pt"
+    if latest_ckpt.is_file():
+        info = inspect_rl_checkpoint(latest_ckpt)
+        if info is None or not is_resumable_candidate(info)[0]:
+            console.print(
+                f"[bold yellow]Skipping {latest_ckpt.name}: not a resumable RL checkpoint "
+                "(unreadable, foreign optimizer state, or a weights-only container).[/bold yellow]"
+            )
+            latest_ckpt = ckpt_dir / "__none__"
 
     if latest_ckpt.is_file():
         console.print(f"[bold green]Recovered active checkpoint:[/] [cyan]{latest_ckpt}[/cyan]")
@@ -218,8 +230,18 @@ def run_runs_recover(args: argparse.Namespace) -> int:
         )
         return 0
     else:
-        # Check all checkpoints in ckpt_dir
-        ckpts = sorted(ckpt_dir.glob("*.pt"), key=lambda f: f.stat().st_mtime, reverse=True)
+        # Check all checkpoints in ckpt_dir (validated, newest first)
+        def _resumable(f):
+            info = inspect_rl_checkpoint(f)
+            return bool(info) and is_resumable_candidate(info)[0]
+
+        ckpts = [
+            f
+            for f in sorted(
+                ckpt_dir.glob("*.pt"), key=lambda f: f.stat().st_mtime, reverse=True
+            )
+            if _resumable(f)
+        ]
         if ckpts:
             cand = ckpts[0]
             console.print(f"[bold green]Recovered newest checkpoint:[/] [cyan]{cand}[/cyan]")

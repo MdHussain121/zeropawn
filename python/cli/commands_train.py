@@ -120,6 +120,32 @@ class ExplicitTrackingStoreTrueAction(argparse._StoreTrueAction):
         explicit.add(self.dest)
 
 
+def _supervised_artifact_ticket(
+    ckpt_dir_path: Path,
+    raw_ckpt_dir: Optional[str],
+    log_dir_path: Path,
+    raw_log_dir: Optional[str],
+) -> Any:
+    """Mint the production-write ticket for a supervised run (audit CKP-04).
+
+    This command *is* the production launcher for supervised training, and the
+    destination is printed in the run's parameter table before any write, so the
+    authorization is issued here with the destination recorded in the ticket.
+    A bare boolean or environment variable never mints a ticket; production
+    scripts that call ``train_supervised`` directly must pass their own.
+    """
+    from python.common.artifacts import ProductionWriteTicket
+
+    explicit = bool(raw_ckpt_dir) or bool(raw_log_dir)
+    return ProductionWriteTicket.issue_for_launcher(
+        "zeropawn train --mode supervised",
+        reason=(
+            f"destination={'explicit' if explicit else 'documented default'} "
+            f"checkpoint_dir={ckpt_dir_path} log_dir={log_dir_path}"
+        ),
+    )
+
+
 def _add_supervised_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--auto",
@@ -330,7 +356,11 @@ def register_parser(subparsers: argparse._SubParsersAction) -> None:
         "-c",
         type=str,
         default=None,
-        help="Path to initial weights or checkpoint to start from (default: models/checkpoints_scaled/best_model.pt)",
+        help=(
+            "WEIGHTS-ONLY warm start: load model weights from this checkpoint and start a new "
+            "run (fresh optimizer/scheduler/step; the source step is provenance only). Use "
+            "--resume for a full training-state resume"
+        ),
     )
     parser.add_argument(
         "--random-init",
@@ -342,7 +372,10 @@ def register_parser(subparsers: argparse._SubParsersAction) -> None:
         "--resume",
         type=str,
         default=None,
-        help="Path to existing RL checkpoint to resume training state, step, and optimizer from",
+        help=(
+            "FULL resume: restore model, optimizer, scheduler, RNG, and step/epoch state from "
+            "an RL or supervised training checkpoint (mutually exclusive with --checkpoint)"
+        ),
     )
     parser.add_argument(
         "--max-hours",
@@ -930,24 +963,79 @@ def run_supervised_training(args: argparse.Namespace) -> int:
             micro_batch_size = 64
             gradient_accumulation_steps = 8
 
-    # 7. Check for resume checkpoint
-    resume_path = getattr(args, "resume", None) or getattr(args, "checkpoint", None)
+    # 7. Resolve the initialization mode: weights-only warm start vs full resume
+    #
+    # Audit CKP-02: `--checkpoint` and `--resume` used to be aliases of one
+    # argparse destination merged into a full resume, so a user passing a
+    # weights-only file (or intending a warm start) silently inherited
+    # optimizer/scheduler/step state. The two operations are now distinct and
+    # unambiguous, and contradictory combinations are rejected:
+    #
+    #   --checkpoint PATH      -> weights-only warm start (model weights only:
+    #                             fresh optimizer/scheduler/step 0, new run)
+    #   --resume PATH          -> full resume (optimizer/scheduler/RNG/step ledger)
+    #   --resume-weights-only  -> explicit weights-only override for --resume
+    checkpoint_path_arg = getattr(args, "checkpoint", None)
+    resume_path_arg = getattr(args, "resume", None)
+    resume_weights_only_flag = bool(getattr(args, "resume_weights_only", False))
+
+    if checkpoint_path_arg and resume_path_arg:
+        return _fail(
+            "Both --checkpoint and --resume were given; they mean different things "
+            "(--checkpoint = weights-only warm start, --resume = full resume).",
+            "contradictory initialization flags",
+            "pass exactly one: --resume for a full training-state resume, or "
+            "--checkpoint for a weights-only warm start, then see LOG",
+        )
+    if resume_weights_only_flag and not (checkpoint_path_arg or resume_path_arg):
+        return _fail(
+            "--resume-weights-only requires --checkpoint or --resume PATH.",
+            "missing checkpoint path",
+            "pass the checkpoint to load weights from, then see LOG",
+        )
+
+    init_mode = "fresh"
+    resume_path = None
+    if checkpoint_path_arg:
+        init_mode = "warm-start"
+        resume_path = checkpoint_path_arg
+    elif resume_path_arg:
+        init_mode = "warm-start" if resume_weights_only_flag else "full-resume"
+        resume_path = resume_path_arg
+
     if resume_path:
         try:
             resume_resolved = safe_resolve(resume_path)
             if not resume_resolved.is_file():
                 return _fail(
-                    f"Resume checkpoint does not exist: {resume_resolved}",
+                    f"Checkpoint does not exist: {resume_resolved}",
                     "wrong path or nothing saved yet",
-                    "fix the path or train without --resume, then see LOG",
+                    "fix the path or train without --checkpoint/--resume, then see LOG",
                 )
             resume_path = str(resume_resolved)
         except (ValueError, OSError) as e:
             return _fail(
-                f"Invalid resume checkpoint path: {e}",
+                f"Invalid checkpoint path: {e}",
                 "path escapes repo or is malformed",
                 "pass a repo-relative .pt path, then see LOG",
             )
+    if init_mode == "warm-start":
+        emit_report(
+            format_kv_line(
+                [
+                    (
+                        "init_mode",
+                        "WEIGHTS-ONLY warm start (optimizer/scheduler/step start fresh; the "
+                        "source step is kept as provenance). Use --resume for a full "
+                        "training-state resume.",
+                    )
+                ]
+            )
+        )
+        logger.info(
+            "[MODE] --checkpoint => weights-only warm start from %s (audit CKP-02 contract)",
+            resume_path,
+        )
 
     # 8. Read sample counts from metadata if available
     train_samples_str = "Unknown"
@@ -1091,8 +1179,11 @@ def run_supervised_training(args: argparse.Namespace) -> int:
             data_role=getattr(args, "data_role", None),
             allow_uncertified_data=bool(getattr(args, "allow_uncertified_data", False)),
             verify_identity=getattr(args, "verify_identity", "full"),
-            resume_weights_only=bool(getattr(args, "resume_weights_only", False)),
+            resume_weights_only=init_mode == "warm-start",
             override_schedule=bool(getattr(args, "override_schedule", False)),
+            artifact_ticket=_supervised_artifact_ticket(
+                ckpt_dir_path, raw_ckpt_dir, log_dir_path, raw_log_dir
+            ),
         )
         emit_report(
             format_kv_line(

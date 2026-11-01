@@ -287,15 +287,63 @@ def test_rl_resume_keeps_step_counter_and_momentum(tmp_path):
     assert saved["_optimizer_type"] == "SGD"
     assert saved["step"] == 1
     assert "inherited_supervised_step" not in saved or saved["inherited_supervised_step"] == 0
+    # The format-2 artifact carries the buffer snapshot triple and generation.
+    assert saved["buffer_state"]["generation"] == trainer.replay_buffer.buffer_generation
 
-    # Same-buffer resume (audit SR-04): reopening the SAME buffer directory
-    # is a matching/legitimately-ahead state and must restore step+momentum.
-    trainer2 = _make_trainer(tmp_path, "b", reopen=True)
+    # A restart re-opens the SAME buffer directory (create_new=False): the
+    # generation persisted in meta.json round-trips, which is exactly the
+    # real-process-restart path the resume contract must accept (CKP-05; the
+    # same-buffer case of the SR-04 identity assertion).
+    buf2 = ReplayBuffer(buffer_dir=tmp_path / "buf_b", capacity=100, create_new=False)
+    model2 = ChessNet(num_blocks=2, num_filters=32)
+    trainer2 = RLTrainer(
+        model=model2,
+        replay_buffer=buf2,
+        batch_size=8,
+        warmup_steps=5,
+        total_steps=100,
+        checkpoint_dir=tmp_path / "ckpt_b2",
+        sync_weights_path=tmp_path / "sync_b2.pt",
+    )
     trainer2.load_checkpoint(p)
     assert trainer2.step_num == 1
     # Momentum buffers survived the round trip.
     state = trainer2.optimizer.state_dict()["state"]
     assert any("momentum_buffer" in per_param for per_param in state.values())
+    # The live buffer triple was adopted as a unit (no head/size desync).
+    assert buf2.write_head == buf2.size
+    assert trainer2.run_metadata["buffer_resume_decision"]["decision"] in (
+        "identical_snapshot",
+        "adopted_live_newer",
+    )
+
+
+def test_rl_resume_refuses_different_buffer_generation(tmp_path):
+    """A checkpoint must not resume against an unrelated buffer generation.
+
+    The healthy checkpoint's snapshot pointer refers to records in the buffer of
+    its own generation; splicing it onto a freshly-created buffer (a different
+    generation) is refused with a diagnostic instead of rewinding the head
+    (audit CKP-05; the historical 15,947-vs-96,067 contradiction).
+    """
+    trainer = _make_trainer(tmp_path, "gen")
+    trainer.train_step()
+    p = trainer.save_checkpoint(tmp_path / "gen_ckpt.pt", keep_last_n=-1)
+
+    # Same directory, but re-created from scratch: a NEW generation.
+    buf_other = ReplayBuffer(buffer_dir=tmp_path / "buf_gen", capacity=100, create_new=True)
+    trainer2 = RLTrainer(
+        model=ChessNet(num_blocks=2, num_filters=32),
+        replay_buffer=buf_other,
+        batch_size=8,
+        checkpoint_dir=tmp_path / "gen_ckpt_dir",
+        sync_weights_path=tmp_path / "gen_sync.pt",
+    )
+    with pytest.raises(Exception, match="generation"):
+        trainer2.load_checkpoint(p)
+    # ...and the explicit acknowledgement path is available.
+    trainer2.load_checkpoint(p, reset_buffer=True)
+    assert trainer2.replay_buffer.size == 0  # nothing invented from the checkpoint
 
     # A checkpoint paired with a DIFFERENT buffer directory fails closed
     # unless the operator overrides it explicitly (SR-04).

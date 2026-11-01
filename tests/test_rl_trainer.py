@@ -9,6 +9,7 @@ from python.model.chess_net import ChessNet
 from python.selfplay.worker import SavedPosition
 from python.selfplay.replay_buffer import ReplayBuffer
 from python.selfplay.inference_server import InferenceServer
+from python.model.checkpoint_schema import CURRENT_RL_FORMAT
 from python.train.train_rl import RLTrainer, WarmupCosineDecayScheduler, WeightPushError
 
 
@@ -583,8 +584,13 @@ def test_finetune_checkpoint_type_rejected_for_full_resume(tmp_path):
 
 
 def test_weights_only_checkpoint_accepted_for_warm_start(tmp_path):
-    """A checkpoint without optimizer state is accepted as a weights-only warm-start.
-    The RL trainer keeps its freshly initialized SGD optimizer.
+    """A checkpoint without optimizer/scheduler state is a *warm start*, never a resume.
+
+    Remediation contract (audit CKP-08/CKP-09, 2026-10-31): a weights-only
+    container must not be silently accepted as a full resume — that is exactly
+    how an export or an undefined artifact becomes a "step-0 resume point".
+    ``warm_start=True`` adopts the weights and starts this run's own optimizer
+    at step 0; the plain resume path refuses it with an actionable message.
     """
     buf = ReplayBuffer(buffer_dir=tmp_path / "buf_wo", capacity=500, create_new=True)
     buf.add_positions(_create_dummy_positions(50, full_prob=0.5))
@@ -609,14 +615,20 @@ def test_weights_only_checkpoint_accepted_for_warm_start(tmp_path):
         weights_only_path,
     )
 
-    # No optimizer state: validation passes through, model weights are loaded.
-    resumed_step = trainer.load_checkpoint(weights_only_path)
-    assert resumed_step == 7
-    assert trainer.step_num == 7
+    # Full resume must refuse it: no optimizer/scheduler state means it cannot
+    # continue training state, and the message must point at the warm start.
+    with pytest.raises(RuntimeError, match="warm start"):
+        trainer.load_checkpoint(weights_only_path)
+
+    # The explicit warm-start path adopts the weights with reset RL counters.
+    resumed_step = trainer.load_checkpoint(weights_only_path, warm_start=True)
+    assert resumed_step == 0
+    assert trainer.step_num == 0
+    assert trainer.inherited_step_num == 7  # source step kept as provenance only
 
     # Fresh SGD optimizer still works.
     metrics = trainer.train_step()
-    assert metrics["step"] == 8
+    assert metrics["step"] == 1
     assert metrics["total_loss"] > 0
 
 
@@ -696,7 +708,14 @@ def test_new_rl_checkpoint_contains_type_and_format(tmp_path):
 
     ckpt = torch.load(ckpt_path, weights_only=False)
     assert ckpt.get("checkpoint_type") == "rl"
-    assert ckpt.get("checkpoint_format") == 1
+    # Format 2 is the checkpoint-artifact-lifecycle schema (2026-10-31): it adds
+    # the run-status ledger, the buffer snapshot triple + generation, provenance,
+    # and CUDA RNG state on top of format 1 (audit CKP-01/05/10/12).
+    assert ckpt.get("checkpoint_format") == CURRENT_RL_FORMAT
+    assert ckpt.get("run_metadata", {}).get("run_state") in ("running", "completed")
+    assert isinstance(ckpt.get("buffer_state"), dict)
+    assert ckpt["buffer_state"].get("generation")
+    assert ckpt.get("provenance", {}).get("model", {}).get("num_blocks") == 2
     pg = ckpt.get("optimizer", {}).get("param_groups", [])
     assert pg and isinstance(pg[0], dict)
     assert "momentum" in pg[0]
@@ -1016,7 +1035,9 @@ def test_weights_only_warm_start_does_not_restore_incompatible_optimizer_state(t
     with pytest.raises(RuntimeError, match="not an RL training checkpoint"):
         trainer.load_checkpoint(weights_only_path)
 
-    # Build a clean weights-only checkpoint (no optimizer) and confirm it is accepted.
+    # Build a clean weights-only checkpoint (no optimizer) and confirm the
+    # warm-start path accepts it (remediation contract: weights-only is a warm
+    # start, not a resume — CKP-02/CKP-08).
     clean_weights_path = tmp_path / "clean_weights.pt"
     torch.save(
         {
@@ -1027,9 +1048,13 @@ def test_weights_only_warm_start_does_not_restore_incompatible_optimizer_state(t
         },
         clean_weights_path,
     )
-    resumed_step = trainer.load_checkpoint(clean_weights_path)
-    assert resumed_step == 9
-    assert trainer.step_num == 9
+    with pytest.raises(RuntimeError, match="warm start"):
+        trainer.load_checkpoint(clean_weights_path)
+
+    resumed_step = trainer.load_checkpoint(clean_weights_path, warm_start=True)
+    assert resumed_step == 0
+    assert trainer.step_num == 0
+    assert trainer.inherited_step_num == 9
 
     # Fresh SGD optimizer was used, not the AdamW state.
     pg = trainer.optimizer.param_groups[0]
@@ -1037,7 +1062,7 @@ def test_weights_only_warm_start_does_not_restore_incompatible_optimizer_state(t
     assert "betas" not in pg
 
     metrics = trainer.train_step()
-    assert metrics["step"] == 10
+    assert metrics["step"] == 1
     assert metrics["total_loss"] > 0
 
 

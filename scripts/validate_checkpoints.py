@@ -91,8 +91,11 @@ def main() -> int:
     for f_ in failures:
         print(f"FAIL: {f_}", file=sys.stderr)
     if args.write:
-        registry["last_verified"] = time.strftime("%Y-%m-%d %H:%M:%S")
-        reg_path.write_text(json.dumps(registry, indent=2, ensure_ascii=False), encoding="utf-8")
+        # Audit CKP-14: the historical writer rewrote the tracked registry with a
+        # bare write_text (torn JSON on crash). Now atomic + locked.
+        from python.model.checkpoint_registry import write_registry
+
+        write_registry(registry, ROOT, stamp_verified=True)
         print(f"Registry written: {reg_path}")
     return 1 if failures else 0
 

@@ -492,13 +492,23 @@ def run_learn_puzzles(args: argparse.Namespace) -> int:
         )
         total_time = time.time() - t0
 
-        final_ckpt = Path("models/checkpoints_rl/curriculum_final_latest.pt")
-        torch.save(
+        # Audit CKP-09: model-only payloads must not land in the RL checkpoint
+        # directory (auto-resume discovery could adopt them as step-0 resume
+        # points) and must be written atomically with a declared type.
+        from python.train.train_supervised import _atomic_torch_save
+
+        final_ckpt = Path("models/checkpoints_curriculum/curriculum_final_latest.pt")
+        final_ckpt.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_torch_save(
             {
+                "checkpoint_type": "curriculum",
                 "model": model.state_dict(),
                 "source": "autonomous_curriculum",
                 "start_rating": start_rating,
                 "end_rating": end_rating,
+                "num_blocks": getattr(model, "num_blocks", 12),
+                "num_filters": getattr(model, "num_filters", 128),
+                "weights_only_container": True,
                 "timestamp": time.time(),
             },
             final_ckpt,
@@ -632,7 +642,11 @@ def run_learn_puzzles(args: argparse.Namespace) -> int:
     out_file = safe_resolve(args.output)
     out_file.parent.mkdir(parents=True, exist_ok=True)
     checkpoint_payload = {
+        # One shared payload contract with scripts/learn_from_mistakes.py
+        # (audit CKP-09): both producers used to write different shapes.
+        "checkpoint_type": "mistake_learner",
         "model": model.state_dict(),
+        "optimizer": None,
         "num_blocks": info.get("num_blocks", 12),
         "num_filters": info.get("num_filters", 128),
         "source": "mistake_learner",
@@ -640,7 +654,9 @@ def run_learn_puzzles(args: argparse.Namespace) -> int:
         "mistakes_mined": results["total_mistakes_mined"],
         "timestamp": time.time(),
     }
-    torch.save(checkpoint_payload, out_file)
+    from python.train.train_supervised import _atomic_torch_save
+
+    _atomic_torch_save(checkpoint_payload, out_file)
     print_success(f"Updated weights saved to {out_file}")
 
     summary_table = Table(title="Tactical Learning Summary", box=box.ROUNDED)

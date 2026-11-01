@@ -527,17 +527,26 @@ def get_available_checkpoints() -> list[dict[str, Any]]:
         REPO_ROOT / "models" / "checkpoints_baseline_20261031",
         REPO_ROOT / "models" / "checkpoints_rl",
         REPO_ROOT / "models" / "checkpoints_scaled",
+        REPO_ROOT / "models" / "checkpoints_finetune",
         REPO_ROOT / "models" / "checkpoints",
     ]
 
-    seen = set()
+    # Deduplicate by resolved path, not by file name: several trees legitimately
+    # contain artifacts with the same base name (`latest_checkpoint.pt` exists in
+    # both the scaled and finetune trees), and name-keyed dedup silently dropped
+    # all but the first tree's copy (audit CKP-11).
+    seen: set[str] = set()
     for d in dirs_to_check:
         if not d.is_dir():
             continue
         for f in d.glob("*.pt"):
-            if f.name in seen or not f.is_file():
+            try:
+                key = str(f.resolve())
+            except OSError:
+                key = str(f)
+            if key in seen or not f.is_file():
                 continue
-            seen.add(f.name)
+            seen.add(key)
             stat = f.stat()
             size_mb = stat.st_size / (1024 * 1024)
             mtime = stat.st_mtime
@@ -596,7 +605,10 @@ def get_default_checkpoint_path() -> Path:
 
     Registry-driven (``docs/checkpoint_registry.json``): the designated,
     verified artifact, SHA-256-verified against its registry record at
-    resolution time (audit M-2, 2026-10-31).
+    resolution time (audit M-2, 2026-10-31; merged policy with CKP-11 — the
+    CKP-11 candidate-name chain with its discovery fallback is superseded by
+    this single resolver, which refuses disqualified/quarantined/missing
+    artifacts and never silently substitutes).
 
     Raises:
         DefaultCheckpointError: when nothing trustworthy is designated, or the
