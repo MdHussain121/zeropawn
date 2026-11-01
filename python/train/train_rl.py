@@ -114,29 +114,55 @@ def classify_optimizer_state(ckpt: Dict[str, Any]) -> str:
 
     Returns one of ``"SGD"``, ``"AdamW"`` (any Adam-family state), ``"empty"``
     (optimizer present but no per-parameter state yet — always safe), or
-    ``"unknown"``. A stamped ``_optimizer_type`` wins; otherwise the per-param
-    state keys decide (``exp_avg``/``exp_avg_sq`` are Adam-family,
-    ``momentum_buffer`` is SGD). ``None``/absent optimizer state is ``"empty"``.
+    ``"unknown"``. ``None``/absent optimizer state is ``"empty"``.
+
+    Audit RL-09: the per-parameter contents decide whenever they identify a
+    family. A ``_optimizer_type`` stamp is honored only when it agrees with
+    (or carries more information than) the contents — a stamped file whose
+    per-parameter state is Adam-family classifies as ``"AdamW"`` no matter
+    what the stamp claims, so a forged or stale stamp can no longer smuggle
+    foreign optimizer state through resume selection. A stamp is still
+    authoritative when the state carries no per-parameter entries (a
+    first-save RL checkpoint legitimately has none yet).
     """
     opt_state = ckpt.get("optimizer")
     if opt_state is None:
         return "empty"
     stamped = ckpt.get("_optimizer_type")
-    if isinstance(stamped, str) and stamped:
-        return stamped
     state = opt_state.get("state") if isinstance(opt_state, dict) else None
     if not isinstance(state, dict) or not state:
-        return "empty"
+        # No per-parameter state to contradict the stamp: declared identity wins.
+        return stamped if isinstance(stamped, str) and stamped else "empty"
+    content_class: Optional[str] = None
     saw_any_keys = False
     for per_param in state.values():
-        if isinstance(per_param, dict):
-            keys = set(per_param.keys())
-            if keys & {"exp_avg", "exp_avg_sq", "max_exp_avg_sq"}:
-                return "AdamW"
-            if "momentum_buffer" in keys:
-                return "SGD"
-            saw_any_keys = saw_any_keys or bool(keys)
-    return "unknown" if saw_any_keys else "empty"
+        if not isinstance(per_param, dict):
+            continue
+        keys = set(per_param.keys())
+        if keys & {"exp_avg", "exp_avg_sq", "max_exp_avg_sq"}:
+            content_class = "AdamW"
+            break
+        if "momentum_buffer" in keys:
+            content_class = "SGD"
+        saw_any_keys = saw_any_keys or bool(keys)
+    if content_class is None:
+        content_class = "unknown" if saw_any_keys else "empty"
+    if (
+        isinstance(stamped, str)
+        and stamped
+        and stamped != content_class
+        and content_class not in ("unknown", "empty")
+    ):
+        logger.warning(
+            "Checkpoint stamp _optimizer_type=%r contradicts its optimizer state contents "
+            "(%s); classifying by contents (audit RL-09).",
+            stamped,
+            content_class,
+        )
+        return content_class
+    if isinstance(stamped, str) and stamped:
+        return stamped
+    return content_class
 
 
 def inspect_rl_checkpoint(path: Union[str, Path]) -> Optional[Dict[str, Any]]:
@@ -306,6 +332,21 @@ class RLTrainer:
         self.warmup_steps = int(warmup_steps)
         self.total_steps = int(total_steps)
         self.policy_target_temp = float(policy_target_temp)
+        # Audit RL-29: tau=1.0 trains the RAW stored visit distribution (no
+        # normalization) instead of the AlphaZero-style sharpened target, and
+        # a non-positive tau is mathematically meaningless (1/tau). Keep the
+        # historical 1.0 behavior working, but never silently.
+        if self.policy_target_temp <= 0:
+            raise ValueError(
+                f"policy_target_temp must be > 0 (got {self.policy_target_temp}); "
+                "the supported range is (0, 1] with 0.5 as the configured default."
+            )
+        if self.policy_target_temp == 1.0:
+            logger.warning(
+                "policy_target_temp=1.0 trains RAW un-normalized MCTS visit distributions "
+                "(audit RL-29 config hazard). The configured default is 0.5 (squared-visit "
+                "sharpening); only override deliberately."
+            )
         self.entropy_bonus = float(entropy_bonus)
 
         # Optimizer: SGD with momentum 0.9 and weight decay 1e-4
@@ -333,6 +374,13 @@ class RLTrainer:
         # learner-to-actor loop is visible in metrics, not just in logs.
         self.push_success_count = 0
         self.push_failure_count = 0
+        # Audit RL-04: batches whose optimizer update was skipped (non-finite
+        # loss or gradients). step_num counts successful updates only; this
+        # counter keeps the attempted-but-skipped work visible in telemetry.
+        self.skipped_step_count = 0
+        # Audit RL-35: the human/tactical mix actually assembled by the most
+        # recent replay sample (empty when the batch was supplied directly).
+        self._last_sample_mixes: Dict[str, float] = {}
         # Provenance for warm starts (set by load_checkpoint): the supervised
         # checkpoint this run started from is metadata, NOT RL progress —
         # step_num must only ever count this run's own SGD updates.
@@ -507,6 +555,7 @@ class RLTrainer:
         allow_buffer_mismatch: bool = False,
         reset_buffer: bool = False,
         verify_identity: str = "auto",
+        allow_scheduler_geometry_mismatch: bool = False,
     ) -> int:
         """Resume training from a checkpoint.
 
@@ -641,6 +690,47 @@ class RLTrainer:
                     ) from e
 
         if ckpt.get("scheduler") is not None and hasattr(self.scheduler, "load_state_dict"):
+            saved_sched = ckpt["scheduler"]
+            # Audit RL-07: never inherit foreign scheduler geometry. A full
+            # resume must continue THIS run's configured schedule; a checkpoint
+            # saved under a different warmup/total (e.g. the supervised
+            # {200, 6000} schedule) would silently put the cosine progress at
+            # its end and collapse the RL learning rate to min_lr (~50x low).
+            # The mismatch is refused unless the operator acknowledges it
+            # explicitly, mirroring the buffer-mismatch contract.
+            if (
+                isinstance(saved_sched, dict)
+                and not reset_step
+                and (
+                    (
+                        saved_sched.get("warmup_steps") is not None
+                        and int(saved_sched["warmup_steps"]) != self.warmup_steps
+                    )
+                    or (
+                        saved_sched.get("total_steps") is not None
+                        and int(saved_sched["total_steps"]) != self.total_steps
+                    )
+                )
+            ):
+                detail = (
+                    f"checkpoint scheduler geometry (warmup_steps="
+                    f"{saved_sched.get('warmup_steps')}, total_steps="
+                    f"{saved_sched.get('total_steps')}) differs from the configured RL "
+                    f"schedule (warmup_steps={self.warmup_steps}, "
+                    f"total_steps={self.total_steps})"
+                )
+                if not allow_scheduler_geometry_mismatch:
+                    raise RuntimeError(
+                        f"Refusing to resume '{path_str}': {detail}. Inheriting foreign "
+                        "scheduler geometry would silently reshape the LR schedule and "
+                        "collapse the learning rate (audit RL-07). Pass "
+                        "allow_scheduler_geometry_mismatch=True to adopt the checkpoint's "
+                        "schedule deliberately, or warm-start weights-only instead."
+                    )
+                logger.warning(
+                    "[SCHEDULER] adopting foreign scheduler geometry by explicit override: %s",
+                    detail,
+                )
             try:
                 saved_sched = ckpt["scheduler"]
                 if scheduler_override:
@@ -1415,6 +1505,22 @@ class RLTrainer:
             stats["sampled_unique_games"] = int(torch.unique(positive).numel())
         except (AttributeError, RuntimeError, TypeError):
             logger.debug("sampling stats unavailable for this batch", exc_info=True)
+        # Audit RL-10: report value-supervision coverage honestly. Human rows
+        # are consumed as POLICY-only supervision when their outcome is the
+        # 255 sentinel (masked out of the WDL loss by ignore_index=255); the
+        # batch's masked-row count is surfaced so the human mix cannot be
+        # mistaken for value supervision.
+        outcomes = batch_dict.get("outcomes")
+        if outcomes is not None:
+            try:
+                o = outcomes.detach().to("cpu")
+                if not o.is_floating_point() or (o.ndim == 1):
+                    stats["n_value_masked_rows"] = int((o.long() == 255).sum().item())
+                else:
+                    # (N, 3) probability targets carry no sentinel semantics.
+                    stats["n_value_masked_rows"] = 0
+            except (AttributeError, RuntimeError, TypeError):
+                logger.debug("value-mask accounting unavailable for this batch", exc_info=True)
         return stats
 
     def train_step(self, batch_dict: Optional[dict[str, Any]] = None) -> dict[str, Any]:
@@ -1428,12 +1534,56 @@ class RLTrainer:
                 step=self.step_num,
                 device=self.device,
             )
+            # Audit RL-35: report the actual human/tactical mix so telemetry
+            # cannot log a phantom 0.000. The buffer records what it actually
+            # assembled for the most recent sample.
+            self._last_sample_mixes = {
+                "actual_human_mix": float(
+                    getattr(self.replay_buffer, "last_human_mix", 0.0) or 0.0
+                ),
+                "actual_tactical_mix": float(
+                    getattr(self.replay_buffer, "last_tactical_mix", 0.0) or 0.0
+                ),
+            }
+        else:
+            self._last_sample_mixes = {}
         self._last_sampling_stats = self._sampling_stats_from_batch(batch_dict)
 
         if self.train_stream is not None:
             with torch.cuda.stream(self.train_stream):
                 return self._train_step_impl(batch_dict)
         return self._train_step_impl(batch_dict)
+
+    def _skipped_step_metrics(
+        self,
+        policy_loss: torch.Tensor,
+        wdl_loss: torch.Tensor,
+        lr: float,
+        full_mask: torch.Tensor,
+        is_full: torch.Tensor,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Metrics for a step whose optimizer update was skipped (audit RL-04).
+
+        The reported ``step`` is the counter of the last successful update — a
+        skipped batch is not optimizer progress and must not advance it.
+        """
+        return {
+            "step": self.step_num,
+            "policy_loss": float(policy_loss.item()),
+            "wdl_loss": float(wdl_loss.item()),
+            "total_loss": float("nan"),
+            "lr": float(lr),
+            "policy_entropy": float("nan"),
+            "target_entropy": float("nan"),
+            "n_full": int(full_mask.sum().item()),
+            "n_total": int(is_full.numel()),
+            "skipped_batch": True,
+            "skip_reason": reason,
+            "skipped_step_count": self.skipped_step_count,
+            **self._last_sample_mixes,
+            **self._last_sampling_stats,
+        }
 
     def _train_step_impl(self, batch_dict: dict[str, Any]) -> dict[str, Any]:
         planes = batch_dict["planes"].to(self.device, non_blocking=True)
@@ -1518,25 +1668,32 @@ class RLTrainer:
 
         # Guard against NaNs/Infs so a bad batch cannot corrupt the live model.
         if not torch.isfinite(total_loss):
+            # Audit RL-04: a skipped batch is NOT optimizer progress. The RL
+            # step counter counts successful optimizer updates only, so a
+            # non-finite loss leaves step_num — and with it the schedule
+            # position — untouched and is counted separately.
             logger.warning("RL trainer produced non-finite loss; skipping optimizer step")
             self.optimizer.zero_grad(set_to_none=True)
-            self.step_num += 1
-            metrics = {
-                "step": self.step_num,
-                "policy_loss": float(policy_loss.item()),
-                "wdl_loss": float(wdl_loss.item()),
-                "total_loss": float("nan"),
-                "lr": float(lr),
-                "policy_entropy": float("nan"),
-                "target_entropy": float("nan"),
-                "n_full": int(full_mask.sum().item()),
-                "n_total": int(is_full.numel()),
-                **self._last_sampling_stats,
-            }
-            return metrics
+            self.skipped_step_count += 1
+            return self._skipped_step_metrics(
+                policy_loss, wdl_loss, lr, full_mask, is_full, reason="non-finite loss"
+            )
 
         total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+        # Audit RL-23: a finite loss can still produce non-finite gradients.
+        # clip_grad_norm_'s returned total norm is the cheapest whole-model
+        # finiteness signal and is checked before the optimizer step.
+        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+        if not torch.isfinite(grad_norm):
+            logger.warning(
+                "RL trainer produced non-finite gradients (total norm %s); skipping optimizer step",
+                float(grad_norm),
+            )
+            self.optimizer.zero_grad(set_to_none=True)
+            self.skipped_step_count += 1
+            return self._skipped_step_metrics(
+                policy_loss, wdl_loss, lr, full_mask, is_full, reason="non-finite gradients"
+            )
         self.optimizer.step()
 
         # Reported entropy is a logging metric: the masked legal-move entropy when
@@ -1562,9 +1719,11 @@ class RLTrainer:
         n_total = int(is_full.numel())
 
         self.step_num += 1
-        self.last_push_step = self.step_num if self.step_num % self.push_freq == 0 else self.last_push_step
 
-        # Weight push to the inference server every N steps.
+        # Weight push to the inference server every N steps. Audit RL-22:
+        # ``last_push_step`` is advanced by push_weights itself on SUCCESS
+        # only, so a failed push can no longer be recorded as done by a
+        # failure-cleanup checkpoint.
         if self.step_num % self.push_freq == 0:
             self.push_weights()
 
@@ -1592,6 +1751,8 @@ class RLTrainer:
             "target_entropy": float(m[4]),
             "n_full": int(m[5]),
             "n_total": n_total,
+            "skipped_batch": False,
+            **self._last_sample_mixes,
             **sampled,
         }
 
@@ -1716,6 +1877,12 @@ class RLTrainer:
                     exc_info=True,
                 )
 
+        # Audit RL-22: record the push only after the whole push pipeline
+        # succeeded (server version advanced and/or the disk sync artifact was
+        # written). Any failure above raises or is counted before this line,
+        # so failure-cleanup checkpoints can no longer carry a last_push_step
+        # for a push that never happened.
+        self.last_push_step = self.step_num
         return sync_event
 
 
