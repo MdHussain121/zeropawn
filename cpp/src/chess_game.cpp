@@ -2,6 +2,9 @@
 #include "zeropawn/encoder.hpp"
 
 #include <stdexcept>
+#include <string>
+#include <string_view>
+#include <vector>
 
 namespace zeropawn {
 
@@ -12,7 +15,17 @@ uint64_t compute_perft(chess::Board& board, int depth) {
     if (depth == 1) return moves.size();
     uint64_t nodes = 0;
     for (const auto& move : moves) {
-        board.makeMove(move);
+        // EXACT en-passant policy (remediation CR-01): the vendored default
+        // makeMove<false> records the en-passant square whenever an enemy
+        // pawn pseudo-legally attacks it, while setFen validates it with
+        // full legality -- the same physical position then carried different
+        // hashes depending on whether it was reached by play or by FEN load.
+        // makeMove<true> is the vendor's own template that applies the same
+        // isEpSquareValid legality test at play time, unifying position
+        // identity across both paths. EP legality itself (and therefore
+        // perft counts) is unaffected: an EP capture the square would have
+        // enabled was already rejected by move generation.
+        board.makeMove<true>(move);
         nodes += compute_perft(board, depth - 1);
         board.unmakeMove(move);
     }
@@ -25,7 +38,124 @@ ChessGame::ChessGame(const std::string& fen) : board_(chess::constants::STARTPOS
     set_fen(fen);
 }
 
+namespace {
+
+// Structural FEN gate (remediation CR-02/CR-03). The vendored parser walks a
+// single square cursor over the piece-placement field with no per-rank
+// boundary check, so a rank with more than eight squares silently rolls into
+// earlier ranks and transforms the input into a different position; its
+// counter parsing wraps negative integers into the unsigned storage fields
+// (halfmove "-5" became 251, instantly reporting the 50-move draw state; a
+// negative fullmove wrapped to an absurd number). This gate runs BEFORE the
+// vendored parse so that ChessGame::set_fen either loads the intended
+// position or rejects the input without touching any existing state
+// (fail-closed, DEF-02 contract). Lenient normalization of the castling and
+// en-passant fields is intentionally left to the vendored parser (documented
+// CR-05 policy).
+//
+// Returns an empty string when the FEN is structurally valid, otherwise a
+// diagnostic describing the first violation.
+std::string validate_fen_structure(std::string_view fen) {
+    // Tokenize on exactly one separating space. The vendored splitter turns
+    // consecutive spaces into empty tokens (an empty counter field silently
+    // defaulted to 0), which is now rejected as ambiguous input instead.
+    std::vector<std::string_view> fields;
+    size_t start = fen.find_first_not_of(' ');
+    if (start == std::string_view::npos) return "empty FEN";
+    while (start < fen.size()) {
+        size_t end = fen.find(' ', start);
+        if (end == std::string_view::npos) end = fen.size();
+        fields.push_back(fen.substr(start, end - start));
+        if (end == fen.size()) break;
+        if (end + 1 < fen.size() && fen[end + 1] == ' ') {
+            return "consecutive spaces in FEN";
+        }
+        start = end + 1;
+    }
+    if (fields.size() > 6) return "more than 6 FEN fields (trailing garbage)";
+
+    // Piece placement: exactly 8 ranks, each expanding to exactly 8 squares.
+    // Kings are counted during the same scan: the vendored setFenCommon
+    // initializes its castling-path table with kingSq(c) for BOTH colors
+    // unconditionally (before any king validation), and lsb() of an empty
+    // king bitboard is undefined -- a FEN without exactly one king per side
+    // crashes with an out-of-bounds table access there (flaky segfault,
+    // reproduced at ~70% on the pre-remediation build). Gating king counts
+    // here means such input never reaches the vendored parser (REM-CR-08).
+    const std::string_view placement = fields[0];
+    int rank = 0;
+    size_t i = 0;
+    int white_kings = 0;
+    int black_kings = 0;
+    while (true) {
+        if (rank >= 8) return "more than 8 ranks in piece placement";
+        int width = 0;
+        while (i < placement.size() && placement[i] != '/') {
+            const char c = placement[i];
+            if (c >= '1' && c <= '8') {
+                width += c - '0';
+            } else if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+                switch (c) {
+                    case 'p': case 'n': case 'b': case 'r': case 'q': case 'k':
+                    case 'P': case 'N': case 'B': case 'R': case 'Q': case 'K':
+                        ++width;
+                        if (c == 'K') ++white_kings;
+                        if (c == 'k') ++black_kings;
+                        break;
+                    default:
+                        return "invalid piece character in placement";
+                }
+            } else {
+                if (c == '0' || c == '9') {
+                    return "invalid rank compression digit in placement";
+                }
+                return "invalid character in piece placement";
+            }
+            if (width > 8) return "rank expands past 8 squares";
+            ++i;
+        }
+        if (width != 8) return "rank does not contain exactly 8 squares";
+        ++rank;
+        if (i == placement.size()) break;
+        ++i;  // skip '/'
+        if (i == placement.size()) return "empty final rank";
+    }
+    if (rank != 8) return "fewer than 8 ranks in piece placement";
+    if (white_kings != 1 || black_kings != 1) {
+        return "piece placement must contain exactly one king per side";
+    }
+
+    // Counters (fields 5/6): digits only, within the ranges representable by
+    // the vendored storage (halfmove clock uint8, ply counter uint16). A
+    // negative or overflowing value would wrap silently and corrupt
+    // draw-state behavior.
+    const auto valid_counter = [](std::string_view field, long long min_value,
+                                  long long max_value) {
+        if (field.empty()) return false;
+        long long value = 0;
+        for (const char c : field) {
+            if (c < '0' || c > '9') return false;
+            value = value * 10 + (c - '0');
+            if (value > max_value) return false;
+        }
+        return value >= min_value;
+    };
+    if (fields.size() >= 5 && !valid_counter(fields[4], 0, 255)) {
+        return "invalid halfmove clock (must be an integer in [0, 255])";
+    }
+    if (fields.size() >= 6 && !valid_counter(fields[5], 1, 32768)) {
+        return "invalid fullmove number (must be an integer in [1, 32768])";
+    }
+    return "";
+}
+
+}  // namespace
+
 bool ChessGame::set_fen(const std::string& fen) {
+    // Structural gate (remediation CR-02/CR-03): reject malformed board
+    // layouts and out-of-range counters before the vendored parser runs.
+    // Every rejection path below leaves the existing game state untouched.
+    if (!validate_fen_structure(fen).empty()) return false;
     chess::Board temp;
     if (!temp.setFen(fen)) return false;
     // Required king invariants: the vendored parser accepts king-less and
@@ -111,7 +241,8 @@ bool ChessGame::make_move_uci(const std::string& uci) {
     // chess-library makeMove being non-throwing, either both mutate or
     // neither does.
     move_history_.reserve(move_history_.size() + 1);
-    board_.makeMove(m);
+    // EXACT en-passant policy, see compute_perft (remediation CR-01).
+    board_.makeMove<true>(m);
     move_history_.push_back(m);
     return true;
 }
@@ -157,7 +288,60 @@ bool ChessGame::is_50_move_rule() const {
 }
 
 bool ChessGame::is_insufficient_material() const {
-    return board_.isInsufficientMaterial();
+    // Remediation CR-04: the vendored isInsufficientMaterial() only
+    // recognizes the <=4-piece basic cases and misses dead positions with
+    // more pieces, e.g. K + two same-colored bishops vs K + bishop (six
+    // pieces), where no checkmate exists under any series of legal moves.
+    // This mirrors python-chess's has_insufficient_material() for both
+    // colors -- the project's reference oracle -- which reduces to the
+    // vendored verdicts for every <=4-piece configuration and extends the
+    // same-color-bishop rule to arbitrary piece counts. The classification
+    // stays conservative: any pawn, rook or queen; king + two knights; a
+    // knight facing non-king material; or opposite-colored bishops anywhere
+    // keeps the game classified as playable.
+    using chess::Bitboard;
+    using chess::Color;
+    using chess::PieceType;
+
+    const Bitboard pawns   = board_.pieces(PieceType::PAWN);
+    const Bitboard knights = board_.pieces(PieceType::KNIGHT);
+    const Bitboard bishops = board_.pieces(PieceType::BISHOP);
+    const Bitboard rooks   = board_.pieces(PieceType::ROOK);
+    const Bitboard queens  = board_.pieces(PieceType::QUEEN);
+    const Bitboard kings   = board_.pieces(PieceType::KING);
+
+    // True when every bishop on the board stands on the same square color.
+    const auto bishops_all_same_color = [&]() {
+        if (bishops.count() <= 1) return true;
+        const int ref = bishops.lsb();
+        Bitboard rest = bishops;
+        rest.clear(ref);
+        while (rest) {
+            if (!chess::Square::same_color(ref, rest.lsb())) return false;
+            rest.clear(rest.lsb());
+        }
+        return true;
+    };
+
+    const auto has_insufficient = [&](Color color) {
+        const Bitboard own = board_.us(color);
+        const Bitboard opp = board_.us(~color);
+        if (own & (pawns | rooks | queens)) return false;
+        if (own & knights) {
+            // King + exactly one knight; the opponent may hold nothing but
+            // kings and queens (any pawn/knight/bishop/rook to capture would
+            // allow a selfmate construction).
+            return own.count() <= 2 && !(opp & ~kings & ~queens);
+        }
+        if (own & bishops) {
+            // Any number of bishops, but all on one square color, and no
+            // pawns or knights anywhere on the board.
+            return bishops_all_same_color() && !pawns && !knights;
+        }
+        return true;
+    };
+
+    return has_insufficient(Color::WHITE) && has_insufficient(Color::BLACK);
 }
 
 bool ChessGame::is_game_over() const {
@@ -247,7 +431,8 @@ void ChessGame::apply_action(int action) {
     }
     // Reserve before mutating the board (see make_move_uci, remediation F-13).
     move_history_.reserve(move_history_.size() + 1);
-    board_.makeMove(m);
+    // EXACT en-passant policy, see compute_perft (remediation CR-01).
+    board_.makeMove<true>(m);
     move_history_.push_back(m);
 }
 

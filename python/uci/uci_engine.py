@@ -124,6 +124,13 @@ class UCIEngine:
         self.last_engine_move: Optional[str] = None
         self.prev_moves_at_search: Optional[List[str]] = None
         self.prev_moves: List[str] = []
+        # Ply of the position BEFORE any replayed "moves" suffix, derived from
+        # the validated FEN metadata (remediation CR-07): startpos is ply 0,
+        # a FEN at fullmove N with black to move sits at (N-1)*2 + 1 plies.
+        # history_len() alone under-counts for FEN-loaded games (it only
+        # counts moves replayed inside this UCI session), which let book
+        # moves be offered beyond max_depth_plies.
+        self.prev_base_ply: int = 0
         self.prev_fen: str = "startpos"
 
         # Real-time search control (F-3): stop event + abort deadline shared
@@ -466,7 +473,13 @@ class UCIEngine:
 
         # Check opening book first if enabled
         if self.use_book and self.opening_book is not None:
-            book_res = self.opening_book.lookup(self.game)
+            # True game ply (remediation CR-07): the bare position's own ply
+            # (startpos -> 0; a FEN at fullmove N -> (N-1)*2 [+1 for black])
+            # plus the moves replayed after it. history_len() alone reports 0
+            # for FEN-loaded games and under-counts book depth. Book moves
+            # remain legality-gated below either way.
+            current_ply = self.prev_base_ply + len(self.prev_moves)
+            book_res = self.opening_book.lookup(self.game, current_ply=current_ply)
             if book_res is not None:
                 book_move, _ = book_res
                 if book_move in legal_moves:
@@ -688,6 +701,7 @@ class UCIEngine:
             self.last_engine_move = None
             self.prev_moves_at_search = None
             self.prev_moves = []
+            self.prev_base_ply = 0
             self.prev_fen = "startpos"
 
         elif cmd == "position":
@@ -718,6 +732,15 @@ class UCIEngine:
                 current_fen = fen_str
             else:
                 new_game = self.zeropawn_cpp.ChessGame()
+
+            # Base ply from the bare position's own metadata, BEFORE any
+            # moves suffix is replayed (remediation CR-07): fullmove N with
+            # white to move is (N-1)*2 plies deep, black to move (N-1)*2 + 1.
+            # This reflects the FEN's move number without inventing history;
+            # replayed moves are added on top at book-lookup time.
+            base_ply = (new_game.full_move_number() - 1) * 2 + (
+                0 if new_game.side_to_move() else 1
+            )
 
             new_moves: List[str] = []
             if moves_idx is not None:
@@ -762,6 +785,7 @@ class UCIEngine:
             self.game = new_game
             self.prev_fen = current_fen
             self.prev_moves = new_moves
+            self.prev_base_ply = base_ply
             self.last_engine_action = None
             self.last_engine_move = None
             self.prev_moves_at_search = None

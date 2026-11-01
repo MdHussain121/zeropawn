@@ -818,6 +818,164 @@ void test_mcts_config_validation() {
     std::cout << "[PASS] test_mcts_config_validation\n";
 }
 
+void test_chess_rules_remediation() {
+    using zeropawn::ChessGame;
+
+    // ------------------------------------------------------------------
+    // CR-01: en-passant position identity must not depend on the path.
+    // The audit repro: after 1.d4 the black e4 pawn's EP capture is
+    // pseudo-legal but illegal (exd3 e.p. opens the Qh4-a4 rank against the
+    // a4 king). Play path and FEN path must produce identical state.
+    // ------------------------------------------------------------------
+    ChessGame play("8/8/8/8/k3p2Q/8/3P4/3K4 w - - 0 1");
+    TEST_CHECK(play.make_move_uci("d2d4"), "d2d4 legal");
+    ChessGame load(play.get_fen());
+    TEST_CHECK(play.get_hash() == load.get_hash(), "CR-01: play/FEN hashes must match (white)");
+    TEST_CHECK(play.get_fen() == load.get_fen(), "CR-01: play/FEN FENs must match (white)");
+    TEST_CHECK(load.get_fen().find(" d3 ") == std::string::npos,
+               "CR-01: illegal EP square must not be serialized");
+
+    // Black-side mirror of the same horizontal-pin family.
+    ChessGame play_b("3k4/3p4/8/8/K2pP2q/8/8/8 b - - 0 1");
+    TEST_CHECK(play_b.make_move_uci("d7d5"), "d7d5 legal");
+    ChessGame load_b(play_b.get_fen());
+    TEST_CHECK(play_b.get_hash() == load_b.get_hash(), "CR-01: play/FEN hashes must match (black)");
+    TEST_CHECK(play_b.get_fen() == load_b.get_fen(), "CR-01: play/FEN FENs must match (black)");
+
+    // Fully legal EP must still be recorded after a double push.
+    ChessGame legal_ep("4k3/8/8/8/3p4/8/4P3/4K3 w - - 0 1");
+    TEST_CHECK(legal_ep.make_move_uci("e2e4"), "e2e4 legal");
+    TEST_CHECK(legal_ep.get_fen().find(" e3 ") != std::string::npos,
+               "legal EP square is serialized");
+    ChessGame legal_ep_load(legal_ep.get_fen());
+    TEST_CHECK(legal_ep.get_hash() == legal_ep_load.get_hash(), "legal EP identity across paths");
+
+    // EP state must remain hash-distinguishable when it is legal.
+    ChessGame with_ep("4k3/8/8/8/3pP3/8/8/4K3 b - e3 0 1");
+    ChessGame without_ep("4k3/8/8/8/3pP3/8/8/4K3 b - - 0 1");
+    TEST_CHECK(with_ep.get_hash() != without_ep.get_hash(),
+               "legal-EP and no-EP positions must hash differently");
+
+    // FEN round-trip idempotence on the repro family.
+    for (const char* fen : {"8/8/8/8/k2Pp2Q/8/8/3K4 b - - 0 1",
+                            "3k4/8/8/K2pP2q/8/8/8/8 w - - 0 1",
+                            "4k3/8/8/8/3pP3/8/8/4K3 b - e3 0 1",
+                            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"}) {
+        ChessGame g(fen);
+        TEST_CHECK(g.get_fen() == fen, "loaded FEN serializes unchanged");
+    }
+
+    // ------------------------------------------------------------------
+    // CR-02: structurally malformed board layouts are rejected instead of
+    // being silently transformed; every rejection preserves prior state.
+    // ------------------------------------------------------------------
+    ChessGame g;
+    g.make_move_uci("e2e4");
+    const std::string pre_fen = g.get_fen();
+    const uint64_t pre_hash = g.get_hash();
+    const char* bad_fens[] = {
+        "4k3/8/8/8/8/8/8/qqqqqqqqK w - - 0 1",  // the audit's rank-overflow repro
+        "4k3/8/8/8/8/8/8/9q w - - 0 1",          // compression digit 9
+        "4k3/8/8/8/8/8/8/0q w - - 0 1",          // compression digit 0
+        "4k3/8/8/8/8/8/8/4K2 w - - 0 1",         // short final rank
+        "4k3/8/8/8/8/8/4K/8 w - - 0 1",          // short rank mid-board (7 squares)
+        "4k3/8/8/8/8/8/8/4K3/8 w - - 0 1",       // 9 ranks
+        "4k3/8/8/8/8/8/8 w - - 0 1",             // 7 ranks
+        "4k3/8/8/8/8/8/8//4K3 w - - 0 1",        // empty rank
+        "4k3/8/8/8/8/8/8/4K3/ w - - 0 1",        // trailing separator
+        "4k3/8/8/8/8/8/8/4K3X w - - 0 1",        // invalid piece char
+        "4k3/8/8/8/8/8/8/4K3 w - - 0 1 extra",   // trailing garbage field
+        "4k3  8/8/8/8/8/8/8/4K3 w - - 0 1",      // consecutive separators
+    };
+    for (const char* bad : bad_fens) {
+        TEST_CHECK(!g.set_fen(bad), "malformed FEN must be rejected");
+        TEST_CHECK(g.get_fen() == pre_fen && g.get_hash() == pre_hash,
+                   "rejected FEN must not mutate state");
+    }
+    // Valid structural variants still load (44 == 8 squares of compression).
+    TEST_CHECK(g.set_fen("4k3/8/8/8/8/8/44/4K3 w - - 0 1"), "valid compression accepted");
+    TEST_CHECK(g.set_fen(pre_fen), "valid FEN re-loads after rejections");
+
+    // ------------------------------------------------------------------
+    // REM-CR-08 (found during this remediation): a king-less FEN carrying
+    // castling rights for the king-less side made the vendored setFen
+    // dereference a missing king (undefined lsb of an empty bitboard) while
+    // initializing the castling-path table -- flaky out-of-bounds access
+    // and segfault (~70% per attempt on the pre-remediation build). The
+    // structural gate must reject king-less and multi-king placements
+    // BEFORE the vendored parser runs. The first FEN is the fuzz killer:
+    // Kiwipete with the black king replaced by a white king.
+    // ------------------------------------------------------------------
+    const char* king_faults[] = {
+        "r3K2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        "4k3/8/8/8/8/8/8/8 w KQkq - 0 1",
+        "8/8/8/8/8/8/8/4K3 w - - 0 1",
+        "4k3/8/8/8/8/8/8/K3K3 w - - 0 1",
+        "8/8/8/8/8/8/8/8 w - - 0 1",
+    };
+    for (const char* bad : king_faults) {
+        ChessGame k;
+        TEST_CHECK(!k.set_fen(bad), "king-less/multi-king FEN must be rejected pre-parse");
+        TEST_CHECK(k.get_hash() == ChessGame().get_hash(), "rejected FEN must not mutate state");
+    }
+
+    // ------------------------------------------------------------------
+    // CR-03: negative, malformed, or out-of-range counters are rejected;
+    // representable boundaries are accepted.
+    // ------------------------------------------------------------------
+    const char* bad_counters[] = {
+        "4k3/8/8/8/8/8/8/4K3 w - - -5 1",
+        "4k3/8/8/8/8/8/8/4K3 b - - 0 -3",
+        "4k3/8/8/8/8/8/8/4K3 w - - 256 1",
+        "4k3/8/8/8/8/8/8/4K3 w - - 0 32769",
+        "4k3/8/8/8/8/8/8/4K3 w - - 1x 1",
+        "4k3/8/8/8/8/8/8/4K3 w - - x1 1",
+        "4k3/8/8/8/8/8/8/4K3 w - - +5 1",
+        "4k3/8/8/8/8/8/8/4K3 w - -  1",  // empty halfmove field (double space)
+    };
+    TEST_CHECK(g.set_fen("4k3/8/8/8/8/8/8/4K3 w - - 0 1"), "clean FEN loads");
+    const std::string counter_pre_fen = g.get_fen();
+    for (const char* bad : bad_counters) {
+        TEST_CHECK(!g.set_fen(bad), "invalid counter must be rejected");
+        TEST_CHECK(g.get_fen() == counter_pre_fen, "rejected counter must not mutate state");
+    }
+    TEST_CHECK(g.set_fen("4k3/8/8/8/8/8/8/4K3 w - - 0 1"), "halfmove 0 accepted");
+    TEST_CHECK(g.set_fen("4k3/8/8/8/8/8/8/4K3 w - - 255 32768"), "counter upper bounds accepted");
+    TEST_CHECK(g.half_move_clock() == 255 && g.full_move_number() == 32768,
+               "boundary counters stored exactly");
+
+    // ------------------------------------------------------------------
+    // CR-04: insufficient material must classify the multi-bishop dead
+    // positions correctly without false positives on playable material.
+    // ------------------------------------------------------------------
+    const struct {
+        const char* fen;
+        bool insufficient;
+    } material_cases[] = {
+        {"8/8/8/4k3/2b5/8/8/4KB1B w - - 0 1", true},   // audit repro: K+2 light B vs K+light B
+        {"8/8/8/4k3/8/8/8/4KB1B w - - 0 1", true},     // K+2 light bishops vs K
+        {"8/8/8/4k3/2b5/8/8/4KB2 w - - 0 1", true},    // KB vs KB same color
+        {"8/8/8/4k3/2b5/8/8/4K1B1 w - - 0 1", false},  // KB vs KB opposite color
+        {"8/8/8/4k3/2n5/8/8/4K1N1 w - - 0 1", false},  // KN vs KN (selfmate material)
+        {"8/8/8/4k3/8/8/8/4KN2 w - - 0 1", true},      // KN vs K
+        {"8/8/8/4k3/8/8/8/4KNN1 w - - 0 1", false},    // true KNN vs K (helpmate exists)
+        {"8/8/8/4k3/2n5/8/8/4KB1B w - - 0 1", false},  // KBB vs KN (knight can selfmate)
+        {"8/8/8/4k3/8/8/8/4KBB1 w - - 0 1", false},    // opposite-colored bishop pair
+        {"8/8/8/4k3/2q5/8/8/4K1N1 w - - 0 1", false},  // KN vs KQ
+        {"8/8/8/4k3/2r5/8/8/4K1N1 w - - 0 1", false},  // KN vs KR
+        {"8/8/8/4k3/8/8/4P3/4K3 w - - 0 1", false},    // KP vs K
+        {"8/8/8/4k3/8/8/8/4KR2 w - - 0 1", false},     // KR vs K
+        {"8/8/8/4k3/8/8/8/4KBN1 w - - 0 1", false},    // KBN vs K
+        {"8/8/8/4k3/8/8/8/4K3 w - - 0 1", true},       // K vs K
+    };
+    for (const auto& mc : material_cases) {
+        ChessGame m(mc.fen);
+        TEST_CHECK(m.is_insufficient_material() == mc.insufficient,
+                   mc.fen);
+    }
+    std::cout << "[PASS] test_chess_rules_remediation\n";
+}
+
 int main() {
     test_stub();
     test_board_basics();
@@ -836,6 +994,7 @@ int main() {
     test_apply_action_illegal_raises();
     test_abort_fn_stops_search();
     test_mcts_config_validation();
+    test_chess_rules_remediation();
     std::cout << "\nAll C++ tests passed successfully.\n";
     return 0;
 }
