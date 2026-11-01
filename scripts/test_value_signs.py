@@ -1,15 +1,22 @@
-"""Test value head sign and perspective across 20 canonical positions.
+"""Optional diagnostic: value-head sign and perspective across 20 positions.
 
-Verifies:
-1. When side to move is winning (White or Black), is predicted root value > 0?
-2. When side to move is losing (White or Black), is predicted root value < 0?
-3. When position is equal/drawn, is predicted root value near 0?
-4. Are board flips, hash keys, and side-to-move perspectives consistent?
-"""
+This is a DIAGNOSTIC (not part of pytest discovery).  The mandatory,
+assertion-bearing regression coverage for prediction semantics lives in
+``tests/test_model_prediction_semantics.py`` (audit I-1): WDL class ordering,
+side-to-move perspective, single-softmax chains, and the canonical scalar
+conversion are pinned there with controlled deterministic models and
+skip-if-absent real-checkpoint checks.
+
+What this script adds: a broader 20-position material/quality sweep on the
+current default checkpoint, exiting non-zero when the sign accuracy is below
+the expected bar, so CI/operator runs cannot mistake a mis-signed value head
+for success.  (A checkpoint can be semantically consistent and still weakly
+calibrated — the designated 2026-10-31 baseline is; see audit I-5.)"""
 
 import os
 import sys
 from pathlib import Path
+
 import numpy as np
 import torch
 
@@ -74,17 +81,25 @@ TEST_POSITIONS = [
     ),
     ("07 White up Rook (White to move, winning)", "1k6/8/8/8/8/8/4R3/4K3 w - - 0 1", "+"),
     ("08 White up Rook (Black to move, losing)", "1k6/8/8/8/8/8/4R3/4K3 b - - 0 1", "-"),
-    ("09 Black up Rook (Black to move, winning)", "1k6/4r3/8/8/8/8/8/4K3 b - - 0 1", "+"),
-    ("10 Black up Rook (White to move, losing)", "1k6/4r3/8/8/8/8/8/4K3 w - - 0 1", "-"),
+    # Rook on a7 (not attacking the white king on e1) so the side NOT to
+    # move is never in check — the previous e7-rook FENs made 'white in
+    # check, black to move', rule-illegal and rejected by the C-1 FEN
+    # hardening, which is why this script must construct only legal
+    # positions.
+    ("09 Black up Rook (Black to move, winning)", "1k6/r7/8/8/8/8/8/4K3 b - - 0 1", "+"),
+    ("10 Black up Rook (White to move, losing)", "1k6/r7/8/8/8/8/8/4K3 w - - 0 1", "-"),
     (
         "11 White Queen+King vs King (White to move, winning)",
         "1k6/8/8/8/8/8/4Q3/4K3 w - - 0 1",
         "+",
     ),
     ("12 White Queen+King vs King (Black to move, losing)", "1k6/8/8/8/8/8/4Q3/4K3 b - - 0 1", "-"),
+    # Queen on a7 (not attacking e1) so the side NOT to move is not in check
+    # (the e7-queen '...b' FEN was rule-illegal: white in check, black to
+    # move — rejected by the C-1 FEN hardening).
     (
         "13 Black Queen+King vs King (Black to move, winning)",
-        "1k6/4q3/8/8/8/8/8/4K3 b - - 0 1",
+        "1k6/q7/8/8/8/8/8/4K3 b - - 0 1",
         "+",
     ),
     ("14 Black Queen+King vs King (White to move, losing)", "1k6/4q3/8/8/8/8/8/4K3 w - - 0 1", "-"),
@@ -179,7 +194,52 @@ def evaluate_checkpoint(ckpt_path: str, device: str = "cuda"):
 
 
 if __name__ == "__main__":
-    dev = "cuda" if torch.cuda.is_available() else "cpu"
-    evaluate_checkpoint("models/checkpoints_scaled/best_model.pt", dev)
-    if Path("models/checkpoints_rl/phase4_final_checkpoint.pt").exists():
-        evaluate_checkpoint("models/checkpoints_rl/phase4_final_checkpoint.pt", dev)
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Value-head sign diagnostic (optional; pytest coverage is in "
+        "tests/test_model_prediction_semantics.py)"
+    )
+    parser.add_argument(
+        "--checkpoint",
+        "-c",
+        default=None,
+        help="Checkpoint to probe (default: the registry-designated default).",
+    )
+    parser.add_argument("--device", default=None, help="cpu or cuda (default: auto)")
+    parser.add_argument(
+        "--min-accuracy",
+        type=float,
+        default=0.75,
+        help="Minimum sign accuracy for exit code 0 (default: 0.75). A weakly "
+        "calibrated but semantically correct checkpoint may legitimately fail "
+        "this quality bar (audit I-5) — lower it consciously, do not ignore it.",
+    )
+    args = parser.parse_args()
+
+    dev = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    if args.checkpoint:
+        ckpt_path = args.checkpoint
+    else:
+        from python.model.checkpoint_registry import (
+            DefaultCheckpointError,
+            resolve_default_checkpoint,
+        )
+
+        try:
+            ckpt_path = str(resolve_default_checkpoint(repo_root=_repo_root).path)
+        except DefaultCheckpointError as e:
+            print("No designated default checkpoint is available.\n")
+            print(e)
+            raise SystemExit(2)
+
+    results = evaluate_checkpoint(ckpt_path, dev)
+    total = len(results)
+    correct = sum(1 for r in results if r["pass"])
+    accuracy = (correct / total) if total else 0.0
+    ok = accuracy >= args.min_accuracy
+    print(
+        f"RESULT: {correct}/{total} ({accuracy:.1%}) sign accuracy; "
+        f"threshold {args.min_accuracy:.0%} -> {'PASS' if ok else 'FAIL'}"
+    )
+    raise SystemExit(0 if ok else 1)

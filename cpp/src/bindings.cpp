@@ -2,6 +2,7 @@
 #include <pybind11/stl.h>
 #include <pybind11/numpy.h>
 #include <pybind11/functional.h>
+#include <cmath>
 #include <cstring>
 #include <stdexcept>
 #include "zeropawn/stub.h"
@@ -332,22 +333,31 @@ PYBIND11_MODULE(zeropawn_cpp, m) {
                     auto py_policy = tuple[0].cast<py::array_t<float, py::array::c_style>>();
                     auto py_vals = tuple[1].cast<py::array_t<float, py::array::c_style>>();
 
-                    // Exact-shape validation (remediation F-12): the previous
-                    // implementation min-clamped short outputs and zero-filled
-                    // the remainder, silently corrupting priors/values. Malformed
-                    // evaluator output must fail loudly, mirroring the exact
-                    // validation of the `search` binding.
-                    if (static_cast<size_t>(py_policy.size()) !=
-                        static_cast<size_t>(n) * static_cast<size_t>(num_actions)) {
+                    // Exact shape validation (remediation F-12 for element counts,
+                    // strengthened for audit L-1): the original implementation
+                    // min-clamped short outputs and zero-filled the remainder,
+                    // silently corrupting priors/values.  Element-count equality
+                    // alone still accepted transposed / extra-dimension arrays
+                    // that satisfy size but violate the (n, num_actions) row-major
+                    // contract, so rank and each dimension are checked exactly.
+                    auto shape_str = [](const py::array_t<float>& a) {
+                        std::string s = "(";
+                        for (py::ssize_t d = 0; d < a.ndim(); ++d) {
+                            s += std::to_string(a.shape(d));
+                            if (d + 1 < a.ndim()) s += ", ";
+                        }
+                        return s + ")";
+                    };
+                    if (py_policy.ndim() != 2 || py_policy.shape(0) != n ||
+                        py_policy.shape(1) != num_actions) {
                         throw std::runtime_error(
                             "batch_evaluator policy shape must be (" + std::to_string(n) + ", " +
-                            std::to_string(num_actions) + "); got " +
-                            std::to_string(py_policy.size()) + " floats");
+                            std::to_string(num_actions) + "); got " + shape_str(py_policy));
                     }
-                    if (static_cast<size_t>(py_vals.size()) != static_cast<size_t>(n)) {
+                    if (py_vals.ndim() != 1 || py_vals.shape(0) != n) {
                         throw std::runtime_error(
                             "batch_evaluator values shape must be (" + std::to_string(n) +
-                            "); got " + std::to_string(py_vals.size()) + " floats");
+                            "); got " + shape_str(py_vals));
                     }
 
                     std::vector<float> policy(static_cast<size_t>(n) * static_cast<size_t>(num_actions));
@@ -355,6 +365,27 @@ PYBIND11_MODULE(zeropawn_cpp, m) {
 
                     std::vector<float> values(static_cast<size_t>(n), 0.0f);
                     std::memcpy(values.data(), py_vals.data(), values.size() * sizeof(float));
+
+                    // Numeric validity (audit L-1): a NaN prior vector silently
+                    // falls through the prior-mask renormalization to the uniform
+                    // fallback (NaN comparisons are false), and an Inf value
+                    // propagates into SearchResult.root_value — both corrupt
+                    // search output without any exception.  Reject non-finite
+                    // evaluator output explicitly.
+                    for (size_t i = 0; i < policy.size(); ++i) {
+                        if (!std::isfinite(policy[i])) {
+                            throw std::runtime_error(
+                                "batch_evaluator policy contains a non-finite value "
+                                "(NaN/Inf) at flat index " + std::to_string(i));
+                        }
+                    }
+                    for (size_t i = 0; i < values.size(); ++i) {
+                        if (!std::isfinite(values[i])) {
+                            throw std::runtime_error(
+                                "batch_evaluator values contain a non-finite value "
+                                "(NaN/Inf) at index " + std::to_string(i));
+                        }
+                    }
 
                     return {std::move(policy), std::move(values)};
                 };

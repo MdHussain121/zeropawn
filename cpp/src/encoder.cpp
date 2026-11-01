@@ -43,7 +43,12 @@ void encode_state(const ChessGame& game, float* out) {
     if (opp_ks) std::fill_n(&out[14 * 64], 64, 1.0f);
     if (opp_qs) std::fill_n(&out[15 * 64], 64, 1.0f);
 
-    // Plane 16: En passant square
+    // Plane 16: En passant square. Written only when the ep capture is
+    // actually legal: the chess library normalizes obsolete ep fields on
+    // move application (after 1.e4 the FEN keeps "e3" but this plane stays
+    // empty). Do NOT assume raw-FEN ep semantics here; train and serve agree
+    // because every path uses this encoder. See docs/model_io_contract.md
+    // (audit I-2) and the ep-plane coverage in tests/test_encoder.py.
     auto ep = board.enpassantSq();
     if (ep != chess::Square::NO_SQ && ep.is_valid()) {
         int sq = ep.index();

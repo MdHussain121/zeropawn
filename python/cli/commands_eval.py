@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 
+from python.cli.common import print_error
 from python.cli.models import get_default_model_path
 from python.cli.runner import execute_script_with_monitoring
+from python.model.checkpoint_registry import DefaultCheckpointError
 
 
 def register_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -79,9 +81,11 @@ def register_parser(subparsers: argparse._SubParsersAction) -> None:
 
 
 def run_baseline(args: argparse.Namespace) -> int:
-    ckpt = args.checkpoint or str(
-        get_default_model_path() or "models/checkpoints_scaled/best_model.pt"
-    )
+    try:
+        ckpt = args.checkpoint or str(get_default_model_path())
+    except DefaultCheckpointError as e:
+        print_error(str(e))
+        return 1
     openings = (
         max(1, args.games // 2) if getattr(args, "games", None) is not None else args.openings
     )
@@ -120,9 +124,11 @@ def run_all_baseline(args: argparse.Namespace) -> int:
 
 
 def run_heldout(args: argparse.Namespace) -> int:
-    ckpt = args.checkpoint or str(
-        get_default_model_path() or "models/checkpoints_scaled/best_model.pt"
-    )
+    try:
+        ckpt = args.checkpoint or str(get_default_model_path())
+    except DefaultCheckpointError as e:
+        print_error(str(e))
+        return 1
     cmd_args = [
         "--checkpoint",
         ckpt,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -14,10 +15,17 @@ from rich.table import Table
 from python.cli.common import REPO_ROOT
 from python.cli.ui import COLOR_BORDER, console
 
+logger = logging.getLogger(__name__)
+
 
 def get_checkpoint_directories() -> List[Path]:
-    """Return all standard model and checkpoint search locations."""
+    """Return all standard model and checkpoint search locations.
+
+    Listing only (``models``/``status`` commands and interactive selection).  The
+    default model is resolved through the registry, not by scanning these.
+    """
     dirs = [
+        REPO_ROOT / "models" / "checkpoints_baseline_20261031",
         REPO_ROOT / "models" / "checkpoints_scaled",
         REPO_ROOT / "models" / "checkpoints_supervised",
         REPO_ROOT / "models" / "checkpoints_rl",
@@ -94,26 +102,36 @@ def discover_checkpoints() -> List[Dict[str, Any]]:
     return checkpoints
 
 
-def get_default_model_path() -> Optional[Path]:
-    """Get the primary default model checkpoint path if available.
+def get_default_model_path() -> Path:
+    """Get the authoritative default model checkpoint path.
 
-    Prefers fine-tuned model (strongest) over scaled baseline.
+    Delegates to the single canonical resolver
+    (:func:`python.model.checkpoint_registry.resolve_default_checkpoint`) —
+    the same policy every other CLI family uses (audit M-2: this function
+    previously kept its own candidate list that could disagree with
+    ``common.get_default_checkpoint_path``).
+
+    Raises:
+        DefaultCheckpointError: when no designated, verified checkpoint is
+            available or the designated artifact fails validation.
     """
-    preferred = [
-        REPO_ROOT / "models" / "checkpoints_finetune" / "best_model.pt",
-        REPO_ROOT / "models" / "checkpoints_scaled" / "best_model.pt",
-        REPO_ROOT / "models" / "checkpoints_rl" / "best_model.pt",
-        REPO_ROOT / "models" / "checkpoints" / "best_model.pt",
-        REPO_ROOT / "models" / "best_model.pt",
-    ]
-    for p in preferred:
-        if p.is_file():
-            return p
+    from python.model.checkpoint_registry import resolve_default_checkpoint
 
-    ckpts = discover_checkpoints()
-    if ckpts:
-        return ckpts[0]["path"]
-    return None
+    return resolve_default_checkpoint(repo_root=REPO_ROOT).path
+
+
+def try_get_default_model_path() -> Optional[Path]:
+    """Quiet variant of :func:`get_default_model_path` for display contexts.
+
+    Returns ``None`` (and logs why) instead of raising when no trustworthy
+    default exists — for menus/status lines that must keep working without a
+    model.  Load paths must use :func:`get_default_model_path`.
+    """
+    try:
+        return get_default_model_path()
+    except Exception as e:  # DefaultCheckpointError (and registry IO)
+        logger.debug("No resolvable default model: %s", e)
+        return None
 
 
 def validate_checkpoint_file(path: Union[str, Path]) -> Tuple[bool, str]:

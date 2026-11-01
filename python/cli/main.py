@@ -45,7 +45,7 @@ from python.cli.common import (
     wait_for_enter,
 )
 from python.cli.output_context import OutputMode, set_output_mode
-from python.cli.models import get_default_model_path, select_model_interactive
+from python.cli.models import select_model_interactive, try_get_default_model_path
 from python.cli.operations import (
     CATEGORIES,
     OperationDef,
@@ -699,7 +699,9 @@ def run_category_menu(category_id: int, active_model: Optional[Path]) -> None:
 
 def run_interactive_menu() -> int:
     """Rich-powered Interactive Control Center for ZeroPawn."""
-    active_model: Optional[Path] = get_default_model_path()
+    # Quiet lookup: the menu must render even when no designated default
+    # exists; load paths surface the full diagnostic instead.
+    active_model: Optional[Path] = try_get_default_model_path()
 
     while True:
         try:

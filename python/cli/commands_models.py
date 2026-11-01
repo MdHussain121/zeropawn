@@ -18,6 +18,7 @@ from python.cli.models import (
     inspect_model,
 )
 from python.cli.ui import COLOR_BORDER, console
+from python.model.checkpoint_registry import DefaultCheckpointError
 
 
 def register_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -171,11 +172,12 @@ def run_models_list(args: argparse.Namespace) -> int:
 
 
 def run_models_inspect(args: argparse.Namespace) -> int:
-    ckpt_path = (
-        getattr(args, "checkpoint_flag", None) or args.checkpoint or get_default_model_path()
-    )
-    if not ckpt_path:
-        console.print("[bold red]No model specified and no default checkpoint found.[/bold red]")
+    try:
+        ckpt_path = (
+            getattr(args, "checkpoint_flag", None) or args.checkpoint or get_default_model_path()
+        )
+    except DefaultCheckpointError as e:
+        console.print(f"[bold red]{e}[/bold red]")
         return 1
     return inspect_model(ckpt_path)
 
@@ -185,7 +187,11 @@ def run_models_compare(args: argparse.Namespace) -> int:
 
 
 def run_models_validate(args: argparse.Namespace) -> int:
-    ckpt_path = args.checkpoint or get_default_model_path()
+    try:
+        ckpt_path = args.checkpoint or get_default_model_path()
+    except DefaultCheckpointError as e:
+        console.print(f"[bold red]{e}[/bold red]")
+        return 1
     p = Path(ckpt_path) if Path(ckpt_path).is_absolute() else (REPO_ROOT / ckpt_path)
     if not p.is_file():
         console.print(f"[bold red]Checkpoint file not found: {ckpt_path}[/bold red]")
@@ -307,11 +313,11 @@ def run_models_export(args: argparse.Namespace) -> int:
 
 
 def run_models_check_compat(args: argparse.Namespace) -> int:
-    ckpt_target = (
-        args.checkpoint
-        or get_default_checkpoint_path()
-        or "models/checkpoints_scaled/best_model.pt"
-    )
+    try:
+        ckpt_target = args.checkpoint or get_default_checkpoint_path()
+    except DefaultCheckpointError as e:
+        console.print(f"[bold red]{e}[/bold red]")
+        return 1
     ckpt_p = Path(ckpt_target) if Path(ckpt_target).is_absolute() else (REPO_ROOT / ckpt_target)
     if not ckpt_p.is_file():
         console.print(f"[bold red]Checkpoint file not found: {ckpt_p}[/bold red]")

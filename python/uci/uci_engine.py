@@ -22,6 +22,7 @@ from python.cli.common import (
     resolve_device,
     setup_environment,
 )
+from python.model.checkpoint_registry import DefaultCheckpointError
 from python.model.chess_net import ChessNet
 from python.uci.time_management import SearchTimeManager, ThroughputKey, allocate_clock_ms
 
@@ -53,7 +54,25 @@ class UCIEngine:
 
         self.zeropawn_cpp = zeropawn_cpp
         self.device = resolve_device(device)
-        self.checkpoint_path = checkpoint_path or get_default_checkpoint_path()
+        if checkpoint_path:
+            # "" is the explicit "no model" signal; any non-empty path is the
+            # operator's explicit choice (provenance warnings are emitted by
+            # load_engine_model).  None means "use the designated default".
+            self.checkpoint_path = checkpoint_path
+        else:
+            try:
+                self.checkpoint_path = get_default_checkpoint_path()
+            except DefaultCheckpointError as e:
+                # UCI stays usable in protocol/introspection mode without a
+                # model (uniform-policy evaluator), but the reason must be
+                # visible in the log — never a silent weak-checkpoint swap.
+                logger.warning(
+                    "No default checkpoint available; UCI engine starts WITHOUT a "
+                    "model (uniform-policy evaluator). Pass an explicit checkpoint "
+                    "path or restore/designate the registry default. Detail: %s",
+                    e,
+                )
+                self.checkpoint_path = None
         self.default_sims = default_sims
         self.c_puct = c_puct
         self.fpu_reduction = fpu_reduction

@@ -1,4 +1,4 @@
-"""Checkpoint provenance registry and warm-start validation.
+"""Checkpoint provenance registry, default resolution, and warm-start validation.
 
 Established 2026-10-26 after the search-quality audit (findings F-11/F-12):
 three mutually inconsistent hash/step records existed for the "same"
@@ -17,6 +17,13 @@ Rules enforced here:
    must explicitly pass ``allow_unverified=True`` (logged as an override).
    Missing, invalid, or undesignated warm starts are rejected — the launcher
    must never silently fall back to whichever checkpoint is easiest to load.
+4. Default inference resolution (:func:`resolve_default_checkpoint`) follows
+   the same fail-closed contract (added 2026-10-31, audit M-2): the single
+   authoritative default is the registry-designated, verified artifact,
+   hash-checked against the registry at resolution time.  When none is
+   available, resolution raises :class:`DefaultCheckpointError` with the exact
+   expected artifact and a recovery path.  It never falls back to "newest
+   file on disk" — a checkpoint that merely exists (or loads) is not eligible.
 
 Registry file: ``docs/checkpoint_registry.json`` (tracked in the repository;
 ``models/`` itself is gitignored, so the registry must not live there).
@@ -42,6 +49,16 @@ EXPECTED_ARCHITECTURE = {"num_blocks": 12, "num_filters": 128}
 
 class WarmStartValidationError(RuntimeError):
     """Raised when an RL warm-start checkpoint cannot be trusted."""
+
+
+class DefaultCheckpointError(RuntimeError):
+    """Raised when no trustworthy default checkpoint can be resolved.
+
+    The message is operator-facing and actionable: it names the expected
+    artifact(s), why each candidate is ineligible, and the supported recovery
+    actions.  Callers must surface it (CLI: print + exit 1) rather than
+    substituting any checkpoint of convenience.
+    """
 
 
 @dataclass
@@ -242,3 +259,278 @@ def validate_warm_start(
         "model_version": info.model_version,
         "best_val_loss": info.best_val_loss,
     }
+
+
+# ---------------------------------------------------------------------------
+# Default inference checkpoint resolution (audit M-2, 2026-10-31)
+#
+# Single authoritative resolver for every CLI/inference consumer.  The old
+# world had two resolvers (python/cli/common.get_default_checkpoint_path and
+# python/cli/models.get_default_model_path) with different candidate lists
+# that could disagree, and both silently fell through to "newest .pt on disk"
+# — which, after the certified artifacts went missing, meant every command
+# quietly evaluated the disqualified weak scaled checkpoint.  The registry
+# (docs/checkpoint_registry.json) is the source of truth; eligibility is
+# status=="verified" AND designated_warm_start==true; the artifact's SHA-256
+# is re-verified against the registry before it may be used.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class DefaultCheckpointResolution:
+    """The outcome of :func:`resolve_default_checkpoint`."""
+
+    path: Path
+    sha256: str
+    entry_id: str
+    role: Optional[str] = None
+    step: Optional[int] = None
+    designated: bool = True
+
+    @property
+    def sha256_16(self) -> str:
+        return self.sha256[:16]
+
+
+def _entry_status_line(entry: Dict[str, Any]) -> str:
+    status = entry.get("status")
+    designated = "designated" if entry.get("designated_warm_start") else "not designated"
+    reason = ""
+    if status == "disqualified":
+        dq = entry.get("disqualification") or {}
+        reason = f" — disqualified: {dq.get('reason', 'undocumented')}"
+    line = f"  - {entry.get('id', '<no id>')} [{status}, {designated}] {entry.get('path')}{reason}"
+    return line
+
+
+def _default_entry_path(entry: Dict[str, Any], repo_root: Path, models_root: Optional[Path]) -> Path:
+    rel = Path(str(entry.get("path", "")))
+    if models_root is not None and rel.parts and rel.parts[0] == "models":
+        return Path(models_root) / Path(*rel.parts[1:])
+    return repo_root / rel
+
+
+def _explain_registry(registry: Optional[Dict[str, Any]], registry_path: Path) -> str:
+    if registry is None:
+        return f"  (registry file not found: {registry_path})"
+    lines = [_entry_status_line(e) for e in registry.get("checkpoints", [])]
+    return "\n".join(lines) if lines else "  (registry contains no checkpoint entries)"
+
+
+def _recovery_hint(repo_root: Path) -> str:
+    return (
+        "Recovery:\n"
+        "  1. Restore or re-acquire the designated artifact at the exact path above, or\n"
+        "  2. Designate a verified checkpoint in docs/checkpoint_registry.json "
+        "(procedure in its 'designation_procedure' field) and re-verify with "
+        "scripts/validate_checkpoints.py, or\n"
+        "  3. Pass an explicit checkpoint path (e.g. --checkpoint <file.pt>).\n"
+        "Refusing to fall back to an arbitrary or unqualified checkpoint."
+    )
+
+
+def resolve_default_checkpoint(
+    repo_root: str | Path = ".",
+    models_root: Optional[str | Path] = None,
+    verify_hash: bool = True,
+) -> DefaultCheckpointResolution:
+    """Resolve the single authoritative default checkpoint (fail-closed).
+
+    Policy: exactly one policy for every consumer.  The default is the
+    registry entry with ``status == "verified"`` and
+    ``designated_warm_start == true`` whose file exists on disk and whose
+    SHA-256 matches the registry record.  If several entries are designated
+    (a curation smell — a warning is logged), the one with the highest
+    registry id wins (ids are assigned in designation order, so this is
+    deterministic and documented).
+
+    Raises:
+        DefaultCheckpointError: when no such artifact exists, or the
+            designated artifact is missing/hash-mismatched.  The message
+            lists the expected artifact, the ineligibility reasons of every
+            registry candidate, and recovery actions.
+    """
+    repo_root = Path(repo_root)
+    models_root_p = Path(models_root) if models_root is not None else None
+    registry_path = repo_root / REGISTRY_REL_PATH
+
+    try:
+        registry = load_registry(repo_root)
+    except FileNotFoundError as e:
+        raise DefaultCheckpointError(
+            "No checkpoint registry found; cannot resolve a trustworthy default "
+            f"checkpoint ({e})\n"
+            f"Registry path expected: {registry_path}\n"
+            + _recovery_hint(repo_root)
+        ) from e
+
+    entries = list(registry.get("checkpoints", []))
+    eligible = [
+        e
+        for e in entries
+        if e.get("status") == "verified"
+        and e.get("designated_warm_start")
+        and e.get("sha256")
+    ]
+    designated_but_shapeless = [
+        e
+        for e in entries
+        if e.get("status") == "verified"
+        and e.get("designated_warm_start")
+        and not e.get("sha256")
+    ]
+
+    if not eligible:
+        detail = ""
+        if designated_but_shapeless:
+            detail = (
+                "\nA designated entry exists but records no SHA-256 "
+                "(never verified from disk): "
+                + ", ".join(str(e.get("id")) for e in designated_but_shapeless)
+            )
+        raise DefaultCheckpointError(
+            "No designated, verified default checkpoint is available.\n"
+            f"Registry: {registry_path}\n"
+            f"Registry contents:\n{_explain_registry(registry, registry_path)}"
+            f"{detail}\n"
+            + _recovery_hint(repo_root)
+        )
+
+    eligible.sort(key=lambda e: str(e.get("id", "")), reverse=True)
+    if len(eligible) > 1:
+        logger.warning(
+            "Multiple designated checkpoints in the registry (%s); selecting %s "
+            "(highest registry id — deterministic rule). Consider undesignating "
+            "the others.",
+            ", ".join(str(e.get("id")) for e in eligible),
+            eligible[0].get("id"),
+        )
+    entry = eligible[0]
+    path = _default_entry_path(entry, repo_root, models_root_p)
+
+    if not path.is_file():
+        raise DefaultCheckpointError(
+            "The designated default checkpoint is recorded in the registry but "
+            f"the file is MISSING on disk.\n"
+            f"  Expected artifact: {path}\n"
+            f"  Registry entry:    {entry.get('id')} (status=verified, designated)\n"
+            f"  Registry path:     {registry_path}\n"
+            + _recovery_hint(repo_root)
+        )
+
+    size_bytes = entry.get("size_bytes")
+    if size_bytes is not None:
+        actual_size = path.stat().st_size
+        if actual_size != int(size_bytes):
+            raise DefaultCheckpointError(
+                "The designated default checkpoint does not match its registry "
+                "size (modified or replaced after verification).\n"
+                f"  Artifact:        {path}\n"
+                f"  Size on disk:    {actual_size}\n"
+                f"  Registry size:   {size_bytes}\n"
+                f"  Registry entry:  {entry.get('id')}\n"
+                + _recovery_hint(repo_root)
+            )
+
+    sha256 = str(entry.get("sha256"))
+    if verify_hash:
+        actual_sha = compute_sha256(path)
+        if actual_sha != sha256:
+            raise DefaultCheckpointError(
+                "The designated default checkpoint does not match its registry "
+                "SHA-256 (modified or replaced after verification).\n"
+                f"  Artifact:        {path}\n"
+                f"  SHA-256 on disk: {actual_sha}\n"
+                f"  Registry SHA-256:{sha256}\n"
+                f"  Registry entry:  {entry.get('id')}\n"
+                + _recovery_hint(repo_root)
+            )
+
+    resolution = DefaultCheckpointResolution(
+        path=path,
+        sha256=sha256,
+        entry_id=str(entry.get("id")),
+        role=entry.get("role"),
+        step=entry.get("step"),
+        designated=True,
+    )
+    logger.info(
+        "Default checkpoint resolved via registry: %s (entry %s, sha256 %s..., step %s)",
+        resolution.path,
+        resolution.entry_id,
+        resolution.sha256_16,
+        resolution.step,
+    )
+    return resolution
+
+
+def explicit_checkpoint_warnings(
+    path: str | Path,
+    repo_root: str | Path = ".",
+    verify_hash: bool = True,
+) -> Optional[str]:
+    """Provenance warnings for an operator-supplied checkpoint path.
+
+    Explicit paths are honored (the operator's choice is not silent), but the
+    provenance is surfaced: disqualified/quarantined registry entries and
+    unregistered files produce a loud warning string; a registered path whose
+    file no longer matches the recorded hash warns about the mismatch.
+    Returns ``None`` when the checkpoint is a verified registry artifact.
+    """
+    repo_root = Path(repo_root)
+    p = Path(path)
+    if not p.is_absolute():
+        candidate = repo_root / p
+        p = candidate if candidate.is_file() else p
+
+    try:
+        registry = load_registry(repo_root)
+    except FileNotFoundError:
+        return (
+            f"Checkpoint {p} is being used without a checkpoint registry "
+            f"({repo_root / REGISTRY_REL_PATH} not found); provenance unverified."
+        )
+
+    entry = None
+    for rec in registry.get("checkpoints", []):
+        rec_path = _default_entry_path(rec, repo_root, None)
+        try:
+            same = rec_path.resolve() == p.resolve()
+        except OSError:  # pragma: no cover - defensive
+            same = False
+        if same:
+            entry = rec
+            break
+
+    if entry is None:
+        return (
+            f"Checkpoint {p} is not in the checkpoint registry "
+            "(unverified provenance — acceptable for explicit/experimental use, "
+            "but it is not an approved default)."
+        )
+
+    status = entry.get("status")
+    if status == "disqualified":
+        dq = entry.get("disqualification") or {}
+        return (
+            f"Checkpoint {p} is DISQUALIFIED in the registry "
+            f"({dq.get('reason', 'undocumented')}): {dq.get('detail', '')} "
+            "This artifact must not be used as a default or warm start."
+        )
+    if status != "verified":
+        return (
+            f"Checkpoint {p} is registered with status {status!r} "
+            "(not verified); treat its results as unverified provenance."
+        )
+
+    sha256 = entry.get("sha256")
+    if verify_hash and sha256:
+        actual = compute_sha256(p)
+        if actual != sha256:
+            return (
+                f"Checkpoint {p} does not match its registry SHA-256 "
+                f"(on disk {actual[:16]}..., registry {str(sha256)[:16]}...); "
+                "the file was modified or replaced after verification — "
+                "results from it are not covered by the registry record."
+            )
+    return None

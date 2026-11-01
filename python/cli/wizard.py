@@ -11,7 +11,7 @@ from rich.panel import Panel
 from rich.prompt import FloatPrompt, IntPrompt, Prompt
 from rich.table import Table
 
-from python.cli.models import get_default_model_path, select_model_interactive
+from python.cli.models import select_model_interactive, try_get_default_model_path
 from python.cli.operations import OpArgument, OperationDef
 from python.cli.presets import save_preset
 from python.cli.ui import COLOR_BORDER, console
@@ -47,7 +47,9 @@ def run_configuration_wizard(
     if selected_model is None and op.id in _WIZARD_SELECTED_MODELS:
         selected_model = _WIZARD_SELECTED_MODELS[op.id]
     if op.requires_model in ("required", "optional") and selected_model is None:
-        selected_model = get_default_model_path()
+        # Quiet lookup: the wizard keeps working without a designated model
+        # (the operator picks one explicitly in the model-selection step).
+        selected_model = try_get_default_model_path()
 
     while True:
         console.clear()

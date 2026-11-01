@@ -118,8 +118,20 @@ class ChessNet(nn.Module):
         """Count trainable parameters."""
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
+    @staticmethod
+    def wdl_logits_to_value(wdl_logits: torch.Tensor) -> torch.Tensor:
+        """Canonical WDL logits -> scalar value: ``P(win) - P(loss)``.
+
+        WDL class order is ``[win, draw, loss]`` relative to the side to move,
+        so the result is a side-to-move-relative value in [-1, 1].  This is
+        the single softmax of the consumption chain — callers must not apply
+        another one.  All production consumers (UCI, match, puzzles, CLI,
+        self-play aggregator) compute this same quantity from probabilities.
+        """
+        probs = F.softmax(wdl_logits, dim=-1)
+        return probs[..., 0] - probs[..., 2]
+
     def predict_value(self, x: torch.Tensor) -> torch.Tensor:
         """Compute scalar search value = P(win) - P(loss) from WDL logits."""
         _, wdl_logits = self.forward(x)
-        probs = F.softmax(wdl_logits, dim=-1)
-        return probs[:, 0] - probs[:, 2]
+        return self.wdl_logits_to_value(wdl_logits)

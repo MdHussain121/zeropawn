@@ -101,11 +101,20 @@ def test_model_discovery():
 
 
 def test_default_model_path():
-    """Verify default model resolver."""
-    p = get_default_model_path()
-    if p is not None:
-        assert p.is_file()
-        assert p.suffix == ".pt"
+    """Default model resolver: designated artifact or actionable failure (M-2)."""
+    from python.cli.models import try_get_default_model_path
+    from python.model.checkpoint_registry import DefaultCheckpointError
+
+    try:
+        p = get_default_model_path()
+    except DefaultCheckpointError as e:
+        assert "Recovery:" in str(e)
+        # Display contexts get the quiet variant instead of an exception.
+        assert try_get_default_model_path() is None
+        return
+    assert p.is_file()
+    assert p.suffix == ".pt"
+    assert try_get_default_model_path() == p
 
 
 def test_validate_checkpoint_file(tmp_path):

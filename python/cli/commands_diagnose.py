@@ -206,7 +206,6 @@ def run_diagnose_env(args: argparse.Namespace) -> int:
 
 
 def run_diagnose_health(args: argparse.Namespace) -> int:
-    import hashlib
     import sys
     from pathlib import Path
     import psutil
@@ -244,28 +243,34 @@ def run_diagnose_health(args: argparse.Namespace) -> int:
         ("cpp_extension", "chess_cpp native module", "PASS" if ext_ok else "WARN (fallback)")
     )
 
-    # 4. Protected baseline checkpoint
-    PROTECTED_PATH = Path("models/checkpoints_scaled/best_model.pt")
-    VALID_SHAS = {
-        "54D462823837F77C60621FB72E1A1474ECA3DC9DBB2A2969D87CED18ADA2B7DF",
-        "5AC334C8DC2E36A2577473514641929EDABFDB73D9B09FF19B455C36DDC0A038",
-        "79A72EF746F4BFDA2555FE7D0EC04970BE7CCD4A39E282E16A05594ED15BC36B",
-    }
-    if PROTECTED_PATH.exists():
-        h = hashlib.sha256()
-        with open(PROTECTED_PATH, "rb") as f:
-            while chunk := f.read(1024 * 1024):
-                h.update(chunk)
-        actual_sha = h.hexdigest().upper()
-        if actual_sha in VALID_SHAS:
-            checks.append(("protected_baseline", f"{PROTECTED_PATH} SHA256 verified", "PASS"))
-        else:
-            checks.append(
-                ("protected_baseline", f"Checksum mismatch! {actual_sha[:16]}...", "FAIL")
+    # 4. Effective default checkpoint (audit M-2): the single registry-driven
+    # resolver decides what commands load.  The former check verified a
+    # hardcoded SHA list against a historical artifact that has been missing
+    # since the 2026-10-26 reconciliation — duplicate governance that could
+    # disagree with the registry.
+    try:
+        from python.cli.common import REPO_ROOT
+        from python.model.checkpoint_registry import resolve_default_checkpoint
+
+        resolved = resolve_default_checkpoint(repo_root=REPO_ROOT)
+        checks.append(
+            (
+                "default_checkpoint",
+                f"{resolved.path.name} [{resolved.entry_id}] sha256 "
+                f"{resolved.sha256_16}... (registry-designated, hash-verified)",
+                "PASS",
             )
-            overall_ok = False
-    else:
-        checks.append(("protected_baseline", f"{PROTECTED_PATH} missing", "FAIL"))
+        )
+    except Exception as e:
+        first_line = str(e).splitlines()[0] if str(e) else type(e).__name__
+        checks.append(
+            (
+                "default_checkpoint",
+                f"no designated, verified default checkpoint — {first_line[:140]} "
+                "(default-loading commands refuse until restored/designated)",
+                "FAIL",
+            )
+        )
         overall_ok = False
 
     # 5. Stockfish

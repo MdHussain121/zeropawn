@@ -28,6 +28,7 @@ from python.common.progress import (
     run_context,
     summary_block,
 )
+from python.model.checkpoint_registry import DefaultCheckpointError
 import logging
 
 logger = logging.getLogger(__name__)
@@ -1280,17 +1281,24 @@ def run_training(args: argparse.Namespace) -> int:
                 "pass a repo-relative .pt path, then see LOG",
             )
     else:
-        # Default protected supervised warm-start baseline
-        default_ckpt = get_default_checkpoint_path() or safe_resolve(
-            "models/checkpoints_scaled/best_model.pt"
-        )
+        # Default supervised warm start: the registry-designated baseline
+        # (single authoritative resolver — the old `or best_model.pt` literal
+        # fallback named a file the 2026-10-26 reconciliation found missing).
+        try:
+            default_ckpt = get_default_checkpoint_path()
+        except DefaultCheckpointError as e:
+            return _fail(
+                "No usable default warm-start checkpoint.",
+                str(e),
+                "restore/designate the registry default, or pass --checkpoint <file.pt>, then see LOG",
+            )
         try:
             checkpoint_resolved = safe_resolve(default_ckpt)
             if not checkpoint_resolved.is_file():
                 return _fail(
                     f"Default warm-start checkpoint does not exist: {checkpoint_resolved}",
-                    "protected baseline missing",
-                    "verify models/checkpoints_scaled/best_model.pt exists, then see LOG",
+                    "registry-designated baseline missing on disk",
+                    "restore the designated artifact, then see LOG",
                 )
             base_checkpoint = str(checkpoint_resolved)
             resume_checkpoint = None
@@ -1299,7 +1307,7 @@ def run_training(args: argparse.Namespace) -> int:
             return _fail(
                 f"Invalid default checkpoint path: {e}",
                 "path escapes repo or is malformed",
-                "verify models/checkpoints_scaled/best_model.pt, then see LOG",
+                "restore/designate the registry default, then see LOG",
             )
 
     # Numeric validation

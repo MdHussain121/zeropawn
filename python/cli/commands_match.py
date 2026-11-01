@@ -9,7 +9,6 @@ import time
 from pathlib import Path
 from typing import Optional
 
-import torch
 from rich.panel import Panel
 from rich import box
 
@@ -29,6 +28,8 @@ from python.cli.common import (
     safe_resolve,
     validate_fen_or_raise,
 )
+from python.cli.eval_callbacks import make_serial_eval_fn
+from python.model.checkpoint_registry import DefaultCheckpointError
 from python.common.progress import (
     Heartbeat,
     banner,
@@ -372,12 +373,13 @@ def run_batch_match(args: argparse.Namespace) -> int:
     if err:
         return _fail(err, "argument out of range", "fix the flagged argument, then see LOG")
 
-    ckpt_path = args.checkpoint or get_default_checkpoint_path()
-    if not ckpt_path:
+    try:
+        ckpt_path = args.checkpoint or get_default_checkpoint_path()
+    except DefaultCheckpointError as e:
         return _fail(
-            "No model checkpoint found! Please train or specify --checkpoint.",
-            "no checkpoint at default locations",
-            "pass --checkpoint <file.pt>, then see LOG",
+            "No usable default model checkpoint.",
+            str(e),
+            "restore/designate the registry default, or pass --checkpoint <file.pt>, then see LOG",
         )
     try:
         ckpt_path = safe_resolve(ckpt_path)
@@ -594,9 +596,10 @@ def run_live_game(args: argparse.Namespace) -> int:
         print_error(err)
         return 1
 
-    ckpt_path = args.checkpoint or get_default_checkpoint_path()
-    if not ckpt_path:
-        print_error("No model checkpoint found! Please specify --checkpoint.")
+    try:
+        ckpt_path = args.checkpoint or get_default_checkpoint_path()
+    except DefaultCheckpointError as e:
+        print_error(str(e))
         return 1
     try:
         ckpt_path = safe_resolve(ckpt_path)
@@ -687,19 +690,10 @@ def run_live_game(args: argparse.Namespace) -> int:
     mcts_cfg.batch_size = 1
     mcts = zeropawn_cpp.MCTS(mcts_cfg)
 
-    def eval_fn(game: zeropawn_cpp.Game):
-        chess_g = zeropawn_cpp.ChessGame(game.get_fen())
-        planes = zeropawn_cpp.encode_state(chess_g)
-        t = torch.from_numpy(planes).unsqueeze(0).to(device)
-        if device == "cuda":
-            t = t.to(memory_format=torch.channels_last)
-        with torch.no_grad():
-            with torch.amp.autocast(device, dtype=torch.bfloat16):
-                p_logits, v_wdl = model(t)
-            p_probs = torch.softmax(p_logits.float(), dim=-1).squeeze(0).cpu().numpy().tolist()
-            v_probs = torch.softmax(v_wdl.float(), dim=-1).squeeze(0).cpu().numpy()
-            scalar_val = float(v_probs[0] - v_probs[2])
-        return (p_probs, scalar_val)
+    # Shared factory: encodes the passed game directly (history preserved,
+    # plane 18 repetition live).  The former inline callback FEN-round-tripped
+    # the game and zeroed the history planes (audit M-1).
+    eval_fn = make_serial_eval_fn(model, device)
 
     game = zeropawn_cpp.ChessGame(fen)
     engine_is_white = args.engine_color.lower() == "white"
@@ -784,9 +778,10 @@ def run_human_game(args: argparse.Namespace) -> int:
 
     print_banner("HUMAN VS AI CHESS", "Challenge our Neural Network Engine")
 
-    ckpt_path = args.checkpoint or get_default_checkpoint_path()
-    if not ckpt_path:
-        print_error("No model checkpoint found! Please specify --checkpoint.")
+    try:
+        ckpt_path = args.checkpoint or get_default_checkpoint_path()
+    except DefaultCheckpointError as e:
+        print_error(str(e))
         return 1
     try:
         ckpt_path = safe_resolve(ckpt_path)
@@ -831,19 +826,9 @@ def run_human_game(args: argparse.Namespace) -> int:
     mcts_cfg.add_noise = False
     mcts = zeropawn_cpp.MCTS(mcts_cfg)
 
-    def eval_fn(game: zeropawn_cpp.Game):
-        chess_g = zeropawn_cpp.ChessGame(game.get_fen())
-        planes = zeropawn_cpp.encode_state(chess_g)
-        t = torch.from_numpy(planes).unsqueeze(0).to(device)
-        if device == "cuda":
-            t = t.to(memory_format=torch.channels_last)
-        with torch.no_grad():
-            with torch.amp.autocast(device, dtype=torch.bfloat16):
-                p_logits, v_wdl = model(t)
-            p_probs = torch.softmax(p_logits.float(), dim=-1).squeeze(0).cpu().numpy().tolist()
-            v_probs = torch.softmax(v_wdl.float(), dim=-1).squeeze(0).cpu().numpy()
-            scalar_val = float(v_probs[0] - v_probs[2])
-        return (p_probs, scalar_val)
+    # Shared factory: encodes the passed game directly (history preserved).
+    # The former inline callback FEN-round-tripped the game (audit M-1).
+    eval_fn = make_serial_eval_fn(model, device)
 
     game = zeropawn_cpp.ChessGame()
     human_is_white = args.human_color.lower() == "white"
