@@ -16,6 +16,7 @@ import torch
 
 from python.model.chess_net import ChessNet
 from python.model.checkpoint_registry import (
+    DefaultCheckpointError,
     WarmStartValidationError,
     load_registry,
     upsert_registry_entry,
@@ -283,7 +284,11 @@ def test_default_chain_skips_disqualified_and_quarantined_artifacts(tmp_path, mo
     monkeypatch.setattr(common, "REPO_ROOT", tmp_path)
     monkeypatch.setattr("python.common.artifacts.repo_root", lambda: tmp_path)
 
-    assert common.get_default_checkpoint_path() is None
+    # Merged M-2/CKP-11 contract: resolution is fail-closed.  A disqualified
+    # artifact is never served as a default — and because no designated,
+    # verified entry exists, resolution raises instead of falling back.
+    with pytest.raises(DefaultCheckpointError):
+        common.get_default_checkpoint_path()
 
     # A registry-verified artifact becomes the default instead.
     verified = models / "checkpoints_scaled" / "latest_checkpoint.pt"

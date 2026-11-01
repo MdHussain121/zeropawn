@@ -32,12 +32,12 @@ def _positions(n: int, start: int = 0):
         visits[i % 4672] = 1.0
         out.append(
             SavedPosition(
-                planes=np.random.randn(19, 8, 8).astype(np.float32),
+                planes=np.random.rand(19, 8, 8).astype(np.float32),
                 visits=visits,
                 outcome=i % 3,
                 is_full_search=True,
                 model_version=1,
-                game_id=i,
+                game_id=i + 1,  # ring records require game_id > 0 (integrated SR-07 contract)
             )
         )
     return out

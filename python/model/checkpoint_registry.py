@@ -608,7 +608,11 @@ def _entry_status_line(entry: Dict[str, Any]) -> str:
 
 
 def _default_entry_path(entry: Dict[str, Any], repo_root: Path, models_root: Optional[Path]) -> Path:
-    rel = Path(str(entry.get("path", "")))
+    # Registry entries record the artifact path under ``file`` (the canonical
+    # key used by verify_checkpoint_identity and the tracked registry JSON);
+    # ``path`` is the legacy alias some entries carry. Read both — an entry
+    # with only one of them must still resolve.
+    rel = Path(str(entry.get("file") or entry.get("path") or ""))
     if models_root is not None and rel.parts and rel.parts[0] == "models":
         return Path(models_root) / Path(*rel.parts[1:])
     return repo_root / rel

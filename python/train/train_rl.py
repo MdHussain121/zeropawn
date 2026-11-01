@@ -701,16 +701,19 @@ class RLTrainer:
                 )
 
         # ── Replay-buffer ↔ checkpoint reconciliation (SR-04 + CKP-05) ──────
-        # Stage 1 (audit SR-04): the checkpoint's buffer snapshot is a
-        # consistency ASSERTION against the live buffer — identity (directory,
-        # schema, directory generation) and verifiable pointer arithmetic. The
-        # live buffer's own meta.json (atomic fsync + replace after every
+        # The live buffer's own meta.json (atomic fsync + replace after every
         # insert) is the authoritative state; the pointer is NEVER restored
-        # from the checkpoint.
-        # Stage 2 (finding CKP-05, full resume only): the snapshot triple and
-        # save generation are reconciled as a unit; the head is never rewound
-        # over newer metadata and ``size`` is never left behind by a
-        # pointer-only restore.
+        # from the checkpoint. Reconciliation is a two-stage contract:
+        #
+        # full resume — the CKP-05 reconciliation owns the flow: identity-class
+        #   contradictions (a different buffer directory) raise
+        #   :class:`BufferCheckpointMismatchError` (audit SR-04); state
+        #   contradictions (older/emptier live buffer, foreign save generation)
+        #   raise :class:`BufferRestoreError`. On adoption, the SR-04
+        #   append-arithmetic assertion runs, so a live ring that is "newer" by
+        #   count but not explainable as appends is still refused.
+        # warm start — counters reset and nothing is adopted, but the SR-04
+        #   pairing assertion still applies to snapshots that carry one.
         if hasattr(self.replay_buffer, "write_head"):
             snapshot = ckpt.get("buffer_state")
             if snapshot is None and (
@@ -720,43 +723,14 @@ class RLTrainer:
                     "size": ckpt.get("buffer_size"),
                     "write_head": ckpt.get("buffer_write_head"),
                 }
-            if snapshot is not None:
-                classify = getattr(self.replay_buffer, "checkpoint_consistency", None)
-                if callable(classify):
-                    verdict, detail = classify(snapshot)
-                    if verdict == "match":
-                        logger.info(
-                            "[BUFFER] checkpoint/buffer snapshot matches live state (%s)", detail
-                        )
-                    elif verdict == "ahead":
-                        logger.info(
-                            "[BUFFER] live buffer is ahead of the checkpoint snapshot (%s); "
-                            "keeping the live state (pointer is never rewound)",
-                            detail,
-                        )
-                    else:
-                        message = (
-                            f"Checkpoint '{path_str}' buffer snapshot is inconsistent with the "
-                            f"live replay buffer: {detail}. The live buffer state (size="
-                            f"{getattr(self.replay_buffer, 'size', '?')}, write_head="
-                            f"{getattr(self.replay_buffer, 'write_head', '?')}) is authoritative; "
-                            "refusing to pair this checkpoint with it unless "
-                            "--allow-buffer-mismatch or --reset-buffer is passed explicitly."
-                        )
-                        if not allow_buffer_mismatch and not reset_buffer:
-                            raise BufferCheckpointMismatchError(message)
-                        logger.warning(
-                            "[BUFFER OVERRIDE] Proceeding despite buffer/checkpoint mismatch "
-                            "(explicitly acknowledged via %s): %s",
-                            "--reset-buffer" if reset_buffer else "--allow-buffer-mismatch",
-                            detail,
-                        )
-                elif ckpt.get("buffer_write_head") is not None and not callable(
-                    getattr(self.replay_buffer, "buffer_state", None)
-                ):
-                    # Buffer object without the snapshot APIs (minimal test
-                    # doubles): fall back to the legacy write-head restore for
-                    # compatibility.
+            has_snapshot_apis = callable(
+                getattr(self.replay_buffer, "buffer_state", None)
+            ) or callable(getattr(self.replay_buffer, "checkpoint_consistency", None))
+            if not has_snapshot_apis:
+                # Buffer object without the snapshot APIs (minimal test
+                # doubles): fall back to the legacy write-head restore for
+                # compatibility.
+                if ckpt.get("buffer_write_head") is not None:
                     try:
                         head = int(ckpt["buffer_write_head"])
                         cap = getattr(self.replay_buffer, "capacity", None)
@@ -765,15 +739,19 @@ class RLTrainer:
                         self.replay_buffer.write_head = head
                     except (ValueError, TypeError):
                         logger.debug("Ignoring invalid buffer_write_head in '%s'", path_str)
-            else:
+            elif snapshot is None:
                 logger.info(
                     "[BUFFER] checkpoint '%s' carries no buffer snapshot (legacy format); "
                     "live buffer state kept as-is",
                     path_str,
                 )
-            # Stage 2 (finding CKP-05) — full resume only; a warm start resets
-            # the counters and never adopts the checkpoint's buffer state.
-            if not reset_step:
+            elif reset_step:
+                self._assert_buffer_pairing(
+                    snapshot,
+                    path_str,
+                    allow_override=allow_buffer_mismatch or reset_buffer,
+                )
+            else:
                 self._restore_buffer_state(
                     ckpt,
                     path_str,
@@ -983,6 +961,26 @@ class RLTrainer:
             self.run_metadata["buffer_resume_decision"] = decision
             return
 
+        # SR-04 identity class: a snapshot from a DIFFERENT buffer directory is
+        # a pairing error, not a state contradiction — it refuses with
+        # :class:`BufferCheckpointMismatchError` before any triple logic runs.
+        saved_buffer_id = saved_state.get("buffer_id") if isinstance(saved_state, dict) else None
+        live_buffer_id = getattr(self.replay_buffer, "buffer_id", None)
+        if (
+            saved_buffer_id is not None
+            and live_buffer_id is not None
+            and str(saved_buffer_id) != str(live_buffer_id)
+        ):
+            decision["decision"] = "refused_different_buffer_directory"
+            self.run_metadata["buffer_resume_decision"] = decision
+            raise BufferCheckpointMismatchError(
+                f"Checkpoint '{path_str}' was saved against replay buffer {saved_buffer_id} "
+                f"but the live buffer is {live_buffer_id} (a different directory). Pairing "
+                "them would mix unrelated self-play data. The live buffer state (size="
+                f"{live['size']}, write_head={live['write_head']}) is authoritative; pass "
+                "--allow-buffer-mismatch or --reset-buffer to acknowledge explicitly."
+            )
+
         saved_gen = saved.get("generation")
         live_gen = live.get("generation")
         if saved_gen and live_gen and saved_gen != live_gen:
@@ -1072,6 +1070,67 @@ class RLTrainer:
                 saved["size"],
                 saved["total_added"],
             )
+
+        # SR-04 append-arithmetic assertion (audit SR-04, integrated): a live
+        # ring that is equal-or-newer by count but NOT explainable as appends
+        # from the checkpoint's snapshot is inconsistent — the records were
+        # replaced rather than appended. Legacy snapshots (no total_added)
+        # cannot be verified this way and are handled conservatively above.
+        classify = getattr(self.replay_buffer, "checkpoint_consistency", None)
+        if (
+            not saved.get("legacy")
+            and isinstance(saved_state, dict)
+            and saved_state.get("total_added") is not None
+            and callable(classify)
+        ):
+            verdict, detail = classify(saved_state)
+            if verdict == "mismatch":
+                decision["decision"] = "refused_ring_not_explainable_as_appends"
+                self.run_metadata["buffer_resume_decision"] = decision
+                raise BufferCheckpointMismatchError(
+                    f"Checkpoint '{path_str}' buffer snapshot is inconsistent with the live "
+                    f"replay buffer: {detail}. The live ring is not explainable as appends "
+                    "from the checkpoint's state; pass --allow-buffer-mismatch or "
+                    "--reset-buffer to acknowledge explicitly."
+                )
+            logger.info(
+                "[BUFFER] checkpoint/buffer snapshot %s the live state (%s)",
+                "matches" if verdict == "match" else "is behind",
+                detail,
+            )
+
+    def _assert_buffer_pairing(
+        self,
+        snapshot: Dict[str, Any],
+        path_str: str,
+        *,
+        allow_override: bool = False,
+    ) -> None:
+        """SR-04 pairing assertion without adopting any buffer state (warm start)."""
+        classify = getattr(self.replay_buffer, "checkpoint_consistency", None)
+        if not callable(classify):
+            return
+        verdict, detail = classify(snapshot)
+        if verdict in ("match", "ahead"):
+            logger.info(
+                "[BUFFER] checkpoint/buffer snapshot %s the live state (%s)",
+                "matches" if verdict == "match" else "is behind",
+                detail,
+            )
+            return
+        message = (
+            f"Checkpoint '{path_str}' buffer snapshot is inconsistent with the live replay "
+            f"buffer: {detail}. The live buffer state is authoritative; refusing to pair this "
+            "checkpoint with it unless --allow-buffer-mismatch or --reset-buffer is passed "
+            "explicitly."
+        )
+        if not allow_override:
+            raise BufferCheckpointMismatchError(message)
+        logger.warning(
+            "[BUFFER OVERRIDE] Proceeding despite buffer/checkpoint mismatch (explicitly "
+            "acknowledged): %s",
+            detail,
+        )
 
     def _cuda_rng_state(self) -> Optional[List[torch.Tensor]]:
         """Per-device CUDA RNG states when training on CUDA (audit CKP-12).
