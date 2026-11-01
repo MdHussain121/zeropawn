@@ -9,6 +9,7 @@ import sys
 import time
 import random
 from collections import deque
+from pathlib import Path
 from typing import Any
 import numpy as np
 import torch
@@ -160,7 +161,24 @@ def train_connect4(
             elapsed = time.time() - start_time
             print(f"Game {g:3d}/{num_games} | Buffer: {len(buffer):4d} | Elapsed: {elapsed:.1f}s")
 
-    torch.save(model.state_dict(), save_path)
+    # Audit CKP-09: a bare state_dict has zero metadata (no architecture, no
+    # type, no timestamp) and was written non-atomically. Stage 2 keeps the
+    # ``state_dict`` payload readable for existing consumers while adding the
+    # declaration and durability contract.
+    from python.train.train_supervised import _atomic_torch_save
+
+    _atomic_torch_save(
+        {
+            "checkpoint_type": "connect4",
+            "model": model.state_dict(),
+            "num_blocks": getattr(model, "num_blocks", None),
+            "num_filters": getattr(model, "num_filters", None),
+            "payload": "state_dict",
+            "step": int(g),
+            "timestamp": time.time(),
+        },
+        Path(save_path),
+    )
     print(f"Model saved to {save_path}")
     return save_path
 

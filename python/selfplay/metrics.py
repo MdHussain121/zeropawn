@@ -404,9 +404,30 @@ class MetricsTracker:
                 ]
             )
             try:
-                with open(self.csv_path, "a", newline="", encoding="utf-8") as f:
-                    writer = csv.writer(f)
-                    writer.writerow(row)
+                from python.common.artifacts import ArtifactLockError, artifact_lock
+
+                try:
+                    lock = artifact_lock(self.csv_path, timeout=15.0, owner="telemetry-csv")
+                except ArtifactLockError:
+                    lock = None
+                if lock is None:
+                    logger.warning(
+                        "Telemetry CSV %s is locked by another writer; skipping this row",
+                        self.csv_path,
+                    )
+                else:
+                    with lock:
+                        with open(self.csv_path, "a", newline="", encoding="utf-8") as f:
+                            writer = csv.writer(f)
+                            writer.writerow(row)
+                            # Audit SUS-01: an append without flush could be torn
+                            # by a crash mid-write. Flush then fsync so a completed
+                            # row is durable and a torn row cannot be half-written.
+                            f.flush()
+                            try:
+                                os.fsync(f.fileno())
+                            except OSError:
+                                logger.debug("telemetry CSV fsync failed", exc_info=True)
             except (OSError, csv.Error) as e:
                 logger.warning("Failed to append CSV %s: %s", self.csv_path, e)
 

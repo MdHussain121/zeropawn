@@ -401,6 +401,8 @@ def train_opening_policy(
         )
 
         ckpt_state = {
+            "checkpoint_type": "opening_policy",
+            "weights_only_container": True,
             "model": model.state_dict(),
             "epoch": epoch,
             "step": step,
@@ -427,6 +429,8 @@ def train_opening_policy(
     final_path = output_dir / "latest_opening_model.pt"
     _atomic_torch_save(
         {
+            "checkpoint_type": "opening_policy",
+            "weights_only_container": True,
             "model": model.state_dict(),
             "step": step,
             "best_val_loss": best_val_loss,

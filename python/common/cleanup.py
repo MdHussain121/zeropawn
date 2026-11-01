@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import shutil
+import time
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -42,8 +43,16 @@ PROTECTED_CHECKPOINTS = frozenset(
         "live_weights.pt",
         "live_weights.pt.tmp",
         "phase4_final_checkpoint.pt",
+        # Curriculum weights container (audit CKP-09 moved it out of the RL tree;
+        # protected here so no future pattern ever matches it).
+        "curriculum_final_latest.pt",
     }
 )
+
+# Cross-process lock files created by python.common.artifacts.artifact_lock.
+# They are empty sentinels that the OS releases on process exit; cleanup may
+# remove them once their owning run is over.
+LOCK_FILE_SUFFIXES = (".lock", ".lock.owner")
 
 
 def _rm_file(path: Path) -> bool:
@@ -125,8 +134,9 @@ def prune_checkpoints(
             pass
         if _rm_file(p):
             stats["deleted"] += 1
-        # stale .tmp siblings of deleted checkpoints
+        # stale .tmp siblings and lock sentinels of deleted checkpoints
         _rm_file(p.with_name(p.name + ".tmp"))
+        sweep_stale_lock_files(p)
     stats["kept"] = (
         len(candidates)
         - stats["deleted"]
@@ -190,6 +200,53 @@ def cleanup_caches(repo_root: str | Path) -> dict[str, int]:
     return stats
 
 
+def sweep_stale_lock_files(target: str | Path, *, min_age_sec: float = 600.0) -> int:
+    """Remove *stale* lock sentinels for one artifact. Never raises.
+
+    ``python.common.artifacts.artifact_lock`` creates ``<artifact>.lock`` (held by
+    the OS for the duration of a write, auto-released if the process dies) plus a
+    best-effort ``<artifact>.lock.owner`` diagnostic sidecar. Sentinel removal
+    happens only when the lock is provably free of a live writer:
+
+    * the ``.lock`` file is at least ``min_age_sec`` old, and
+    * this process can acquire it non-blockingly right now.
+
+    A held lock (and its sidecar) is therefore never touched. This is janitorial
+    tidiness, not lock management: exclusion lives in the OS lock, so correctness
+    never depends on the file's absence.
+    """
+    from python.common.artifacts import ArtifactLockError, artifact_lock
+
+    base = Path(target)
+    lock_path = base.with_name(base.name + ".lock")
+    owner_path = base.with_name(base.name + ".lock.owner")
+    lock_exists = lock_path.is_file()
+    released = True
+    if lock_exists:
+        try:
+            age = time.time() - lock_path.stat().st_mtime
+        except OSError:
+            age = 0.0
+        if age < min_age_sec:
+            released = False
+        else:
+            try:
+                with artifact_lock(base, timeout=0.0, owner="cleanup-sweep"):
+                    pass
+            except (ArtifactLockError, OSError):
+                released = False
+    if not released:
+        return 0
+    removed = 0
+    for path in (lock_path, owner_path):
+        try:
+            if path.is_file() and _rm_file(path):
+                removed += 1
+        except OSError:
+            logger.debug("could not remove lock sentinel %s", path, exc_info=True)
+    return removed
+
+
 def cleanup_run(
     log_dir: str | Path,
     checkpoint_dir: str | Path | None = None,
@@ -205,6 +262,26 @@ def cleanup_run(
         report["checkpoints"] = prune_checkpoints(checkpoint_dir, keep_last_n=keep_checkpoints)
     if delete_buffer:
         report["buffer"] = cleanup_buffer(Path(log_dir) / "buffer")
+    # Lock sentinels of the run's own artifacts: remove only the ones provably
+    # released (acquirable) and old, so an active writer's lock is never touched.
+    sweeps = [Path(log_dir)]
+    if checkpoint_dir is not None:
+        sweeps.append(Path(checkpoint_dir))
+    for sweep_dir in sweeps:
+        if not sweep_dir.is_dir():
+            continue
+        seen_artifacts: set[Path] = set()
+        for lock_file in list(sweep_dir.glob("*.lock")) + list(sweep_dir.glob("*.lock.owner")):
+            name = lock_file.name
+            for suffix in (".lock.owner", ".lock"):
+                if name.endswith(suffix):
+                    seen_artifacts.add(lock_file.with_name(name[: -len(suffix)]))
+                    break
+        for artifact in seen_artifacts:
+            try:
+                sweep_stale_lock_files(artifact)
+            except OSError:
+                logger.debug("lock sweep failed for %s", artifact, exc_info=True)
     return report
 
 

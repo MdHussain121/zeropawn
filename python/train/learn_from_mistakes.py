@@ -761,8 +761,11 @@ def run_curriculum(
             ckpt_base
             / f"curriculum_tier_{tier.tier_number}_{tier.min_rating}_{tier.max_rating}_p{base_tier_puzzles}_lr{lr_str}.pt"
         )
-        torch.save(
+        from python.train.train_supervised import _atomic_torch_save
+
+        _atomic_torch_save(
             {
+                "checkpoint_type": "curriculum",
                 "model": learner.model.state_dict(),
                 "optimizer": learner.optimizer.state_dict(),
                 "tier": tier.tier_number,
@@ -772,6 +775,8 @@ def run_curriculum(
                 "total_puzzles": tier_results["total_puzzles"],
                 "mcts_regression_flag": mcts_regression_flag,
                 "mcts_rate": bench_res.get("mcts_rate") if bench_res else None,
+                "num_blocks": getattr(learner.model, "num_blocks", 12),
+                "num_filters": getattr(learner.model, "num_filters", 128),
                 "timestamp": time.time(),
             },
             tier_ckpt_path,
