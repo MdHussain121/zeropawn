@@ -694,7 +694,9 @@ def load_engine_model(
             logger.warning("%s", provenance_warning)
         registry = load_registry(REPO_ROOT)
         for rec in registry.get("checkpoints", []):
-            rel = Path(str(rec.get("path", "")))
+            # Registry entries record the artifact path under ``file`` (the
+            # canonical key; ``path`` is the legacy alias some entries carry).
+            rel = Path(str(rec.get("file") or rec.get("path") or ""))
             rec_path = (REPO_ROOT / rel) if rel.parts else None
             try:
                 if rec_path is not None and rec_path.resolve() == path.resolve():
