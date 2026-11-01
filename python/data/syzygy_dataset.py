@@ -42,7 +42,8 @@ from python.selfplay.tb_adjudicate import TablebaseAdjudicator
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_SYZYGY_PATH = Path("data/syzygy")
+_repo_root = Path(__file__).resolve().parent.parent.parent
+DEFAULT_SYZYGY_PATH = _repo_root / "data" / "syzygy"
 
 
 class SyzygyPositionSample:
@@ -83,7 +84,12 @@ class SyzygySupervisionGenerator:
         tablebase_path: Union[str, Path] = DEFAULT_SYZYGY_PATH,
         max_pieces: int = 5,
     ) -> None:
-        self.tablebase_path = Path(tablebase_path)
+        tb_p = Path(tablebase_path)
+        if not tb_p.is_absolute() and not tb_p.is_dir():
+            candidate = _repo_root / tb_p
+            if candidate.is_dir():
+                tb_p = candidate
+        self.tablebase_path = tb_p
         self.max_pieces = max_pieces
         self.tb: Optional[chess.syzygy.Tablebase] = None
 
@@ -108,13 +114,20 @@ class SyzygySupervisionGenerator:
             piece_count = len(board.piece_map())
             return (has_no_castling and piece_count <= self.max_pieces), piece_count
 
+    def has_dtz(self) -> bool:
+        """Return True only if genuine DTZ (.rtbz) table files are loaded."""
+        if self.tb is None:
+            return False
+        # python-chess Tablebase stores loaded DTZ tables in _dtz dict
+        return bool(getattr(self.tb, "_dtz", {}))
+
     def probe_dtz(self, board: chess.Board) -> Optional[int]:
         """Probe raw Syzygy DTZ (distance-to-zero) value.
 
-        Returns positive value for winning side to move, 0 for draw,
-        negative value for losing side. Requires both WDL and DTZ tables.
+        Returns None if DTZ tables are not present (zero .rtbz files).
+        Requires genuine DTZ (.rtbz) tables; returns None when unsupported (SY-04).
         """
-        if self.tb is None:
+        if self.tb is None or not self.has_dtz():
             return None
         eligible, _ = self.is_eligible(board)
         if not eligible:
@@ -167,21 +180,25 @@ class SyzygySupervisionGenerator:
         if raw_wdl is None:
             return None
 
-        # Outcome class from moving player's perspective (5-class, not collapsed):
+        # Outcome class from moving player's perspective (5-class, auxiliary metadata):
         # 0 = Win (+2), 1 = Cursed Win (+1), 2 = Draw (0),
         # 3 = Blessed Loss (-1), 4 = Loss (-2)
+        #
+        # 3-class value target under FIDE rule 50 (SY-02):
+        # 0 = Win ([1, 0, 0]), 1 = Draw ([0, 1, 0]), 2 = Loss ([0, 0, 1])
+        # Under rule 50, cursed wins and blessed losses are theoretical draws -> Draw [0, 1, 0]
         if raw_wdl == 2:
             outcome_class = 0
             wdl_target = np.array([1.0, 0.0, 0.0], dtype=np.float32)
         elif raw_wdl == 1:
             outcome_class = 1
-            wdl_target = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+            wdl_target = np.array([0.0, 1.0, 0.0], dtype=np.float32)
         elif raw_wdl == 0:
             outcome_class = 2
             wdl_target = np.array([0.0, 1.0, 0.0], dtype=np.float32)
         elif raw_wdl == -1:
             outcome_class = 3
-            wdl_target = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+            wdl_target = np.array([0.0, 1.0, 0.0], dtype=np.float32)
         elif raw_wdl == -2:
             outcome_class = 4
             wdl_target = np.array([0.0, 0.0, 1.0], dtype=np.float32)
@@ -466,16 +483,68 @@ class SyzygySupervisionGenerator:
             "train_samples": len(train_samples),
             "val_samples": len(val_samples),
             "output_dir": str(output_dir),
-            "wins": sum(1 for s in samples if s.outcome_class in (0, 1)),
-            "draws": sum(1 for s in samples if s.outcome_class == 2),
-            "losses": sum(1 for s in samples if s.outcome_class in (3, 4)),
+            "wins": sum(1 for s in samples if s.outcome_class == 0),
+            "cursed_wins": sum(1 for s in samples if s.outcome_class == 1),
+            "draws": sum(1 for s in samples if s.outcome_class in (1, 2, 3)),
+            "blessed_losses": sum(1 for s in samples if s.outcome_class == 3),
+            "losses": sum(1 for s in samples if s.outcome_class == 4),
         }
+
+        # Emit build_record.json for dataset certification (SY-08)
+        try:
+            from python.data.dataset_contract import BuildRecord, detect_git_commit
+            from python.data.dataset_validation import file_identity
+
+            outputs: Dict[str, Any] = {}
+            for split_name in ("train", "val"):
+                s_dir = output_dir / split_name
+                outputs[split_name] = {}
+                for f_name in (
+                    "planes.bin",
+                    "moves.bin",
+                    "outcomes.bin",
+                    "game_ids.bin",
+                    "plies.bin",
+                    "value_targets.bin",
+                    "policy_targets.bin",
+                ):
+                    p = s_dir / f_name
+                    if p.is_file():
+                        outputs[split_name][f_name] = file_identity(p)["sha256"]
+
+            rec = BuildRecord(
+                builder="python.data.syzygy_dataset.SyzygySupervisionGenerator",
+                builder_version="1.0",
+                source={
+                    "type": "syzygy_tablebase",
+                    "path": str(self.tablebase_path),
+                    "max_pieces": self.max_pieces,
+                },
+                config={
+                    "val_ratio": val_ratio,
+                    "seed": seed,
+                    "synthetic_count": synthetic_count,
+                },
+                label_semantics={
+                    "value_targets": "3-class FIDE rule-50 (0=W, 1=D [incl. cursed/blessed], 2=L)",
+                    "outcomes": "5-class raw syzygy (0=W, 1=CW, 2=D, 3=BL, 4=L)",
+                },
+                counts=summary,
+                outputs=outputs,
+                git_commit=detect_git_commit(),
+            )
+            rec.write(output_dir)
+        except Exception as e:
+            logger.debug("Could not write build_record.json: %s", e)
+
         logger.info("Built endgame Syzygy dataset: %s", summary)
         return summary
 
     def _write_split(
         self, split_dir: Path, samples: List[SyzygyPositionSample], split_name: str
     ) -> None:
+        from python.data.dataset_contract import SCHEMA_VERSION
+
         num = len(samples)
         planes_path = split_dir / "planes.bin"
         moves_path = split_dir / "moves.bin"
@@ -484,7 +553,6 @@ class SyzygySupervisionGenerator:
         plies_path = split_dir / "plies.bin"
         val_targets_path = split_dir / "value_targets.bin"
         policy_targets_path = split_dir / "policy_targets.bin"
-        dtz_targets_path = split_dir / "dtz_targets.bin"
         meta_path = split_dir / "metadata.json"
 
         planes_mm = np.memmap(planes_path, dtype=np.float32, mode="w+", shape=(num, 19, 8, 8))
@@ -496,7 +564,13 @@ class SyzygySupervisionGenerator:
         policy_targets_mm = np.memmap(
             policy_targets_path, dtype=np.float32, mode="w+", shape=(num, 4672)
         )
-        dtz_mm = np.memmap(dtz_targets_path, dtype=np.float32, mode="w+", shape=(num,))
+
+        # SY-04: Only create dtz_targets.bin if genuine DTZ targets exist (never write all-NaN files)
+        has_real_dtz = any(s.dtz_target is not None for s in samples)
+        dtz_mm = None
+        if has_real_dtz:
+            dtz_targets_path = split_dir / "dtz_targets.bin"
+            dtz_mm = np.memmap(dtz_targets_path, dtype=np.float32, mode="w+", shape=(num,))
 
         for i, s in enumerate(samples):
             planes_mm[i] = s.planes
@@ -510,7 +584,8 @@ class SyzygySupervisionGenerator:
                 if s.optimal_policy_target is not None
                 else np.zeros(4672, dtype=np.float32)
             )
-            dtz_mm[i] = np.float32(s.dtz_target) if s.dtz_target is not None else np.nan
+            if dtz_mm is not None:
+                dtz_mm[i] = np.float32(s.dtz_target) if s.dtz_target is not None else np.nan
 
         planes_mm.flush()
         moves_mm.flush()
@@ -519,13 +594,16 @@ class SyzygySupervisionGenerator:
         plies_mm.flush()
         val_targets_mm.flush()
         policy_targets_mm.flush()
-        dtz_mm.flush()
+        if dtz_mm is not None:
+            dtz_mm.flush()
 
         metadata = {
             "num_samples": num,
             "planes_shape": [19, 8, 8],
             "split": split_name,
             "kind": "endgame_syzygy",
+            "schema_version": SCHEMA_VERSION,
+            "dtz_available": has_real_dtz,
         }
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(metadata, f, indent=2)

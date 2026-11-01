@@ -383,6 +383,10 @@ def validate_split(
     if pt_path.is_file():
         pt = np.memmap(pt_path, dtype=np.float32, mode="r", shape=(num_samples, 4672))
         report.add(_check_policy_targets(pt, num_samples))
+    dtz_path = split_dir / "dtz_targets.bin"
+    if dtz_path.is_file():
+        dtz = np.memmap(dtz_path, dtype=np.float32, mode="r", shape=(num_samples,))
+        report.add(_check_dtz_targets(dtz, num_samples))
 
     # Planes: finiteness and [0, 1] range with explicit coverage.
     if scan_planes != "off":
@@ -482,6 +486,32 @@ def _check_policy_targets(pt: np.memmap, num_samples: int, tol: float = 1e-3) ->
         "policy_targets_valid",
         CheckStatus.PASS if ok else CheckStatus.FAIL,
         f"non-finite: {bad_finite}, rows neither masked-zero nor summing to 1: {bad_rows}",
+        coverage=f"full ({n} rows)",
+    )
+
+
+def _check_dtz_targets(dtz: np.memmap, num_samples: int) -> CheckResult:
+    """Validate DTZ targets: reject all-NaN placeholder artifacts claiming DTZ supervision (SY-04)."""
+    block_size = 4096
+    n = dtz.shape[0]
+    total_nan = 0
+    total_finite = 0
+    for start in range(0, n, block_size):
+        block = np.asarray(dtz[start : min(start + block_size, n)], dtype=np.float32)
+        total_nan += int(np.isnan(block).sum())
+        total_finite += int(np.isfinite(block).sum())
+
+    if total_finite == 0:
+        return CheckResult(
+            "dtz_targets_valid",
+            CheckStatus.FAIL,
+            f"dtz_targets.bin contains all-NaN entries ({n} samples); DTZ supervision unavailable or falsely advertised",
+            coverage=f"full ({n} rows)",
+        )
+    return CheckResult(
+        "dtz_targets_valid",
+        CheckStatus.PASS,
+        f"valid DTZ targets present ({total_finite} finite, {total_nan} nan)",
         coverage=f"full ({n} rows)",
     )
 
