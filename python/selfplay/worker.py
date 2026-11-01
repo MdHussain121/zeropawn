@@ -1408,7 +1408,8 @@ class SelfPlayWorker:
             # Shutdown-aborted game (audit SR-01 / S-2 remediation): the positions list is empty
             # by contract and the summary carries no result — it is NOT sunk,
             # NOT counted as a played game, and NEVER recorded as a draw.
-            if not self.running or not self.accepts_for_sink(summary):
+            # Completed games immediately before shutdown are preserved if accepted for sink.
+            if not self.accepts_for_sink(summary):
                 with self.counter_lock:
                     self.aborted_games += 1
                 logger.info(
