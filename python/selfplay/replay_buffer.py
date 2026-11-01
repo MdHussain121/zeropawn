@@ -2124,7 +2124,9 @@ class ReplayBuffer:
             self.write_head = (self.write_head + 1) % self.capacity
             self.size = min(self.capacity, self.size + 1)
             self.total_added += 1
-        self._save_meta(force=True)
+        # Audit F-17 remediation: use throttled meta-save to avoid paying 1.6 ms
+        # fsync per single position. Forced flush remains on batched inserts and close().
+        self._save_meta(force=False)
 
         if self.gpu_cache is not None:
             self.gpu_cache.add_positions(

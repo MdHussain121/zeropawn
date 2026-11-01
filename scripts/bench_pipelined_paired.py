@@ -21,7 +21,18 @@ from datetime import datetime
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_CHECKPOINT = r"C:/Users/<user>/Music/chess/chess-rl/models/checkpoints_scaled/latest_checkpoint.pt"
+
+
+def get_default_benchmark_checkpoint() -> str:
+    """Resolve the canonical default checkpoint, or fall back safely (audit F-13/F-14)."""
+    try:
+        from python.cli.common import get_default_checkpoint_path
+        return str(get_default_checkpoint_path())
+    except Exception:
+        fallback = REPO_ROOT / "models" / "checkpoints_baseline_20261031" / "best_model.pt"
+        if fallback.is_file():
+            return str(fallback)
+        return str(REPO_ROOT / "models" / "checkpoints_scaled" / "latest_checkpoint.pt")
 
 
 def gpu_busy_with_foreign_process() -> bool:
@@ -68,11 +79,19 @@ def run_window(args, arm: str, pair_idx: int, root: Path) -> dict:
         )
     with open(summary_path, encoding="utf-8") as f:
         summary = json.load(f)
-    trials = summary.get("trials") or [summary]
-    return trials[0]
+    # Audit F-14: summary['trials'] is an integer in selfplay_summary.json;
+    # individual window results are in summary['trial_summaries'].
+    trial_summaries = summary.get("trial_summaries")
+    if isinstance(trial_summaries, list) and trial_summaries:
+        return trial_summaries[0]
+    trials = summary.get("trials")
+    if isinstance(trials, list) and trials:
+        return trials[0]
+    return summary
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """Build parser for paired A/B benchmark (audit F-14)."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pairs", type=int, default=3)
     parser.add_argument("--warmup-sec", type=float, default=60.0)
@@ -81,9 +100,21 @@ def main() -> int:
     parser.add_argument("--full-sims", type=int, default=400)
     parser.add_argument("--fast-sims", type=int, default=80)
     parser.add_argument("--base-seed", type=int, default=42)
-    parser.add_argument("--checkpoint-path", type=str, default=DEFAULT_CHECKPOINT)
+    parser.add_argument(
+        "--checkpoint-path",
+        type=str,
+        default=None,
+        help="Model checkpoint path (default: canonical registry checkpoint)",
+    )
     parser.add_argument("--output-root", type=str, default="tmp_bench/pipelined_paired")
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
     args = parser.parse_args()
+    if args.checkpoint_path is None:
+        args.checkpoint_path = get_default_benchmark_checkpoint()
 
     if gpu_busy_with_foreign_process():
         print("ABORT: GPU has an active compute app; paired windows would be contaminated.")
