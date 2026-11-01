@@ -24,6 +24,7 @@ import csv
 import json
 import logging
 import os
+import shutil
 import signal
 import sys
 import threading
@@ -653,6 +654,17 @@ class Phase4Orchestrator:
         logger.info(
             f"Initializing RL Trainer (train_device={self.train_device}, SGD momentum 0.9, base_lr {self.base_lr}, min_lr {self.min_lr}, 500 warmup steps)..."
         )
+        # Production launcher: this script IS the authorized writer for the
+        # run's artifact tree. The ticket records the destination so the
+        # protected-artifact guard can distinguish a deliberate production run
+        # from a test-scale process that merely inherited the same CWD
+        # (finding CKP-04).
+        from python.common.artifacts import ProductionWriteTicket
+
+        self.artifact_ticket = ProductionWriteTicket.issue_for_launcher(
+            "scripts/run_phase4_rl.py",
+            reason=f"production RL campaign checkpoint_dir={self.checkpoint_dir}",
+        )
         self.trainer = RLTrainer(
             model=trainer_model,
             replay_buffer=self.buffer,
@@ -673,15 +685,20 @@ class Phase4Orchestrator:
             gpu_cache_capacity=self.gpu_cache_capacity if self.train_device == "cuda" else 0,
             policy_target_temp=self.policy_target_temp,
             entropy_bonus=self.entropy_bonus,
+            artifact_ticket=self.artifact_ticket,
         )
 
         if is_resuming:
-            self.trainer.load_checkpoint(resume_checkpoint)
+            self.trainer.load_checkpoint(resume_checkpoint, reset_buffer=self.reset_buffer)
             if hasattr(self.trainer, "direct_server") and self.trainer.direct_server is not None:
                 self.server.model_version = self.trainer.direct_server.model_version
             logger.info(
                 f"Resumed RL training from {resume_checkpoint} at step {self.trainer.step_num} (model_version={self.server.model_version})"
             )
+            # The resumed trainer builds its own ledger (with the predecessor
+            # recorded); attach this run's identity to it (CKP-01).
+            self.trainer.run_metadata["seed"] = self.seed
+            self.trainer.run_metadata["active_checkpoint"] = str(resume_checkpoint)
         else:
             # Warm start (or cold start): the weights already came in via the
             # inference server and RL counters are fresh at 0. The warm-start
@@ -691,11 +708,27 @@ class Phase4Orchestrator:
             # assigned anywhere — a fresh start crashed with AttributeError
             # before training. The validated record is `self._warm_start_record`.
             ws = self._warm_start_record or {}
-            self.trainer.run_metadata = {
-                "warm_start": str(base_checkpoint) if base_checkpoint else "random_init",
-                "warm_start_sha256": ws.get("sha256", "unverified"),
-                "warm_start_step": ws.get("step", 0),
-            }
+            from python.model.checkpoint_schema import build_run_metadata
+
+            self.trainer.run_metadata = build_run_metadata(
+                run_type="rl-warm-start" if base_checkpoint else "rl-fresh",
+                seed=self.seed,
+                config=dict(self.trainer.run_metadata.get("config") or {}),
+                parent_checkpoint=(
+                    dict(ws) if base_checkpoint and ws else None
+                ),
+                extra={
+                    "warm_start": str(base_checkpoint) if base_checkpoint else "random_init",
+                    "warm_start_sha256": ws.get("sha256", "unverified"),
+                    "warm_start_step": ws.get("step", 0),
+                },
+            )
+            logger.info(
+                "[RUN-STATUS] new ledger run_id=%s type=%s state=%s",
+                self.trainer.run_metadata["run_id"],
+                self.trainer.run_metadata["run_type"],
+                self.trainer.run_metadata["run_state"],
+            )
             if ws.get("step"):
                 self.trainer.inherited_step_num = int(ws["step"])
                 self.trainer.warm_start_path = str(base_checkpoint)
@@ -719,7 +752,7 @@ class Phase4Orchestrator:
         a loud warning: filename ordering (``phase4_final``/``latest``) must
         never decide what a relaunch resumes from.
         """
-        from python.train.train_rl import inspect_rl_checkpoint
+        from python.train.train_rl import inspect_rl_checkpoint, is_resumable_candidate
 
         rejected: List[str] = []
         candidates: List[Dict[str, Any]] = []
@@ -734,11 +767,12 @@ class Phase4Orchestrator:
             if info is None:
                 rejected.append(f"{f.name}: unreadable or invalid")
                 continue
-            if info["optimizer_class"] not in ("SGD", "empty"):
-                rejected.append(
-                    f"{f.name}: optimizer state is {info['optimizer_class']} "
-                    "(foreign/poisoned — not resumable by an SGD trainer)"
-                )
+            # Weights-only containers (exports, model-only curriculum files) are
+            # not resume points even though they load: a candidate must carry SGD
+            # state or declare itself an RL checkpoint (audit CKP-08/CKP-09).
+            acceptable, reject_reason = is_resumable_candidate(info)
+            if not acceptable:
+                rejected.append(f"{f.name}: {reject_reason}")
                 continue
             candidates.append(info)
         for line in rejected:
@@ -801,6 +835,10 @@ class Phase4Orchestrator:
             "mcts_puzzle_solved",
             "mcts_puzzle_total",
             "mcts_puzzle_rate",
+            # Promotion evidence (audit CKP-15, appended 2026-10-31).
+            "promotion_decision",
+            "promotion_reason",
+            "promotion_generation",
         ]
         need_write = True
         if self.eval_csv_path.exists():
@@ -824,6 +862,8 @@ class Phase4Orchestrator:
             with open(self.eval_csv_path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 writer.writerow(headers)
+                f.flush()
+                os.fsync(f.fileno())
         # Per-game durability (F-15): every completed match game is persisted
         # the moment it finishes, so an interrupted evaluation keeps its
         # evidence and a resumed run can deduplicate by (step, seed, color).
@@ -904,11 +944,19 @@ class Phase4Orchestrator:
             return "unknown"
 
     def _append_eval_row(self, row: list) -> None:
-        """Append one eval_history row and fsync so interruption keeps it."""
-        with open(self.eval_csv_path, "a", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow(row)
-            f.flush()
-            os.fsync(f.fileno())
+        """Append one eval_history row and fsync so interruption keeps it.
+
+        Held under the artifact lock so two processes appending to the same
+        history cannot interleave partial rows (SUS-02); the wait is short
+        because appends are rare compared with training steps.
+        """
+        from python.common.artifacts import artifact_lock
+
+        with artifact_lock(self.eval_csv_path, timeout=15.0, owner="phase4-eval-history"):
+            with open(self.eval_csv_path, "a", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow(row)
+                f.flush()
+                os.fsync(f.fileno())
 
     def _persist_puzzle_result(self, solve_rate: float, solved: int, total: int) -> None:
         """Persist the completed puzzle-phase result before the engine match starts."""
@@ -1292,31 +1340,16 @@ class Phase4Orchestrator:
                 round(mcts_rate, 4) if mcts_rate is not None else "unavailable",
             ]
         )
-        self._append_eval_row(row)
-
-        # Log to TensorBoard
-        step = self.trainer.step_num
-        self.metrics_tracker.writer.add_scalar(
-            "eval/puzzle_solve_rate", solve_rate, global_step=step
-        )
-        self.metrics_tracker.writer.add_scalar(
-            "eval/match_score", match_res["engine_score"], global_step=step
-        )
-        self.metrics_tracker.writer.add_scalar(
-            "eval/match_draw_rate", match_res["draw_rate"], global_step=step
-        )
-        self.metrics_tracker.writer.flush()
-
-        logger.info(f"[EVAL CYCLE] Completed in {time.time() - eval_start:.1f}s.")
-        self._event("EVAL_END", f"evaluation completed in {time.time() - eval_start:.1f}s")
-        logger.info("=" * 70)
-
         # Check safety trigger: puzzle solve rate falls for 3 consecutive checks
         # (noise band: each step must drop by MORE than the band to count, so
         # jitter at the 1e-4 level cannot trip a critical stop; semantics
-        # otherwise unchanged).
+        # otherwise unchanged). Runs before promotion so a tripping run never
+        # promotes.
         if puzzle_decline_trips(self.puzzle_solve_history, self.puzzle_noise_band):
             last4 = self.puzzle_solve_history[-4:]
+            self._append_eval_row(
+                row + ["not_evaluated", "safety stop triggered before promotion", ""]
+            )
             raise SafetyTriggerException(
                 f"CRITICAL STOP TRIGGER: Puzzle solve rate fell for 3 consecutive checks: "
                 f"{[round(x, 4) for x in last4]}"
@@ -1335,6 +1368,9 @@ class Phase4Orchestrator:
                 eligible = False
                 gate_reason = f"SPRT {sprt_decision}: {sprt_detail}"
         previous_best = self._best_eval_comp_score
+        promotion_decision = "skipped"
+        promotion_generation = ""
+        promotion_reason = gate_reason
         if not eligible:
             logger.info(
                 "[PROMOTION] Not eligible (%s); composite score %.4f not promoted%s",
@@ -1344,11 +1380,134 @@ class Phase4Orchestrator:
             )
             self._event("PROMOTION_SKIPPED", f"{gate_reason}; comp_score={comp_score:.4f}")
         elif previous_best is None or comp_score > previous_best:
-            best_eval_path = self.checkpoint_dir / "best_eval.pt"
-            try:
-                import shutil
+            promoted, promotion_generation, promote_detail = self._promote_best_eval(
+                Path(ckpt_path),
+                ckpt_name=ckpt_name,
+                comp_score=comp_score,
+                match_res=match_res,
+                solve_rate=solve_rate,
+                gate_reason=gate_reason,
+            )
+            if promoted:
+                promotion_decision = "promoted"
+            else:
+                promotion_decision = "failed"
+                promotion_reason = promote_detail
+                self._event("PROMOTION_FAILED", promote_detail)
+        else:
+            promotion_decision = "no_improvement"
+            logger.info(
+                "[PROMOTION] No improvement (composite %.4f <= best %.4f)",
+                comp_score,
+                previous_best,
+            )
 
-                shutil.copyfile(ckpt_path, best_eval_path)
+        # The eval row is written only after the promotion decision so the
+        # decision and its reason are durable evidence in the same record as the
+        # measurements (audit CKP-15: the promotion path previously left no
+        # trace on disk).
+        self._append_eval_row(
+            row + [promotion_decision, promotion_reason, str(promotion_generation or "")]
+        )
+
+        # Log to TensorBoard
+        step = self.trainer.step_num
+        self.metrics_tracker.writer.add_scalar(
+            "eval/puzzle_solve_rate", solve_rate, global_step=step
+        )
+        self.metrics_tracker.writer.add_scalar(
+            "eval/match_score", match_res["engine_score"], global_step=step
+        )
+        self.metrics_tracker.writer.add_scalar(
+            "eval/match_draw_rate", match_res["draw_rate"], global_step=step
+        )
+        self.metrics_tracker.writer.flush()
+
+        logger.info(f"[EVAL CYCLE] Completed in {time.time() - eval_start:.1f}s.")
+        self._event("EVAL_END", f"evaluation completed in {time.time() - eval_start:.1f}s")
+        logger.info("=" * 70)
+
+        return {
+            "puzzle": puzzle_res,
+            "match": match_res,
+            "checkpoint": ckpt_name,
+            "promotion": promotion_decision,
+        }
+
+    def _promote_best_eval(
+        self,
+        candidate_ckpt: Path,
+        *,
+        ckpt_name: str,
+        comp_score: float,
+        match_res: dict,
+        solve_rate: float,
+        gate_reason: str,
+    ) -> "tuple[bool, str, str]":
+        """Atomically promote ``candidate_ckpt`` to ``best_eval.pt`` (finding CKP-03).
+
+        Requirements implemented here (audit roadmap P1-2):
+
+        1. the source checkpoint is hashed up front so the promotion record and
+           the promoted bytes are provably the same artifact;
+        2. the candidate is copied to a temporary file in the same directory,
+           flushed and fsynced, then hash-verified before ``os.replace`` makes it
+           visible (the previous ``best_eval.pt`` survives until then);
+        3. the containing directory is fsynced after the rename;
+        4. ``best_eval.json`` is written only after the artifact is in place and
+           carries the same ``generation`` id and ``checkpoint_sha256``, so a
+           torn promotion can never pair a checkpoint with unrelated evaluation
+           results;
+        5. failure is reported to the caller (and the run's event stream) instead
+           of being a silent ``logger.warning``.
+
+        Returns ``(promoted, generation, detail)``.
+        """
+        import uuid
+
+        from python.common.artifacts import assert_safe_artifact_destination, artifact_lock
+        from python.model.checkpoint_registry import compute_sha256
+
+        best_eval_path = self.checkpoint_dir / "best_eval.pt"
+        ticket = getattr(self, "artifact_ticket", None)
+        try:
+            src = Path(candidate_ckpt)
+            if not src.is_file():
+                return False, "", f"candidate checkpoint missing: {src}"
+            candidate_sha = compute_sha256(src)
+            best_eval_path = assert_safe_artifact_destination(
+                best_eval_path, ticket=ticket, what="best_eval promotion target"
+            )
+            generation = f"promo-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+            tmp_path = best_eval_path.with_name(best_eval_path.name + ".tmp")
+            with artifact_lock(best_eval_path, timeout=0.0, owner="phase4-promotion"):
+                with open(src, "rb") as fsrc, open(tmp_path, "wb") as fdst:
+                    shutil.copyfileobj(fsrc, fdst)
+                    fdst.flush()
+                    os.fsync(fdst.fileno())
+                tmp_sha = compute_sha256(tmp_path)
+                if tmp_sha != candidate_sha:
+                    tmp_path.unlink(missing_ok=True)
+                    return (
+                        False,
+                        "",
+                        f"promotion copy verification failed: source {candidate_sha[:16]}... "
+                        f"!= temp {tmp_sha[:16]}...",
+                    )
+                os.replace(tmp_path, best_eval_path)
+                try:
+                    dir_fd = os.open(str(best_eval_path.parent), os.O_RDONLY)
+                except OSError:
+                    dir_fd = None
+                if dir_fd is not None:
+                    try:
+                        os.fsync(dir_fd)
+                    except OSError:
+                        logger.debug("best_eval dir fsync failed", exc_info=True)
+                    finally:
+                        os.close(dir_fd)
+                # Metadata is written only after the artifact is safely in place,
+                # and carries the same generation id + hash.
                 self._best_eval_comp_score = comp_score
                 self._save_best_eval_state(
                     comp_score=comp_score,
@@ -1356,26 +1515,35 @@ class Phase4Orchestrator:
                     puzzle_rate=float(solve_rate),
                     step=self.trainer.step_num,
                     checkpoint=ckpt_name,
+                    checkpoint_sha256=candidate_sha,
+                    generation=generation,
+                    reason=gate_reason,
                 )
-                logger.info(
-                    f"[PROMOTION] New best eval checkpoint saved (score={comp_score:.3f}, "
-                    f"{gate_reason}): {best_eval_path}"
-                )
-                self._event("PROMOTION", f"best_eval.pt updated (score={comp_score:.4f})")
-            except Exception as e:
-                logger.warning(f"Failed to copy best_eval.pt: {e}")
-        else:
             logger.info(
-                "[PROMOTION] No improvement (composite %.4f <= best %.4f)",
+                "[PROMOTION] best_eval.pt updated atomically (score=%.3f, %s, gen=%s, "
+                "sha256=%s): %s",
                 comp_score,
-                previous_best,
+                gate_reason,
+                generation,
+                candidate_sha[:16],
+                best_eval_path,
             )
-
-        return {
-            "puzzle": puzzle_res,
-            "match": match_res,
-            "checkpoint": ckpt_name,
-        }
+            self._event(
+                "PROMOTION",
+                f"best_eval.pt updated (score={comp_score:.4f}, gen={generation}, "
+                f"sha256={candidate_sha[:16]})",
+            )
+            return True, generation, f"promoted {candidate_sha[:16]}..."
+        except Exception as exc:  # promotion failure must never crash the run
+            # A failure we caught here proves the temp file is incomplete or
+            # unverified, so it is removed (a hard crash still leaves it as
+            # evidence, and cleanup.protect keeps it from being pruned blindly).
+            try:
+                (self.checkpoint_dir / "best_eval.pt.tmp").unlink(missing_ok=True)
+            except OSError:
+                logger.debug("could not remove failed promotion temp", exc_info=True)
+            logger.error("Failed to promote best_eval.pt: %s", exc, exc_info=True)
+            return False, "", f"promotion failed: {type(exc).__name__}: {exc}"
 
     def record_entropy(self, entropy: float) -> None:
         """Record policy entropy for baseline and rolling average monitoring."""
@@ -2086,16 +2254,62 @@ class Phase4Orchestrator:
         self._event("SHUTDOWN", "stopping workers and saving final checkpoint")
         logger.info("Shutting down Phase 4 orchestrator...")
         self.stop_event.set()
-        # Stamp the termination status into the final checkpoint so a structurally
-        # valid checkpoint from a failed run can never masquerade as a completed
-        # training run (the Oct 26 Run B failure mode).
+        # Stamp the termination status into the FINAL CHECKPOINT (not only the
+        # trainer's in-memory dict) so a structurally valid checkpoint from a
+        # failed run can never masquerade as a completed training run. The
+        # ledger is advanced to a terminal state from RUN_STATES and the final
+        # save below writes it into the artifact (finding CKP-01; the Oct-26 Run
+        # B failure mode — the ledger existed but never reached disk).
         try:
-            self.trainer.run_metadata["run_status"] = getattr(
-                self, "_status_for_checkpoint", "unknown"
+            from python.model.checkpoint_schema import (
+                RUN_STATE_CANCELLED,
+                RUN_STATE_COMPLETED,
+                RUN_STATE_FAILED,
+                RUN_STATE_INTERRUPTED,
+                advance_run_state_inplace,
             )
+
+            status = str(getattr(self, "_status_for_checkpoint", "") or "")
+            exit_reason = str(getattr(self, "_exit_reason", "") or "")
+            state = {
+                "SUCCESS": RUN_STATE_COMPLETED,
+                "INTERRUPTED": RUN_STATE_INTERRUPTED,
+                "CANCELLED": RUN_STATE_CANCELLED,
+                "FAILED": RUN_STATE_FAILED,
+                # A safety stop means the run did NOT complete; it is recorded as
+                # a failure with the reason, never as success.
+                "SAFETY_STOP": RUN_STATE_FAILED,
+            }.get(status)
+            if state is None:
+                # No explicit status (e.g. a zero-step run that hit its duration
+                # limit, or an early return): fall back to the recorded exit
+                # reason, and treat a truly unknown termination as FAILED — an
+                # unobservable outcome is never reported as success.
+                state = {
+                    "ok": RUN_STATE_COMPLETED,
+                    "interrupted": RUN_STATE_INTERRUPTED,
+                }.get(exit_reason, RUN_STATE_FAILED)
+            reason = None
+            if status == "SAFETY_STOP":
+                reason = "safety trigger stopped the run"
+            elif state == RUN_STATE_FAILED:
+                reason = f"terminated with status {status or exit_reason or 'unknown'}"
+            advance_run_state_inplace(
+                self.trainer.run_metadata,
+                state,
+                step=int(getattr(self.trainer, "step_num", 0) or 0),
+                reason=reason,
+            )
+            self.trainer.run_metadata["run_status"] = status  # legacy field, kept in sync
             self.trainer.run_metadata["terminated_at_unix"] = time.time()
-        except AttributeError:
-            pass
+            logger.info(
+                "[RUN-STATUS] final ledger state=%s (cli status %s) run_id=%s",
+                self.trainer.run_metadata.get("run_state"),
+                status,
+                self.trainer.run_metadata.get("run_id"),
+            )
+        except Exception as exc:  # ledger stamping must never block shutdown
+            logger.error("Failed to stamp run status into the final checkpoint: %s", exc)
         try:
             self.worker.stop()
             final_ckpt = self.trainer.save_checkpoint(

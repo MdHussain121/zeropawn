@@ -65,11 +65,28 @@ logger = logging.getLogger(__name__)
 
 
 def _atomic_torch_save(state: dict[str, Any], path: Path) -> None:
-    """Write torch state atomically via tmp file + os.replace, then fsync dir."""
+    """Write torch state atomically: tmp file, fsync file, replace, fsync dir.
+
+    Every artifact writer in the project funnels through this primitive. The
+    temp file's own fsync is the step that makes the "complete candidate" real
+    before the rename (audit CKP-03 requirement 5), so an interrupted write can
+    never publish a partially-flushed rename target.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(path.name + ".tmp")
     torch.save(state, tmp_path)
+    try:
+        fd = os.open(str(tmp_path), os.O_RDONLY)
+    except OSError:
+        logger.debug("Could not open tmp checkpoint for fsync: %s", tmp_path)
+    else:
+        try:
+            os.fsync(fd)
+        except OSError:
+            logger.debug("fsync failed for %s", tmp_path)
+        finally:
+            os.close(fd)
     os.replace(tmp_path, path)
     try:
         fd = os.open(str(path.parent), os.O_RDONLY)
@@ -531,14 +548,47 @@ def save_checkpoint(
     num_filters: int = 128,
     keep_last_n: int = 3,
     run_metadata: Optional[dict[str, Any]] = None,
+    provenance: Optional[dict[str, Any]] = None,
+    artifact_ticket: Optional[Any] = None,
 ) -> None:
     """Save training state checkpoint (atomic tmp write + os.replace).
 
-    Every save carries the optimizer/checkpoint type stamps (audit SLQ-17) and
-    the run's provenance metadata (audit SLQ-02: run identity, dataset
-    receipts, git commit, seed, and configuration travel inside the artifact).
+    Every save carries the optimizer/checkpoint type stamps (audit SLQ-17), the
+    run's provenance metadata (audit SLQ-02: run identity, dataset receipts, git
+    commit, seed, and configuration travel inside the artifact), the formal
+    schema version (CKP-10), the run-status ledger (CKP-01), and CUDA RNG state
+    when training on CUDA (CKP-12). The destination is validated against the
+    production-write policy and held under a cross-process lock for the update.
     """
-    checkpoint_path = Path(checkpoint_path)
+    from python.common.artifacts import artifact_lock, assert_safe_artifact_destination
+    from python.model.checkpoint_schema import CURRENT_SUPERVISED_FORMAT, build_provenance
+
+    checkpoint_path = assert_safe_artifact_destination(
+        checkpoint_path,
+        ticket=artifact_ticket,
+        arch=(int(num_blocks), int(num_filters)),
+        what="supervised checkpoint",
+    )
+    ledger = dict(run_metadata) if run_metadata else {}
+    provenance_payload = dict(provenance) if provenance else build_provenance(
+        run_id=ledger.get("run_id"),
+        run_type=ledger.get("run_type", "supervised"),
+        config=ledger.get("config"),
+        model_arch=(int(num_blocks), int(num_filters)),
+        param_count=int(sum(p.numel() for p in model.parameters())),
+        dataset=ledger.get("dataset"),
+        parent_checkpoint=ledger.get("parent_checkpoint"),
+        optimizer_config={"type": type(optimizer).__name__},
+        scheduler_config=scheduler.state_dict()
+        if hasattr(scheduler, "state_dict")
+        else {},
+    )
+    cuda_rng: Optional[list] = None
+    if torch.cuda.is_available():
+        try:
+            cuda_rng = list(torch.cuda.get_rng_state_all())
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("CUDA RNG capture failed", exc_info=True)
     state = {
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
@@ -549,8 +599,10 @@ def save_checkpoint(
         "num_blocks": num_blocks,
         "num_filters": num_filters,
         "checkpoint_type": "supervised",
+        "checkpoint_format": CURRENT_SUPERVISED_FORMAT,
         "_optimizer_type": "AdamW",
-        "run_metadata": dict(run_metadata) if run_metadata else {},
+        "run_metadata": ledger,
+        "provenance": provenance_payload,
         "metadata": {
             "architecture": f"{num_blocks} ResBlocks x {num_filters} Filters",
             "step": step,
@@ -559,19 +611,21 @@ def save_checkpoint(
         "rng_state": torch.get_rng_state(),
         "numpy_rng_state": _safe_numpy_rng_state(),
         "python_rng_state": random.getstate(),
+        "cuda_rng_state": cuda_rng,
     }
-    _atomic_torch_save(state, checkpoint_path)
-    print(f"\n[CHECKPOINT] Saved step {step} state to {checkpoint_path}")
-    if keep_last_n >= 0:
-        try:
-            from python.common.cleanup import prune_checkpoints
+    with artifact_lock(checkpoint_path, timeout=0.0, owner=f"supervised-save step {step}"):
+        _atomic_torch_save(state, checkpoint_path)
+        print(f"\n[CHECKPOINT] Saved step {step} state to {checkpoint_path}")
+        if keep_last_n >= 0:
+            try:
+                from python.common.cleanup import prune_checkpoints
 
-            parent = Path(checkpoint_path).parent
-            # Only prune periodic step checkpoints, never best/latest.
-            if Path(checkpoint_path).name.startswith("checkpoint_step_"):
-                prune_checkpoints(parent, keep_last_n=keep_last_n)
-        except (OSError, ValueError):
-            logger.debug("supervised checkpoint prune skipped", exc_info=True)
+                parent = Path(checkpoint_path).parent
+                # Only prune periodic step checkpoints, never best/latest.
+                if Path(checkpoint_path).name.startswith("checkpoint_step_"):
+                    prune_checkpoints(parent, keep_last_n=keep_last_n)
+            except (OSError, ValueError):
+                logger.debug("supervised checkpoint prune skipped", exc_info=True)
 
 
 class _RunTelemetry:
@@ -774,6 +828,8 @@ def train_supervised(
     allow_uncertified_data: bool = False,
     verify_identity: str = "full",
     override_schedule: bool = False,
+    checkpoint_identity: str = "auto",
+    artifact_ticket: Optional[Any] = None,
     **kwargs: Any,
 ) -> dict[str, float]:
     """Execute supervised training loop.
@@ -1044,6 +1100,7 @@ def train_supervised(
         log_dir=log_dir,
     )
     run_metadata["model"]["param_count"] = sum(p.numel() for p in model.parameters())
+    run_metadata.setdefault("run_type", "supervised")
     telemetry = _RunTelemetry(ckpt_dir, run_metadata)
     telemetry.log(
         {
@@ -1059,7 +1116,9 @@ def train_supervised(
     best_val_loss = float("inf")
 
     if resume_path and Path(resume_path).exists():
-        print(f"Resuming checkpoint from {resume_path}...")
+        mode_label = "weights-only warm start" if resume_weights_only else "full resume"
+        print(f"[MODE] {mode_label} from {resume_path}...")
+        logger.info("[MODE] supervised %s from %s", mode_label, resume_path)
         try:
             checkpoint = torch.load(resume_path, map_location=device, weights_only=True)
         except (OSError, RuntimeError, KeyError) as e:
@@ -1067,6 +1126,74 @@ def train_supervised(
         if not isinstance(checkpoint, dict) or "model" not in checkpoint:
             raise RuntimeError(f"Checkpoint '{resume_path}' is invalid: missing 'model' weights.")
         _validate_arch(checkpoint, model, num_blocks, num_filters, resume_path)
+
+        # Identity (phase J) and schema (phase I) gates before any state is
+        # adopted. "auto" verifies registered artifacts and rejects hash drift,
+        # quarantine, and disqualification; unregistered files load by explicit
+        # path with a logged note.
+        if checkpoint_identity != "off":
+            from python.model.checkpoint_registry import verify_checkpoint_identity
+
+            verdict = verify_checkpoint_identity(Path(resume_path), repo_root=_repo_root)
+            if verdict["status"] in ("quarantined", "disqualified"):
+                raise RuntimeError(
+                    f"Checkpoint '{resume_path}' is {verdict['status']} in the checkpoint "
+                    f"registry ({verdict.get('detail', 'no detail')}). Refusing to load it."
+                )
+            if verdict["status"] == "hash_mismatch":
+                raise RuntimeError(
+                    f"Checkpoint '{resume_path}' hash {str(verdict['sha256'])[:16]}... does not "
+                    f"match its registry record ({str(verdict.get('expected'))[:16]}...); the "
+                    "file changed after verification. Refusing to load."
+                )
+            if verdict["status"] == "unregistered" and checkpoint_identity == "required":
+                raise RuntimeError(
+                    f"Checkpoint '{resume_path}' is not registered in "
+                    "docs/checkpoint_registry.json (identity verification is required)."
+                )
+            logger.info("[IDENTITY] %s", verdict)
+
+        from python.model.checkpoint_schema import (
+            RUN_STATE_FAILED,
+            describe_run_status,
+            validate_checkpoint_schema,
+            validate_run_metadata,
+        )
+
+        verdict_schema = validate_checkpoint_schema(
+            checkpoint,
+            path=resume_path,
+            expected_family=None if resume_weights_only else "supervised",
+            allow_legacy=True,
+            require_full_state=not resume_weights_only,
+        )
+        for warning in verdict_schema.warnings:
+            logger.warning("[SCHEMA] %s: %s", Path(resume_path).name, warning)
+        predecessor_ledger = (
+            checkpoint.get("run_metadata") if isinstance(checkpoint.get("run_metadata"), dict) else None
+        )
+        for warning in validate_run_metadata(
+            predecessor_ledger, path=resume_path, required=not verdict_schema.is_legacy
+        ):
+            logger.warning("[RUN-STATUS] %s: %s", Path(resume_path).name, warning)
+        logger.info(
+            "[RUN-STATUS] %s predecessor: %s",
+            Path(resume_path).name,
+            describe_run_status(predecessor_ledger),
+        )
+        if predecessor_ledger and predecessor_ledger.get("run_state") == RUN_STATE_FAILED:
+            logger.warning(
+                "Checkpoint '%s' records a FAILED run (%s); the new run's ledger preserves "
+                "that predecessor status.",
+                resume_path,
+                predecessor_ledger.get("failure_reason"),
+            )
+        from python.model.checkpoint_schema import checkpoint_identity as _ckpt_identity
+
+        run_metadata["parent_checkpoint"] = _ckpt_identity(resume_path, hash_file=True)
+        run_metadata["predecessor_run"] = predecessor_ledger
+        run_metadata["run_type"] = "supervised-warm-start" if resume_weights_only else "supervised-resume"
+
         model.load_state_dict(checkpoint.get("model"))
         if not resume_weights_only:
             if checkpoint.get("optimizer") is not None:
@@ -1136,21 +1263,66 @@ def train_supervised(
                         rng = rng.to(torch.uint8)
                     torch.set_rng_state(rng)
                 except (RuntimeError, ValueError, TypeError) as e:
-                    logger.debug("Ignoring incompatible rng_state in '%s': %s", resume_path, e)
+                    logger.warning(
+                        "Checkpoint '%s' torch RNG state could not be restored (%s); continuing "
+                        "with fresh torch RNG (RNG continuity is NOT claimed).",
+                        resume_path,
+                        e,
+                    )
             if checkpoint.get("numpy_rng_state") is not None:
                 try:
                     _restore_numpy_rng_state(checkpoint["numpy_rng_state"])
                 except (ValueError, TypeError) as e:
-                    logger.debug(
-                        "Ignoring incompatible numpy_rng_state in '%s': %s", resume_path, e
+                    logger.warning(
+                        "Checkpoint '%s' numpy RNG state could not be restored (%s); continuing "
+                        "with fresh numpy RNG.",
+                        resume_path,
+                        e,
                     )
             if checkpoint.get("python_rng_state") is not None:
                 try:
                     random.setstate(checkpoint["python_rng_state"])
                 except (ValueError, TypeError) as e:
-                    logger.debug(
-                        "Ignoring incompatible python_rng_state in '%s': %s", resume_path, e
+                    logger.warning(
+                        "Checkpoint '%s' python RNG state could not be restored (%s); continuing "
+                        "with fresh python RNG.",
+                        resume_path,
+                        e,
                     )
+            # CUDA RNG (CKP-12): restored only when the captured device topology
+            # matches this run; otherwise the difference is stated explicitly.
+            saved_cuda_rng = checkpoint.get("cuda_rng_state")
+            if saved_cuda_rng is not None:
+                if device.type != "cuda" or not torch.cuda.is_available():
+                    logger.info(
+                        "Checkpoint '%s' carries CUDA RNG state but this run is CPU-only; "
+                        "not restored.",
+                        resume_path,
+                    )
+                else:
+                    try:
+                        states = [torch.as_tensor(s, dtype=torch.uint8) for s in saved_cuda_rng]
+                        if len(states) != torch.cuda.device_count():
+                            logger.warning(
+                                "Checkpoint '%s' captured CUDA RNG state for %d device(s) but %d "
+                                "are present; CUDA RNG NOT restored.",
+                                resume_path,
+                                len(states),
+                                torch.cuda.device_count(),
+                            )
+                        else:
+                            torch.cuda.set_rng_state_all(states)
+                            logger.info(
+                                "Restored CUDA RNG state for %d device(s) from '%s'",
+                                len(states),
+                                resume_path,
+                            )
+                    except (RuntimeError, ValueError, TypeError) as e:
+                        logger.warning(
+                            "Checkpoint '%s' CUDA RNG state could not be restored (%s).",
+                            resume_path,
+                            e,
+                        )
             print(
                 f"Resumed at step {start_step}, epoch {start_epoch}, best val loss {best_val_loss:.4f}"
             )
@@ -1163,7 +1335,29 @@ def train_supervised(
     last_checkpoint_time = time.time()
     t_start = time.time()
 
+    # The run is now unmistakably RUNNING inside every artifact it writes
+    # (CKP-01): a checkpoint taken from here on can never be read as CREATED.
+    from python.model.checkpoint_schema import (
+        advance_run_state_inplace,
+        build_provenance,
+        checkpoint_identity as _ckpt_identity,
+    )
+
+    advance_run_state_inplace(run_metadata, "running", step=global_step, epoch=start_epoch)
+    provenance = build_provenance(
+        run_id=run_metadata.get("run_id"),
+        run_type=str(run_metadata.get("run_type", "supervised")),
+        config=run_metadata.get("config"),
+        model_arch=(int(num_blocks), int(num_filters)),
+        param_count=run_metadata.get("model", {}).get("param_count"),
+        dataset=run_metadata.get("dataset"),
+        parent_checkpoint=run_metadata.get("parent_checkpoint"),
+        optimizer_config={"type": type(optimizer).__name__},
+        scheduler_config=scheduler.state_dict(),
+    )
+
     val_metrics: dict[str, float] = {}
+    _run_failure: Optional[BaseException] = None
 
     try:
         for epoch in range(start_epoch, epochs):
@@ -1308,6 +1502,8 @@ def train_supervised(
                         num_blocks=num_blocks,
                         num_filters=num_filters,
                         run_metadata=run_metadata,
+                        provenance=provenance,
+                        artifact_ticket=artifact_ticket,
                     )
                     telemetry.checkpoint_event(
                         ckpt_dir / f"checkpoint_step_{global_step}.pt", "periodic", global_step
@@ -1346,6 +1542,8 @@ def train_supervised(
                         num_blocks=num_blocks,
                         num_filters=num_filters,
                         run_metadata=run_metadata,
+                        provenance=provenance,
+                        artifact_ticket=artifact_ticket,
                     )
                     telemetry.checkpoint_event(ckpt_dir / "best_model.pt", "best", global_step)
                 telemetry.log(
@@ -1405,6 +1603,8 @@ def train_supervised(
                     num_blocks=num_blocks,
                     num_filters=num_filters,
                     run_metadata=run_metadata,
+                    provenance=provenance,
+                    artifact_ticket=artifact_ticket,
                 )
                 telemetry.checkpoint_event(ckpt_dir / "best_model.pt", "best", global_step)
 
@@ -1414,6 +1614,13 @@ def train_supervised(
     except KeyboardInterrupt:
         print("\n[PAUSED] Training interrupted by user. Saving emergency checkpoint...")
         current_epoch = epoch if "epoch" in locals() else start_epoch
+        # The interrupted status is stamped BEFORE the emergency save so the
+        # artifact itself carries "interrupted" (CKP-01 §6.4) instead of the
+        # "running" state it would inherit from the periodic save path.
+        advance_run_state_inplace(
+            run_metadata, "interrupted", step=int(global_step), epoch=int(current_epoch),
+            reason="KeyboardInterrupt",
+        )
         save_checkpoint(
             ckpt_dir / "latest_checkpoint.pt",
             model,
@@ -1425,22 +1632,42 @@ def train_supervised(
             num_blocks=num_blocks,
             num_filters=num_filters,
             run_metadata=run_metadata,
+            provenance=provenance,
+            artifact_ticket=artifact_ticket,
         )
         telemetry.checkpoint_event(ckpt_dir / "latest_checkpoint.pt", "interrupted", global_step)
         raise
-    finally:
-        # Save final/latest checkpoint on clean completion (fixes missing final checkpoint bug)
+    except BaseException as exc:  # noqa: BLE001 - the ledger must record any failure
+        advance_run_state_inplace(
+            run_metadata,
+            "failed",
+            step=int(locals().get("global_step", start_step) or 0),
+            reason=f"{type(exc).__name__}: {exc}",
+        )
         try:
-            final_epoch = (
-                epoch + 1
-                if "epoch" in locals()
-                else (start_epoch + 1 if "start_epoch" in locals() else 0)
+            telemetry.log(
+                {"event": "run_failed", "error": f"{type(exc).__name__}: {exc}"}
             )
-            final_step = (
-                global_step
-                if "global_step" in locals()
-                else (start_step if "start_step" in locals() else 0)
-            )
+        except Exception:
+            logger.debug("telemetry failure log failed", exc_info=True)
+        raise
+    finally:
+        # Save final/latest checkpoint on clean completion (fixes missing final
+        # checkpoint bug). A failure here is NEVER silent (finding CKP-07): it is
+        # logged, recorded as an unsuccessful persistence event, reflected in the
+        # run-status ledger, and re-raised so the run cannot look successful.
+        final_epoch = (
+            epoch + 1
+            if "epoch" in locals()
+            else (start_epoch + 1 if "start_epoch" in locals() else 0)
+        )
+        final_step = (
+            global_step
+            if "global_step" in locals()
+            else (start_step if "start_step" in locals() else 0)
+        )
+        save_error: Optional[BaseException] = None
+        try:
             if "model" in locals() and "optimizer" in locals() and "scheduler" in locals():
                 save_checkpoint(
                     ckpt_dir / "latest_checkpoint.pt",
@@ -1453,20 +1680,60 @@ def train_supervised(
                     num_blocks=num_blocks if "num_blocks" in locals() else 12,
                     num_filters=num_filters if "num_filters" in locals() else 128,
                     run_metadata=run_metadata,
+                    provenance=provenance if "provenance" in locals() else None,
+                    artifact_ticket=artifact_ticket,
                 )
                 telemetry.checkpoint_event(
                     ckpt_dir / "latest_checkpoint.pt", "final", final_step
                 )
-        except Exception:
-            pass
+        except BaseException as exc:  # noqa: BLE001 - must not be swallowed
+            save_error = exc
+            logger.exception("Final supervised checkpoint save FAILED: %s", exc)
+            try:
+                telemetry.log(
+                    {
+                        "event": "checkpoint_saved_failed",
+                        "reason": "final",
+                        "path": str(ckpt_dir / "latest_checkpoint.pt"),
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+            except Exception:
+                logger.debug("telemetry failure record failed", exc_info=True)
+
+        in_flight = sys.exc_info()[1]
+        if save_error is not None:
+            final_status = "failed"
+            failure_reason = f"final checkpoint save failed: {type(save_error).__name__}: {save_error}"
+        elif isinstance(in_flight, KeyboardInterrupt):
+            final_status = "interrupted"
+            failure_reason = None
+        elif in_flight is not None:
+            final_status = "failed"
+            failure_reason = f"{type(in_flight).__name__}: {in_flight}"
+        else:
+            final_status = "completed"
+            failure_reason = None
         try:
-            final_status = "interrupted" if isinstance(sys.exc_info()[1], KeyboardInterrupt) else "completed"
+            advance_run_state_inplace(
+                run_metadata,
+                final_status,
+                step=int(final_step or 0),
+                epoch=int(final_epoch or 0),
+                reason=failure_reason,
+            )
+        except Exception:  # pragma: no cover - ledger already terminal
+            logger.debug("could not advance run ledger to %s", final_status, exc_info=True)
+        try:
             telemetry.finalize(
                 final_status,
                 extra={
-                    "final_step": final_step if "final_step" in locals() else None,
+                    "final_step": final_step,
                     "best_val_loss": best_val_loss if "best_val_loss" in locals() else None,
                     "val_metrics": val_metrics if "val_metrics" in locals() else None,
+                    "final_save_error": (
+                        None if save_error is None else f"{type(save_error).__name__}: {save_error}"
+                    ),
                 },
             )
         except Exception:
@@ -1490,6 +1757,19 @@ def train_supervised(
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+        # A run whose required final persistence failed must not return success
+        # to its caller (CKP-07). When an exception is already propagating it
+        # keeps priority (it is at least as severe); otherwise the save failure
+        # is raised here with the recovery diagnostic.
+        if save_error is not None and sys.exc_info()[1] is None:
+            raise RuntimeError(
+                f"Training finished, but the final checkpoint could not be saved to "
+                f"'{ckpt_dir / 'latest_checkpoint.pt'}': {type(save_error).__name__}: "
+                f"{save_error}. The previous valid checkpoint (if any) was left untouched; "
+                "check free disk space, directory permissions, and for another process "
+                "holding the artifact lock, then re-run."
+            ) from save_error
 
     return val_metrics
 

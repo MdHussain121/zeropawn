@@ -5,20 +5,37 @@ from __future__ import annotations
 import logging
 import os
 import pickle
-import queue
 import random
 import shutil
+import tempfile
 import time
+import uuid
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.optim import SGD
 
 logger = logging.getLogger(__name__)
+from python.common.artifacts import (
+    ProductionWriteTicket,
+    artifact_lock,
+    assert_safe_artifact_destination,
+    resolve_artifact_path,
+)
+from python.model.checkpoint_schema import (
+    CURRENT_RL_FORMAT,
+    RUN_STATE_FAILED,
+    build_provenance,
+    build_run_metadata,
+    checkpoint_identity,
+    describe_run_status,
+    stamp_run_state,
+    validate_checkpoint_schema,
+    validate_run_metadata,
+)
 from python.train.train_supervised import (
     WarmupCosineScheduler as WarmupCosineDecayScheduler,
     _atomic_torch_save,
@@ -38,6 +55,17 @@ class WeightPushError(RuntimeError):
     Fail-closed by design (Stage A §4): a push that fails silently would let
     actors keep sampling stale weights while the learner advances, so the
     failure must be observable to the caller.
+    """
+
+
+class BufferRestoreError(RuntimeError):
+    """Raised when a checkpoint's replay-buffer snapshot cannot be reconciled.
+
+    Fail-closed by design (finding CKP-05): rewinding a ring buffer's head over
+    newer metadata, or restoring a head without a matching size, silently mixes
+    policy generations. When the checkpoint and the live buffer cannot be
+    proven compatible the resume is refused with a diagnostic instead of
+    inventing a state.
     """
 
 
@@ -129,6 +157,7 @@ def inspect_rl_checkpoint(path: Union[str, Path]) -> Optional[Dict[str, Any]]:
             filters,
         )
         return None
+    ledger = ckpt.get("run_metadata")
     return {
         "path": str(p),
         "step": int(ckpt.get("step", 0) or 0),
@@ -137,7 +166,40 @@ def inspect_rl_checkpoint(path: Union[str, Path]) -> Optional[Dict[str, Any]]:
         "buffer_write_head": ckpt.get("buffer_write_head"),
         "last_push_step": ckpt.get("last_push_step"),
         "mtime": p.stat().st_mtime,
+        # Resume-selection inputs (findings CKP-01/CKP-08): a weights-only
+        # container in the RL directory must never be picked as a resume point,
+        # and a checkpoint that records a failed run must not silently look
+        # like a clean one.
+        "checkpoint_type": ckpt.get("checkpoint_type"),
+        "optimizer_type_stamp": ckpt.get("_optimizer_type"),
+        "run_state": ledger.get("run_state") if isinstance(ledger, dict) else None,
+        "run_id": ledger.get("run_id") if isinstance(ledger, dict) else None,
     }
+
+
+def is_resumable_candidate(info: Dict[str, Any]) -> tuple[bool, str]:
+    """Decide whether ``inspect_rl_checkpoint`` output may be an auto-resume point.
+
+    A candidate must either carry SGD optimizer state, or *declare itself* an
+    RL training checkpoint (a first-save RL checkpoint legitimately has no
+    per-parameter optimizer state yet). A weights-only export/container — no
+    ``checkpoint_type``, no ``_optimizer_type`` — is never resumable, no matter
+    where it is copied (findings CKP-08/CKP-09).
+    """
+    opt = info.get("optimizer_class")
+    if opt == "SGD":
+        return True, "SGD optimizer state"
+    if opt == "empty":
+        declared = info.get("checkpoint_type")
+        stamped = info.get("optimizer_type_stamp")
+        if declared == "rl" or stamped == "SGD":
+            return True, "declared RL checkpoint without per-parameter optimizer state yet"
+        return (
+            False,
+            "no optimizer state and not declared as an RL checkpoint "
+            "(weights-only container; must not become a resume point)",
+        )
+    return False, f"optimizer state is {opt} (foreign/poisoned — not resumable by an SGD trainer)"
 class RLTrainer:
     """Continuous RL trainer for self-play experience.
 
@@ -160,15 +222,28 @@ class RLTrainer:
         batch_size: int = 256,
         push_freq: int = 200,
         checkpoint_interval_sec: float = 1800.0,
-        checkpoint_dir: Union[str, Path] = "models/checkpoints_rl",
-        sync_weights_path: Union[str, Path] = "models/checkpoints_rl/live_weights.pt",
+        checkpoint_dir: Optional[Union[str, Path]] = None,
+        sync_weights_path: Optional[Union[str, Path]] = None,
         reload_queue: Optional[Any] = None,
         direct_server: Optional[Any] = None,
         use_bfloat16: bool = True,
         gpu_cache_capacity: Optional[int] = None,
         policy_target_temp: float = 0.5,
         entropy_bonus: float = 0.001,
+        artifact_ticket: Optional[ProductionWriteTicket] = None,
+        label: str = "rl-trainer",
     ) -> None:
+        """Construct the trainer.
+
+        ``checkpoint_dir``/``sync_weights_path`` are artifacts paths and are
+        **never** resolved against the process working directory (finding
+        CKP-04: CWD-relative defaults let a 2x32 test model overwrite the
+        production ``live_weights.pt`` on 2026-10-30). Relative paths resolve
+        against the repository root; when omitted entirely the trainer writes
+        into a session temporary directory and says so loudly — production
+        callers must name their output tree explicitly, which also mints the
+        :class:`ProductionWriteTicket` that protected destinations require.
+        """
         if device is None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         else:
@@ -180,10 +255,21 @@ class RLTrainer:
         self.batch_size = batch_size
         self.push_freq = push_freq
         self.checkpoint_interval_sec = checkpoint_interval_sec
-        self.checkpoint_dir = Path(checkpoint_dir)
+        if checkpoint_dir is None:
+            session_dir = Path(tempfile.mkdtemp(prefix=f"zeropawn_{label}_"))
+            logger.warning(
+                "RLTrainer constructed without an explicit checkpoint_dir; writing to session "
+                "directory %s. Production training must pass an explicit checkpoint directory.",
+                session_dir,
+            )
+            checkpoint_dir = session_dir
+        self.checkpoint_dir = resolve_artifact_path(checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        self.sync_weights_path = Path(sync_weights_path)
+        if sync_weights_path is None:
+            sync_weights_path = self.checkpoint_dir / "live_weights.pt"
+        self.sync_weights_path = resolve_artifact_path(sync_weights_path)
         self.sync_weights_path.parent.mkdir(parents=True, exist_ok=True)
+        self.artifact_ticket = artifact_ticket
 
         self.reload_queue = reload_queue
         self.direct_server = direct_server
@@ -232,6 +318,29 @@ class RLTrainer:
         self.inherited_step_num = 0
         self.warm_start_path: Optional[str] = None
         self.warm_start_step: Optional[int] = None
+
+        # Run-status ledger (finding CKP-01): every checkpoint this trainer
+        # writes embeds this dict, so a structurally valid checkpoint from a
+        # failed run can never masquerade as a completed one. The orchestrator
+        # (or load_checkpoint for a resume) replaces/extends it.
+        self.run_metadata: Dict[str, Any] = build_run_metadata(
+            run_id=f"rl-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}",
+            run_type="rl",
+            seed=None,
+            config={
+                "base_lr": float(base_lr),
+                "min_lr": float(min_lr),
+                "momentum": float(momentum),
+                "weight_decay": float(weight_decay),
+                "warmup_steps": int(warmup_steps),
+                "total_steps": int(total_steps),
+                "batch_size": int(batch_size),
+                "push_freq": int(push_freq),
+                "policy_target_temp": float(policy_target_temp),
+                "entropy_bonus": float(entropy_bonus),
+            },
+        )
+        self.provenance: Dict[str, Any] = {}
 
         # Dedicated non-default CUDA stream for training pipeline
         if self.device.type == "cuda":
@@ -363,6 +472,8 @@ class RLTrainer:
         scheduler_override: bool = True,
         reset_step: bool = False,
         warm_start: bool = False,
+        reset_buffer: bool = False,
+        verify_identity: str = "auto",
     ) -> int:
         """Resume training from a checkpoint.
 
@@ -372,6 +483,21 @@ class RLTrainer:
         (supervised) run, so RL progress restarts at 0 and the inherited
         counter is kept only as provenance metadata. Resuming this run's own
         checkpoint uses the default.
+
+        Validation performed before any state is touched (findings CKP-01/05/06/10
+        and roadmap phases I/J/P):
+
+        * the schema contract (``validate_checkpoint_schema``) — current format
+          fully validated, legacy artifacts accepted explicitly with a warning,
+          newer/unknown formats rejected;
+        * the run-status ledger is surfaced (``describe_run_status``) so a
+          failed run's checkpoint cannot be read as a completed one;
+        * registry identity is verified against the exact file being loaded
+          (``verify_identity``: "auto" checks registered artifacts and rejects
+          hash drift, quarantine, and disqualification; "required" also refuses
+          unregistered files; "off" skips);
+        * the replay buffer's snapshot triple and generation are reconciled with
+          the live buffer (``reset_buffer`` acknowledges a deliberate reset).
         """
         path_str = str(path)
         reset_step = bool(reset_step or warm_start)
@@ -382,10 +508,61 @@ class RLTrainer:
         if not isinstance(ckpt, dict) or "model" not in ckpt:
             raise RuntimeError(f"Checkpoint '{path_str}' is invalid: missing 'model' weights.")
 
+        verification = self._verify_checkpoint_identity(path, verify_identity)
+        if verification is not None:
+            logger.info("[IDENTITY] %s", verification)
+
+        # Domain-level gates first (architecture, then optimizer family): these
+        # produce the specific diagnostics users act on. The schema contract is
+        # enforced immediately afterwards, before ANY state is adopted.
         _validate_arch(ckpt, self.model, getattr(self.model, "num_blocks", 12), getattr(self.model, "num_filters", 128), path_str)
+        _validate_checkpoint_optimizer_compatibility(ckpt, path_str, warm_start=reset_step)
+
+        verdict = validate_checkpoint_schema(
+            ckpt,
+            path=path_str,
+            expected_family=None if reset_step else "rl",
+            allow_legacy=True,
+            require_full_state=not reset_step,
+        )
+        for warning in verdict.warnings:
+            logger.warning("[SCHEMA] %s: %s", Path(path_str).name, warning)
+        ledger = ckpt.get("run_metadata")
+        for warning in validate_run_metadata(
+            ledger, path=path_str, required=not verdict.is_legacy
+        ):
+            logger.warning("[RUN-STATUS] %s: %s", Path(path_str).name, warning)
+        logger.info(
+            "[RUN-STATUS] %s predecessor: %s", Path(path_str).name, describe_run_status(ledger)
+        )
+        if isinstance(ledger, dict) and ledger.get("run_state") == RUN_STATE_FAILED:
+            logger.warning(
+                "Checkpoint '%s' records a FAILED run (%s). Resuming is allowed, but the "
+                "failure is preserved in the new run's ledger as predecessor status.",
+                path_str,
+                ledger.get("failure_reason"),
+            )
 
         self.model.load_state_dict(ckpt.get("model"))
-        _validate_checkpoint_optimizer_compatibility(ckpt, path_str, warm_start=reset_step)
+
+        # Continuation lineage: a resumed run is a NEW run whose ledger names the
+        # predecessor. Terminal predecessors are never re-opened (CKP-01 §6.4).
+        self._resume_parent_identity = checkpoint_identity(path, hash_file=True)
+        predecessor_ledger = dict(ledger) if isinstance(ledger, dict) else None
+        self.run_metadata = build_run_metadata(
+            run_type="rl-resume" if not reset_step else "rl-warm-start",
+            seed=self.run_metadata.get("seed"),
+            config=self.run_metadata.get("config"),
+            parent_checkpoint=self._resume_parent_identity,
+            extra=(
+                {"predecessor_run": predecessor_ledger}
+                if predecessor_ledger
+                else {}
+            ),
+        )
+        if reset_step:
+            self.run_metadata["warm_start"] = path_str
+        self.provenance = {}
 
         if reset_step:
             # Weights-only warm start (audit R-09): never adopt foreign
@@ -477,15 +654,12 @@ class RLTrainer:
                     self.entropy_bonus,
                 )
 
-        if ckpt.get("buffer_write_head") is not None and hasattr(self.replay_buffer, "write_head"):
-            try:
-                head = int(ckpt["buffer_write_head"])
-                cap = getattr(self.replay_buffer, "capacity", None)
-                if cap and cap > 0:
-                    head = head % cap
-                self.replay_buffer.write_head = head
-            except (ValueError, TypeError):
-                logger.debug("Ignoring invalid buffer_write_head in '%s'", path_str)
+        # ── Replay-buffer restoration contract (finding CKP-05) ──────────────
+        # The checkpoint's snapshot triple and the live buffer's triple are
+        # reconciled as a unit; the head is never rewound over newer metadata
+        # and ``size`` is never left behind by a pointer-only restore.
+        if hasattr(self.replay_buffer, "write_head") and not reset_step:
+            self._restore_buffer_state(ckpt, path_str, reset_buffer=reset_buffer)
 
         if ckpt.get("rng_state") is not None:
             try:
@@ -495,18 +669,34 @@ class RLTrainer:
                 if hasattr(rng, "to") and hasattr(rng, "dtype") and rng.dtype != torch.uint8:
                     rng = rng.to(torch.uint8)
                 torch.set_rng_state(rng)
-            except (RuntimeError, ValueError, TypeError):
-                pass
+            except (RuntimeError, ValueError, TypeError) as e:
+                logger.warning(
+                    "Checkpoint '%s' torch RNG state could not be restored (%s); this run "
+                    "continues with fresh torch RNG (bitwise RNG continuity is NOT claimed).",
+                    path_str,
+                    e,
+                )
         if ckpt.get("numpy_rng_state") is not None:
             try:
                 _restore_numpy_rng_state(ckpt["numpy_rng_state"])
-            except (ValueError, TypeError):
-                pass
+            except (ValueError, TypeError) as e:
+                logger.warning(
+                    "Checkpoint '%s' numpy RNG state could not be restored (%s); continuing "
+                    "with fresh numpy RNG.",
+                    path_str,
+                    e,
+                )
         if ckpt.get("python_rng_state") is not None:
             try:
                 random.setstate(ckpt["python_rng_state"])
-            except (ValueError, TypeError):
-                pass
+            except (ValueError, TypeError) as e:
+                logger.warning(
+                    "Checkpoint '%s' python RNG state could not be restored (%s); continuing "
+                    "with fresh python RNG.",
+                    path_str,
+                    e,
+                )
+        self._restore_cuda_rng_state(ckpt.get("cuda_rng_state"), path_str)
 
         if "model_version" in ckpt and self.direct_server is not None:
             try:
@@ -517,27 +707,390 @@ class RLTrainer:
         logger.info("Resumed training from %s at step %d", path_str, self.step_num)
         return self.step_num
 
+    # ── Identity verification (Phase J) ──────────────────────────────────────
+
+    def _verify_checkpoint_identity(self, path: Union[str, Path], mode: str) -> Optional[str]:
+        """Verify the exact file being loaded against the checkpoint registry.
+
+        ``mode``: "off" skips; "required" also refuses unregistered files;
+        "auto" (default) verifies registered artifacts and logs when a file is
+        unregistered. Hash mismatches, quarantined, and disqualified entries are
+        always refused — a file that changed after verification, or a
+        quarantined snapshot, must never be resumed silently.
+        """
+        if mode == "off":
+            return None
+        from python.model.checkpoint_registry import verify_checkpoint_identity
+
+        # The registry is discovered from the artifact's own tree (a worktree may
+        # hold checkpoints whose governance record lives in the same tree).
+        verdict = verify_checkpoint_identity(Path(path))
+        if verdict["status"] == "unregistered":
+            if mode == "required":
+                raise RuntimeError(
+                    f"Checkpoint '{path}' is not registered in docs/checkpoint_registry.json "
+                    "(identity verification is required). Register it or pass "
+                    "verify_identity='auto'."
+                )
+            return f"unregistered artifact (sha256 {verdict['sha256'][:16]}...); loading by explicit path"
+        if verdict["status"] in ("quarantined", "disqualified"):
+            raise RuntimeError(
+                f"Checkpoint '{path}' is {verdict['status']} in the checkpoint registry "
+                f"({verdict.get('detail', 'no detail')}). Refusing to load it."
+            )
+        if verdict["status"] == "hash_mismatch":
+            raise RuntimeError(
+                f"Checkpoint '{path}' hash {verdict['sha256'][:16]}... does not match its "
+                f"registry record ({str(verdict.get('expected'))[:16]}...). The file changed "
+                "after verification; provenance is broken. Refusing to load."
+            )
+        return (
+            f"registry {verdict['status']} (entry {verdict.get('entry_id')}, "
+            f"sha256 {verdict['sha256'][:16]}...)"
+        )
+
+    # ── Replay-buffer restoration contract (finding CKP-05) ──────────────────
+
+    def _restore_buffer_state(
+        self,
+        ckpt: Dict[str, Any],
+        path_str: str,
+        *,
+        reset_buffer: bool = False,
+    ) -> None:
+        """Reconcile the checkpoint's buffer snapshot with the live buffer.
+
+        Contract (explicit, fail-closed, recorded in run metadata):
+
+        * ``reset_buffer`` — the operator already acknowledged losing buffer
+          contents (``--reset-buffer``): the live counters are left untouched
+          (an empty buffer stays empty; no records are invented), and the
+          checkpoint's snapshot is kept as provenance only.
+        * incompatible generations — checkpoint and live buffer both carry a
+          generation id and they differ: refused.
+        * live buffer older or emptier than the checkpoint's snapshot: refused
+          (restoring would silently discard records the checkpoint expects).
+        * live buffer same generation (or unknown legacy markers) and equal-or-
+          newer: the **live** triple (write_head, size, total_added) is adopted
+          as a unit, so the ring stays internally consistent and no consumer can
+          observe a rewound head over a newer size.
+        """
+        live = None
+        if hasattr(self.replay_buffer, "buffer_state"):
+            try:
+                live = dict(self.replay_buffer.buffer_state())
+            except Exception:  # pragma: no cover - defensive
+                live = None
+        if live is None:
+            live = {
+                "write_head": int(getattr(self.replay_buffer, "write_head", 0) or 0),
+                "size": int(len(self.replay_buffer)) if hasattr(self.replay_buffer, "__len__") else 0,
+                "total_added": int(getattr(self.replay_buffer, "total_added", 0) or 0),
+                "capacity": int(getattr(self.replay_buffer, "capacity", 0) or 0),
+                "generation": getattr(self.replay_buffer, "buffer_generation", None),
+            }
+
+        saved_state = ckpt.get("buffer_state")
+        if not isinstance(saved_state, dict):
+            # Legacy checkpoint: only buffer_write_head/buffer_size exist.
+            saved_head = ckpt.get("buffer_write_head")
+            saved_size = ckpt.get("buffer_size")
+            if saved_head is None and saved_size is None:
+                logger.info(
+                    "[BUFFER] Checkpoint '%s' carries no buffer snapshot; live buffer state is "
+                    "unchanged (%s).",
+                    path_str,
+                    live,
+                )
+                self.run_metadata["buffer_resume_decision"] = {
+                    "decision": "checkpoint_has_no_buffer_state",
+                    "live": live,
+                }
+                return
+            saved_state = {
+                "write_head": int(saved_head or 0),
+                "size": int(saved_size or 0),
+                "total_added": int(saved_size or 0),  # legacy: no total_added was recorded
+                "capacity": None,
+                "generation": None,
+                "legacy": True,
+            }
+        saved = {
+            "write_head": int(saved_state.get("write_head") or 0),
+            "size": int(saved_state.get("size") or 0),
+            "total_added": int(saved_state.get("total_added") or saved_state.get("size") or 0),
+            "capacity": saved_state.get("capacity"),
+            "generation": saved_state.get("generation"),
+            "legacy": bool(saved_state.get("legacy", False)),
+        }
+
+        decision: Dict[str, Any] = {
+            "checkpoint": saved,
+            "live": live,
+            "policy": "live-if-newer (same generation)",
+        }
+
+        if reset_buffer:
+            decision["decision"] = "reset_buffer_explicit"
+            logger.info(
+                "[BUFFER] --reset-buffer given: live buffer starts fresh (size=%s) and the "
+                "checkpoint's snapshot %s is retained as provenance only. No records are "
+                "invented from the checkpoint.",
+                live["size"],
+                {k: saved[k] for k in ("write_head", "size", "total_added")},
+            )
+            self.run_metadata["buffer_resume_decision"] = decision
+            return
+
+        saved_gen = saved.get("generation")
+        live_gen = live.get("generation")
+        if saved_gen and live_gen and saved_gen != live_gen:
+            decision["decision"] = "refused_generation_mismatch"
+            self.run_metadata["buffer_resume_decision"] = decision
+            raise BufferRestoreError(
+                f"Refusing to resume '{path_str}': the checkpoint was saved against replay-buffer "
+                f"generation {saved_gen} but the live buffer is generation {live_gen}. Splicing "
+                "two generations would mix unrelated self-play data. Pass --reset-buffer to "
+                "acknowledge starting from the live buffer as-is, or restore the matching buffer."
+            )
+
+        if live["size"] == 0 and live["total_added"] == 0 and (
+            saved["size"] > 0 or saved["total_added"] > 0
+        ):
+            decision["decision"] = "refused_live_buffer_empty"
+            self.run_metadata["buffer_resume_decision"] = decision
+            raise BufferRestoreError(
+                f"Refusing to resume '{path_str}': the checkpoint expects "
+                f"{saved['size']:,} buffered records but the live replay buffer is empty. "
+                "Restoring the checkpoint pointer into an empty buffer would fabricate a "
+                "state that does not exist. Pass --reset-buffer to continue from the empty "
+                "buffer knowingly (the checkpoint's records are then unrecoverable)."
+            )
+
+        if live["total_added"] < saved["total_added"]:
+            decision["decision"] = "refused_live_buffer_older"
+            self.run_metadata["buffer_resume_decision"] = decision
+            raise BufferRestoreError(
+                f"Refusing to resume '{path_str}': the checkpoint snapshot holds "
+                f"{saved['total_added']:,} records but the live buffer only has "
+                f"{live['total_added']:,}. The live buffer is older than the checkpoint "
+                "snapshot (records were lost or replaced). Pass --reset-buffer to acknowledge."
+            )
+
+        # Equal-or-newer live state, compatible generation: adopt live as a unit.
+        adopted = {
+            "write_head": live["write_head"],
+            "size": live["size"],
+            "total_added": live["total_added"],
+        }
+        cap = live.get("capacity") or 0
+        if cap > 0:
+            if not (0 <= adopted["write_head"] < cap):
+                raise BufferRestoreError(
+                    f"Live replay buffer head {adopted['write_head']} is outside [0, {cap}); "
+                    "refusing to resume on an inconsistent ring."
+                )
+            if not (0 <= adopted["size"] <= cap):
+                raise BufferRestoreError(
+                    f"Live replay buffer size {adopted['size']} is outside [0, {cap}]; "
+                    "refusing to resume on an inconsistent ring."
+                )
+            if adopted["size"] < cap and adopted["write_head"] != adopted["size"]:
+                decision["warning"] = (
+                    f"non-wrapped ring with head {adopted['write_head']} != size "
+                    f"{adopted['size']} (legacy metadata); adopting the live triple as-is"
+                )
+                logger.warning("[BUFFER] %s", decision["warning"])
+
+        same = (
+            saved["write_head"] == live["write_head"]
+            and saved["size"] == live["size"]
+            and saved["total_added"] == live["total_added"]
+        )
+        decision["decision"] = "identical_snapshot" if same else "adopted_live_newer"
+        self.run_metadata["buffer_resume_decision"] = decision
+        if same:
+            logger.info(
+                "[BUFFER] Checkpoint and live buffer agree exactly (head=%d, size=%d, "
+                "total_added=%d, generation=%s).",
+                live["write_head"],
+                live["size"],
+                live["total_added"],
+                live_gen or "unknown",
+            )
+        else:
+            logger.info(
+                "[BUFFER] Live buffer is newer than the checkpoint snapshot; continuing from the "
+                "LIVE state (head=%d, size=%d, total_added=%d) instead of rewinding to the "
+                "checkpoint's (head=%d, size=%d, total_added=%d). The checkpoint snapshot is "
+                "recorded in run metadata as provenance.",
+                live["write_head"],
+                live["size"],
+                live["total_added"],
+                saved["write_head"],
+                saved["size"],
+                saved["total_added"],
+            )
+
+    def _cuda_rng_state(self) -> Optional[List[torch.Tensor]]:
+        """Per-device CUDA RNG states when training on CUDA (audit CKP-12).
+
+        ``None`` on CPU-only runs: the project does not fabricate RNG state it
+        does not have, and bitwise-exactness claims are scoped to CPU RNG plus
+        whatever CUDA state was actually captured.
+        """
+        if self.device.type != "cuda" or not torch.cuda.is_available():
+            return None
+        try:
+            return list(torch.cuda.get_rng_state_all())
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("CUDA RNG capture failed", exc_info=True)
+            return None
+
+    def _restore_cuda_rng_state(self, saved: Any, path_str: str) -> None:
+        """Restore captured CUDA RNG state when the device topology matches.
+
+        Device-count differences are reported explicitly instead of being
+        silently ignored or silently claimed as restored.
+        """
+        if saved is None:
+            return
+        if self.device.type != "cuda" or not torch.cuda.is_available():
+            logger.info(
+                "Checkpoint '%s' carries CUDA RNG state but this run is CPU-only; "
+                "not restored (CUDA RNG exactness is not claimed for this run).",
+                path_str,
+            )
+            return
+        try:
+            # ``set_rng_state_all`` requires CPU uint8 tensors, but the checkpoint
+            # is loaded with ``map_location=self.device`` — so move them back.
+            states = [torch.as_tensor(s, dtype=torch.uint8).cpu() for s in saved]
+        except (TypeError, ValueError):
+            logger.warning("Checkpoint '%s' CUDA RNG state is malformed; not restored", path_str)
+            return
+        present = torch.cuda.device_count()
+        if len(states) != present:
+            logger.warning(
+                "Checkpoint '%s' captured CUDA RNG state for %d device(s) but %d are present; "
+                "CUDA RNG state NOT restored (bitwise-exact CUDA continuation is not claimed "
+                "across a device-count change).",
+                path_str,
+                len(states),
+                present,
+            )
+            return
+        try:
+            torch.cuda.set_rng_state_all(states)
+            logger.info("Restored CUDA RNG state for %d device(s) from '%s'", len(states), path_str)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("Failed to restore CUDA RNG state from '%s': %s", path_str, e)
+
+    def _buffer_snapshot(self) -> Optional[Dict[str, Any]]:
+        """The replay buffer's consistent (head, size, total_added, generation)."""
+        buf = self.replay_buffer
+        if hasattr(buf, "buffer_state"):
+            try:
+                return dict(buf.buffer_state())
+            except Exception:  # pragma: no cover - defensive
+                logger.debug("buffer_state() failed", exc_info=True)
+        if hasattr(buf, "write_head"):
+            return {
+                "write_head": int(getattr(buf, "write_head", 0) or 0),
+                "size": int(len(buf)) if hasattr(buf, "__len__") else None,
+                "total_added": int(getattr(buf, "total_added", 0) or 0),
+                "capacity": int(getattr(buf, "capacity", 0) or 0),
+                "generation": getattr(buf, "buffer_generation", None),
+            }
+        return None
+
     def save_checkpoint(
         self,
         path: Optional[Union[str, Path]] = None,
         keep_last_n: int = 3,
+        *,
+        checkpoint_type_override: Optional[str] = None,
     ) -> str:
-        """Save RL training state atomically and optionally prune older checkpoints."""
-        ckpt_path = Path(path) if path else self.checkpoint_dir / f"rl_ckpt_step_{self.step_num}.pt"
-        ckpt_path = ckpt_path.resolve()
+        """Save RL training state atomically and optionally prune older checkpoints.
+
+        The artifact carries the run-status ledger (CKP-01), the consistent
+        replay-buffer snapshot triple plus generation (CKP-05), structured
+        provenance (CKP-12), and the current schema version (CKP-10). The
+        destination is validated against the production-write policy (CKP-04)
+        and held under a cross-process lock (SUS-02) for the whole update,
+        including the ``latest_checkpoint.pt`` mirror.
+        """
+        ckpt_path = (
+            resolve_artifact_path(path)
+            if path
+            else self.checkpoint_dir / f"rl_ckpt_step_{self.step_num}.pt"
+        )
+        arch = (
+            int(getattr(self.model, "num_blocks", 12)),
+            int(getattr(self.model, "num_filters", 128)),
+        )
+        ckpt_path = assert_safe_artifact_destination(
+            ckpt_path, ticket=self.artifact_ticket, arch=arch, what="RL checkpoint"
+        )
         ckpt_path.parent.mkdir(parents=True, exist_ok=True)
 
+        # The ledger is advanced, not replaced: a save during a running run
+        # records "running", and a completed/failed/interrupted transition is
+        # stamped by the caller before the terminal save.
+        ledger = dict(self.run_metadata) if self.run_metadata else build_run_metadata(run_type="rl")
+        if ledger.get("run_state") in ("created", None):
+            ledger = stamp_run_state(ledger, "running", step=self.step_num)
+        else:
+            ledger = dict(ledger)
+            ledger["last_update_at"] = time.time()
+            ledger["step"] = int(self.step_num)
+        self.run_metadata = ledger
+
+        provenance = dict(self.provenance) if self.provenance else {}
+        if not provenance:
+            provenance = build_provenance(
+                run_id=ledger.get("run_id"),
+                run_type=ledger.get("run_type", "rl"),
+                config=ledger.get("config"),
+                model_arch=arch,
+                param_count=int(sum(p.numel() for p in self.model.parameters())),
+                dataset=ledger.get("dataset"),
+                parent_checkpoint=getattr(self, "_resume_parent_identity", None),
+                optimizer_config={
+                    "type": type(self.optimizer).__name__,
+                    "momentum": self.momentum,
+                    "weight_decay": self.weight_decay,
+                },
+                scheduler_config={
+                    "warmup_steps": self.warmup_steps,
+                    "total_steps": self.total_steps,
+                    "base_lr": self.base_lr,
+                    "min_lr": self.min_lr,
+                },
+            )
+        else:
+            provenance = dict(provenance)
+            provenance["model"] = {
+                "num_blocks": arch[0],
+                "num_filters": arch[1],
+                "param_count": int(sum(p.numel() for p in self.model.parameters())),
+            }
+        provenance["parent_checkpoint"] = provenance.get("parent_checkpoint") or getattr(
+            self, "_resume_parent_identity", None
+        )
+        self.provenance = provenance
+
         state = {
-            "checkpoint_type": "rl",
-            "checkpoint_format": 1,
+            "checkpoint_type": checkpoint_type_override or "rl",
+            "checkpoint_format": CURRENT_RL_FORMAT,
             "_optimizer_type": type(self.optimizer).__name__,
             "model": self.model.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "scheduler": getattr(self.scheduler, "state_dict", lambda: {})(),
             "step": self.step_num,
             "model_version": int(getattr(self.direct_server, "model_version", getattr(self.model, "model_version", self.model_version))),
-            "num_blocks": int(getattr(self.model, "num_blocks", 12)),
-            "num_filters": int(getattr(self.model, "num_filters", 128)),
+            "num_blocks": arch[0],
+            "num_filters": arch[1],
             "policy_target_temp": self.policy_target_temp,
             "entropy_bonus": self.entropy_bonus,
             "base_lr": self.base_lr,
@@ -548,39 +1101,67 @@ class RLTrainer:
             "total_steps": self.total_steps,
             "batch_size": self.batch_size,
             "push_freq": self.push_freq,
+            "buffer_state": self._buffer_snapshot(),
             "buffer_size": int(len(self.replay_buffer)) if hasattr(self.replay_buffer, "__len__") else None,
             "buffer_write_head": getattr(self.replay_buffer, "write_head", None),
             "last_push_step": self.last_push_step,
             "tactical_pool_size": getattr(self.replay_buffer, "tactical_pool_size", None),
+            "run_metadata": dict(ledger),
+            "provenance": dict(provenance),
             "rng_state": torch.get_rng_state(),
             "numpy_rng_state": _safe_numpy_rng_state(),
             "python_rng_state": random.getstate(),
+            "cuda_rng_state": self._cuda_rng_state(),
         }
-        _atomic_torch_save(state, ckpt_path)
 
-        # Single write, then byte-copy to latest_checkpoint.pt (candidate-selection
-        # and crash-recovery paths resolve this stable name).
-        latest_path = ckpt_path.parent / "latest_checkpoint.pt"
-        latest_tmp = latest_path.with_name(latest_path.name + ".tmp")
-        try:
-            with open(ckpt_path, "rb") as fsrc, open(latest_tmp, "wb") as fdst:
-                shutil.copyfileobj(fsrc, fdst)
-            os.replace(latest_tmp, latest_path)
-        except OSError as e:
-            logger.warning("Failed to update %s: %s", latest_path, e)
+        # Whole update (step checkpoint + latest mirror) under one lock so two
+        # trainers sharing a directory cannot interleave their writes.
+        with artifact_lock(ckpt_path, timeout=0.0, owner=f"rl-trainer step {self.step_num}"):
+            _atomic_torch_save(state, ckpt_path)
+
+            # Single write, then byte-copy to latest_checkpoint.pt (candidate-selection
+            # and crash-recovery paths resolve this stable name).
+            latest_path = assert_safe_artifact_destination(
+                ckpt_path.parent / "latest_checkpoint.pt",
+                ticket=self.artifact_ticket,
+                arch=arch,
+                what="RL latest-checkpoint mirror",
+            )
+            latest_tmp = latest_path.with_name(latest_path.name + ".tmp")
             try:
-                latest_tmp.unlink()
-            except OSError:
-                logger.debug("Failed to clean tmp checkpoint file %s", latest_tmp)
+                with open(ckpt_path, "rb") as fsrc, open(latest_tmp, "wb") as fdst:
+                    shutil.copyfileobj(fsrc, fdst)
+                    fdst.flush()
+                    try:
+                        os.fsync(fdst.fileno())
+                    except OSError:
+                        logger.debug("fsync of latest tmp failed", exc_info=True)
+                os.replace(latest_tmp, latest_path)
+            except OSError as e:
+                logger.warning("Failed to update %s: %s", latest_path, e)
+                try:
+                    latest_tmp.unlink()
+                except OSError:
+                    logger.debug("Failed to clean tmp checkpoint file %s", latest_tmp)
 
-        if keep_last_n >= 0:
-            try:
-                from python.common.cleanup import prune_checkpoints
+            if keep_last_n >= 0:
+                try:
+                    from python.common.cleanup import prune_checkpoints
 
-                prune_checkpoints(ckpt_path.parent, keep_last_n=keep_last_n, extra_keep=(ckpt_path.name,))
-            except (OSError, ValueError):
-                logger.debug("RL checkpoint prune skipped", exc_info=True)
+                    prune_checkpoints(ckpt_path.parent, keep_last_n=keep_last_n, extra_keep=(ckpt_path.name,))
+                except (OSError, ValueError):
+                    logger.debug("RL checkpoint prune skipped", exc_info=True)
 
+        # Record the published artifact's identity for lineage/hash reporting.
+        identity = checkpoint_identity(ckpt_path, hash_file=True)
+        self._last_checkpoint_identity = identity
+        self.run_metadata["last_checkpoint"] = dict(identity)
+        logger.info(
+            "Saved RL checkpoint %s (%s, sha256=%s)",
+            ckpt_path,
+            describe_run_status(self.run_metadata),
+            (identity.get("sha256") or "?")[:16],
+        )
         return str(ckpt_path)
 
     def train_step(self, batch_dict: Optional[dict[str, Any]] = None) -> dict[str, Any]:
@@ -843,7 +1424,29 @@ class RLTrainer:
                 "num_filters": num_filters,
             }
             try:
+                from python.common.artifacts import (
+                    ArtifactPathError,
+                    assert_safe_artifact_destination,
+                )
+
+                # The sync artifact is a protected production name: validate the
+                # destination and the architecture BEFORE writing, so a
+                # test-scale model can never replace the production
+                # live_weights.pt (finding CKP-04). Guard refusals fail closed.
+                assert_safe_artifact_destination(
+                    self.sync_weights_path,
+                    ticket=self.artifact_ticket,
+                    arch=(int(num_blocks), int(num_filters)),
+                    what="live weight-sync artifact",
+                )
                 _atomic_torch_save(payload, self.sync_weights_path)
+            except ArtifactPathError as e:
+                # A refused destination is a configuration/authorization error,
+                # not a retryable push failure: it propagates with its own type
+                # (and is *never* swallowed like a transient disk error would be).
+                self.push_failure_count += 1
+                logger.error("RL weight sync refused for %s: %s", self.sync_weights_path, e)
+                raise
             except Exception as e:
                 logger.error(
                     "RL weight sync write to %s failed: %s",
@@ -875,6 +1478,16 @@ def _validate_checkpoint_optimizer_compatibility(
             raise RuntimeError(
                 f"Checkpoint '{path_str}' is a fine-tune checkpoint (checkpoint_type='finetune') "
                 "and is not an RL training checkpoint. Use an RL checkpoint for resume."
+            )
+        if ckpt_type == "supervised":
+            raise RuntimeError(
+                f"Checkpoint '{path_str}' is a supervised training checkpoint "
+                "(checkpoint_type='supervised'). Per project policy, explicitly typed foreign "
+                "artifacts are refused on every path here: RL warm starts run through the "
+                "registry designation gate (validate_warm_start) and the inference server, and "
+                "the weight payload is transferred as a weights-only container. Export the "
+                "weights (or use the designated baseline path) instead of loading this file "
+                "directly."
             )
         raise RuntimeError(
             f"Checkpoint '{path_str}' has checkpoint_type={ckpt_type!r} and is "

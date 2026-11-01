@@ -45,6 +45,27 @@ logger = logging.getLogger(__name__)
 UNKNOWN_MODEL_VERSION = -1
 
 
+def _mint_buffer_generation() -> str:
+    """New generation id for a freshly created replay buffer."""
+    import uuid
+    from datetime import datetime, timezone
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    return f"{stamp}-{uuid.uuid4().hex[:8]}"
+
+
+def _buffer_artifact_lock(target: Path, *, owner: str, timeout: float):
+    """Cross-process lock for replay-buffer artifact writes (audit SUS-02).
+
+    Two processes sharing one buffer directory must not interleave meta/array
+    flushes. The lock waits briefly (buffer writes are frequent and short) and
+    raises loudly if the other holder never releases.
+    """
+    from python.common.artifacts import artifact_lock
+
+    return artifact_lock(target, timeout=timeout, owner=owner)
+
+
 class ReplayBatchDict(TypedDict):
     planes: torch.Tensor
     visits: torch.Tensor
@@ -61,6 +82,12 @@ class ReplayMetaDict(TypedDict):
     write_head: int
     size: int
     total_added: int
+    # Identity of this buffer instance, written once at creation and preserved
+    # across flushes. A checkpoint carries the generation it was saved against
+    # so a resume can never splice two buffer generations together (audit
+    # CKP-05 restoration contract). ``None`` for legacy buffers written before
+    # the marker existed.
+    buffer_generation: Optional[str]
 
 
 class GpuResidentReplayCache:
@@ -466,6 +493,11 @@ class ReplayBuffer:
         self._write_head = 0
         self.size = 0
         self.total_added = 0
+        # Generation identity of this buffer instance: minted on creation and
+        # persisted in meta.json. Checkpoints record the generation they were
+        # saved against; a resume refuses to splice different generations
+        # together (CKP-05 restoration contract).
+        self.buffer_generation: Optional[str] = None
         self._lock = threading.Lock()
         self._last_meta_save = 0.0
         self._games_since_meta = 0
@@ -517,6 +549,7 @@ class ReplayBuffer:
             self._load_meta()
         else:
             self._create_empty_files()
+            self.buffer_generation = _mint_buffer_generation()
             self._save_meta()
 
         if self.in_memory:
@@ -684,6 +717,10 @@ class ReplayBuffer:
         else:
             self._games_since_meta = 0
             self._last_meta_save = time.monotonic()
+        if self.buffer_generation is None:
+            # A buffer written before the generation marker existed adopts one
+            # now, so subsequent checkpoints can pin their snapshot identity.
+            self.buffer_generation = _mint_buffer_generation()
         meta = {
             "capacity": self.capacity,
             "in_channels": self.in_channels,
@@ -694,27 +731,29 @@ class ReplayBuffer:
             "size": self.size,
             "total_added": self.total_added,
             "tactical_pool_size": getattr(self, "tactical_pool_size", 0),
+            "buffer_generation": self.buffer_generation,
         }
         meta_path = self.paths["meta"]
         tmp_path = meta_path.with_suffix(".tmp")
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(meta, f, indent=2)
-            f.flush()
-            try:
-                os.fsync(f.fileno())
-            except OSError:
-                logger.debug("fsync meta tmp failed", exc_info=True)
-        try:
-            os.replace(str(tmp_path), str(meta_path))
-        except OSError:
-            logger.warning("os.replace for meta failed; writing in place", exc_info=True)
-            with open(meta_path, "w", encoding="utf-8") as f:
+        with _buffer_artifact_lock(meta_path, owner="replay-meta", timeout=10.0):
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(meta, f, indent=2)
                 f.flush()
                 try:
                     os.fsync(f.fileno())
                 except OSError:
-                    logger.debug("fsync meta failed", exc_info=True)
+                    logger.debug("fsync meta tmp failed", exc_info=True)
+            try:
+                os.replace(str(tmp_path), str(meta_path))
+            except OSError:
+                logger.warning("os.replace for meta failed; writing in place", exc_info=True)
+                with open(meta_path, "w", encoding="utf-8") as f:
+                    json.dump(meta, f, indent=2)
+                    f.flush()
+                    try:
+                        os.fsync(f.fileno())
+                    except OSError:
+                        logger.debug("fsync meta failed", exc_info=True)
 
     def _load_meta(self) -> None:
         """Load ring buffer state with strict validation (raises, never silent reset)."""
@@ -767,9 +806,27 @@ class ReplayBuffer:
         self.write_head = write_head
         self.size = size
         self.total_added = total_added
+        generation = meta.get("buffer_generation")
+        # Legacy meta (pre-generation) leaves this None; the resume contract
+        # treats "unknown" conservatively rather than inventing an identity.
+        self.buffer_generation = str(generation) if generation else None
         if "tactical_pool_size" in meta:
             self.saved_tactical_pool_size = int(meta["tactical_pool_size"])
             self.tactical_pool_size = self.saved_tactical_pool_size
+
+    def buffer_state(self) -> Dict[str, Any]:
+        """The (write_head, size, total_added, capacity, generation) snapshot.
+
+        This is the exact state a checkpoint must persist to be restorable
+        against a ring buffer without mixing generations (audit CKP-05).
+        """
+        return {
+            "write_head": int(self.write_head),
+            "size": int(self.size),
+            "total_added": int(self.total_added),
+            "capacity": int(self.capacity),
+            "generation": self.buffer_generation,
+        }
 
     def _load_from_disk_to_ram(self) -> None:
         """Load existing disk memmap files into host RAM arrays."""
@@ -799,24 +856,27 @@ class ReplayBuffer:
             self._save_meta(force=True)
             return
 
-        for key in ("planes", "visits", "outcomes", "full_search", "versions", "game_ids"):
-            path = self.paths[key]
-            tmp = path.with_name(path.name + ".tmp")
-            arr = getattr(self, key)
-            shape = self._get_shape(key)
-            dtype = self._get_dtype(key)
-            m = np.memmap(tmp, dtype=dtype, mode="w+", shape=shape)
-            try:
-                m[:] = arr[:]
-                m.flush()
-            finally:
+        with _buffer_artifact_lock(
+            self.buffer_dir / "flush.lock", owner="replay-flush", timeout=30.0
+        ):
+            for key in ("planes", "visits", "outcomes", "full_search", "versions", "game_ids"):
+                path = self.paths[key]
+                tmp = path.with_name(path.name + ".tmp")
+                arr = getattr(self, key)
+                shape = self._get_shape(key)
+                dtype = self._get_dtype(key)
+                m = np.memmap(tmp, dtype=dtype, mode="w+", shape=shape)
                 try:
-                    m._mmap.close()  # type: ignore[attr-defined]
-                except (AttributeError, ValueError, OSError):
-                    logger.debug("transient memmap close failed for %s", key, exc_info=True)
-                del m
-            os.replace(str(tmp), str(path))
-        self._save_meta(force=True)
+                    m[:] = arr[:]
+                    m.flush()
+                finally:
+                    try:
+                        m._mmap.close()  # type: ignore[attr-defined]
+                    except (AttributeError, ValueError, OSError):
+                        logger.debug("transient memmap close failed for %s", key, exc_info=True)
+                    del m
+                os.replace(str(tmp), str(path))
+            self._save_meta(force=True)
 
     def enable_gpu_cache(
         self,

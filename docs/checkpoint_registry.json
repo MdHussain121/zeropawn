@@ -1,7 +1,7 @@
 {
   "version": 1,
   "updated": "2026-10-31",
-  "updated_by": "Supervised-learning remediation (fix/supervised-learning-remediation-20261031): new baseline ckpt-10 designated warm start per P0-2 acceptance criteria",
+  "updated_by": "checkpoint-artifact-lifecycle remediation (CKP-08 registry decision)",
   "verification_method": "Full SHA-256 recomputed from files on disk 2026-10-29 (never copied from reports); architecture and step metadata read from checkpoint headers via python.model.checkpoint_registry.inspect_checkpoint.",
   "authority": "models/manifest.json (reconciliation 2026-10-26) for lineage; this registry for verifiable on-disk status.",
   "architecture_required": {
@@ -178,8 +178,26 @@
         "dataset_acceptance": "certified games_wdl receipt; train masked_fraction 0.0000; 0 cross-split encoded states (exhaustive train/val, train/test, val/test); build record binds source sha256 2d28cfa0...",
         "value_head_health": "held-out WDL CE 0.851 (game val) / 0.730 (independent test split) vs uniform 1.099; P(predict loss | true loss) = 0.442 (val) / 0.515 (test) vs 0.0000 on both disqualified predecessors; Brier 0.51/0.43",
         "value_grad_flow": "telemetry value_grad_norm 0.24-0.48 throughout the run; window WDL-valid samples ~468/512",
-        "limits": "Single-epoch run: policy top-1 22.2% game-val / 23.2% game-test / 26.6% tactics-val \u2014 weaker than the disqualified 5-epoch predecessors' policy heads. This designation certifies PROVENANCE and VALUE-HEAD HEALTH ONLY. No strength, Elo, or superiority claim is attached (SLQ-04/SLQ-20 discipline)."
+        "limits": "Single-epoch run: policy top-1 22.2% game-val / 23.2% game-test / 26.6% tactics-val — weaker than the disqualified 5-epoch predecessors' policy heads. This designation certifies PROVENANCE and VALUE-HEAD HEALTH ONLY. No strength, Elo, or superiority claim is attached (SLQ-04/SLQ-20 discipline)."
       }
+    },
+    {
+      "id": "ckpt-11-unattributed_warm_start_weights",
+      "file": "runs/phase4_rl/warm_start_ckpts/phase4_weights_only.pt",
+      "status": "disqualified",
+      "role": "unattributed_weights_only_container",
+      "step": null,
+      "sha256": "56cee5143e543e2a4a98ee3561feacc09004f903625fd26855f8d9dbbaab6e73",
+      "num_params": 8631454,
+      "checkpoint_kind": "weights_only_container",
+      "no_in_repo_producer": true,
+      "registered_at": "2026-10-31",
+      "registered_by": "checkpoint-artifact-lifecycle remediation (CKP-08)",
+      "disqualification": {
+        "reason": "unattributed_weights_only_container",
+        "detail": "Found by the 2026-10-30/31 checkpoint & artifact lifecycle audit (finding CKP-08): a weights-only container ({model, num_blocks 12, num_filters 128, checkpoint_format 1}) written 2026-10-29 01:07 with no in-repo producer and no run identity, whose stem-conv checksum is identical to the quarantined AdamW snapshots. It cannot be reproduced, cannot be attributed to a run, and carries no optimizer/scheduler state. It is weights-only by construction and therefore can never be a resume point; it must not become a warm start either, because its lineage is the same one this project disqualified (value-head contamination) and its producing run is unknown. Copying or renaming it does not change this: registry matching is by path and the trainer/tools refuse weights-only containers on resume paths (is_resumable_candidate)."
+      },
+      "designated_warm_start": false
     }
   ],
   "excluded_from_registry": [

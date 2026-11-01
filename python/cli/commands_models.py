@@ -282,20 +282,33 @@ def run_models_export(args: argparse.Namespace) -> int:
     # (it strips optimizer/scheduler state); it is unrelated to torch's own
     # `weights_only` unpickling guard, which is enforced explicitly here.
     raw = torch.load(src_p, map_location="cpu", weights_only=True)
+    if not isinstance(raw, dict):
+        raw = {"model": raw}
 
     if args.weights_only:
-        # Strip optimizer, scheduler, etc.
+        # Strip optimizer, scheduler, etc. The canonical loss key stays
+        # `best_val_loss` (readers look for that name); `val_loss` is kept as an
+        # explicit alias for older consumers (audit CKP-13).
+        loss = raw.get("best_val_loss", raw.get("val_loss", None))
         export_payload = {
+            "checkpoint_type": "export",
+            "weights_only_container": True,
+            "inference_only": True,
             "model": raw.get("model", raw),
             "num_blocks": raw.get("num_blocks", 12),
             "num_filters": raw.get("num_filters", 128),
             "step": raw.get("step", 0),
-            "val_loss": raw.get("val_loss", None),
+            "best_val_loss": loss,
+            "val_loss": loss,
+            "source_checkpoint": str(src_p),
+            "exported_at": __import__("time").time(),
         }
     else:
         export_payload = raw
 
-    torch.save(export_payload, out_p)
+    from python.train.train_supervised import _atomic_torch_save
+
+    _atomic_torch_save(export_payload, out_p)
 
     # Compute SHA256
     with open(out_p, "rb") as f:
@@ -319,8 +332,10 @@ def run_models_check_compat(args: argparse.Namespace) -> int:
 
     try:
         raw = torch.load(ckpt_p, map_location="cpu", weights_only=True)
-        blocks = raw.get("num_blocks")
-        filters = raw.get("num_filters")
+        if not isinstance(raw, dict):
+            raw = {"model": raw}
+        header_blocks = raw.get("num_blocks")
+        header_filters = raw.get("num_filters")
 
         state = raw.get("model", raw)
         state_keys = list(state.keys()) if isinstance(state, dict) else []
@@ -328,32 +343,67 @@ def run_models_check_compat(args: argparse.Namespace) -> int:
         stem = state.get("stem_conv.weight") if isinstance(state, dict) else None
         stem_filters = stem.shape[0] if stem is not None and hasattr(stem, "shape") else None
 
+        # Blocks/filters are verified from the header when present and inferred
+        # from the weights otherwise, so a header-less but structurally matching
+        # checkpoint is recognized (audit CKP-13: the old check compared the
+        # header against the expectation only, so header-less checkpoints always
+        # reported "differences" and still exited 0).
+        inferred_blocks = None
+        if isinstance(state, dict):
+            block_ids = set()
+            for key in state:
+                if key.startswith("blocks."):
+                    parts = str(key).split(".")
+                    if len(parts) > 1 and parts[1].isdigit():
+                        block_ids.add(int(parts[1]))
+            if block_ids:
+                inferred_blocks = len(block_ids)
+        blocks = header_blocks if header_blocks is not None else inferred_blocks
+        filters = header_filters if header_filters is not None else stem_filters
+
         table = Table(title=f"Compatibility Check: {ckpt_p.name}", box=box.ROUNDED)
         table.add_column("Property", style="bold cyan")
         table.add_column("Header", style="yellow")
         table.add_column("Weights Inference", style="green")
         table.add_column("Engine Expectation", style="dim")
 
-        table.add_row("Residual Blocks", str(blocks), str(blocks), str(args.expected_blocks))
+        table.add_row("Residual Blocks", str(header_blocks), str(inferred_blocks), str(args.expected_blocks))
         table.add_row(
-            "Filter Channels", str(filters), str(stem_filters), str(args.expected_filters)
+            "Filter Channels", str(header_filters), str(stem_filters), str(args.expected_filters)
         )
         table.add_row(
             "State Dict Keys", f"{len(state_keys)} layers", f"{len(state_keys)} layers", "Verified"
         )
 
         console.print(table)
-        is_compat = blocks == args.expected_blocks and (
-            stem_filters == args.expected_filters or filters == args.expected_filters
-        )
-        if is_compat:
+        blocks_ok = blocks is not None and blocks == args.expected_blocks
+        filters_ok = filters is not None and filters == args.expected_filters
+        if blocks_ok and filters_ok:
             console.print(
                 "[bold green]Checkpoint is 100% compatible with current engine architecture.[/bold green]"
             )
             return 0
-        else:
-            console.print("[bold yellow]Warning: Architecture differences detected.[/bold yellow]")
-            return 0
+        # Audit CKP-13: a mismatch used to exit 0 with only a warning, so scripts
+        # could not gate on compatibility. Unknown architecture information is
+        # also a non-zero outcome: it cannot be verified as compatible.
+        unknown = [
+            name
+            for name, value in (("num_blocks", blocks), ("num_filters", filters))
+            if value is None
+        ]
+        if unknown:
+            console.print(
+                "[bold red]Cannot verify compatibility: checkpoint carries no "
+                f"{', '.join(unknown)} in its header and none could be inferred from "
+                "the weights.[/bold red]"
+            )
+            return 1
+        console.print(
+            "[bold red]Incompatible: architecture differences detected "
+            f"(checkpoint {blocks}x{filters} vs expected "
+            f"{args.expected_blocks}x{args.expected_filters}).[/bold red]"
+        )
+        return 1
 
     except Exception as e:
         console.print(f"[bold red]Compatibility check failed: {e}[/bold red]")

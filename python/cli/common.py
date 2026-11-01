@@ -521,17 +521,27 @@ def get_available_checkpoints() -> list[dict[str, Any]]:
     dirs_to_check = [
         REPO_ROOT / "models" / "checkpoints_rl",
         REPO_ROOT / "models" / "checkpoints_scaled",
+        REPO_ROOT / "models" / "checkpoints_baseline_20261031",
+        REPO_ROOT / "models" / "checkpoints_finetune",
         REPO_ROOT / "models" / "checkpoints",
     ]
 
-    seen = set()
+    # Deduplicate by resolved path, not by file name: several trees legitimately
+    # contain artifacts with the same base name (`latest_checkpoint.pt` exists in
+    # both the scaled and finetune trees), and name-keyed dedup silently dropped
+    # all but the first tree's copy (audit CKP-11).
+    seen: set[str] = set()
     for d in dirs_to_check:
         if not d.is_dir():
             continue
         for f in d.glob("*.pt"):
-            if f.name in seen or not f.is_file():
+            try:
+                key = str(f.resolve())
+            except OSError:
+                key = str(f)
+            if key in seen or not f.is_file():
                 continue
-            seen.add(f.name)
+            seen.add(key)
             stat = f.stat()
             size_mb = stat.st_size / (1024 * 1024)
             mtime = stat.st_mtime
@@ -585,23 +595,121 @@ def get_available_checkpoints() -> list[dict[str, Any]]:
     return checkpoints
 
 
-def get_default_checkpoint_path() -> Optional[Path]:
-    """Find best/latest checkpoint to use as default.
+# Names preferred by the historical default chain (audit CKP-11). Every one of
+# them is missing or disqualified on today's disk, so the chain must consult the
+# registry rather than trusting filenames: `docs/checkpoint_registry.json` is the
+# fitness authority (registry ckpt-01/02 are DISQUALIFIED, ckpt-10 is the
+# designated baseline).
+_DEFAULT_CHECKPOINT_NAMES = (
+    ("checkpoints_finetune", "best_model.pt"),
+    ("checkpoints_baseline_20261031", "best_model.pt"),
+    ("checkpoints_rl", "phase4_final_checkpoint.pt"),
+    ("checkpoints_rl", "latest_checkpoint.pt"),
+    ("checkpoints_scaled", "best_model.pt"),
+)
 
-    Prefers fine-tuned model (strongest) over scaled baseline.
+
+def registry_checkpoint_verdict(path: Union[str, Path]) -> dict[str, Any]:
+    """Registry verdict for a checkpoint path, or a benign default.
+
+    Returns ``{"status": ..., ...}`` from
+    :func:`python.model.checkpoint_registry.verify_checkpoint_identity`, or
+    ``{"status": "unregistered"}`` when no registry exists in this checkout.
+    Never raises: default-model resolution must not crash on a missing or
+    unreadable registry.
     """
-    candidates = [
-        REPO_ROOT / "models" / "checkpoints_finetune" / "best_model.pt",
-        REPO_ROOT / "models" / "checkpoints_rl" / "phase4_final_checkpoint.pt",
-        REPO_ROOT / "models" / "checkpoints_rl" / "latest_checkpoint.pt",
-        REPO_ROOT / "models" / "checkpoints_scaled" / "best_model.pt",
-    ]
-    for c in candidates:
-        if c.is_file():
-            return c
+    try:
+        from python.model.checkpoint_registry import verify_checkpoint_identity
 
-    all_ckpts = get_available_checkpoints()
+        # Cheap mode: default resolution runs on every CLI invocation, so it must
+        # not hash 100 MB checkpoints. Hash verification happens at load time.
+        return verify_checkpoint_identity(Path(path), repo_root=REPO_ROOT, hash_file=False)
+    except Exception as e:  # pragma: no cover - defensive
+        logger.debug("registry verdict failed for %s: %s", path, e)
+        return {"status": "unregistered", "detail": str(e)}
+
+
+def is_selectable_default(path: Union[str, Path]) -> bool:
+    """True when a checkpoint may serve as an automatic default.
+
+    Quarantined, disqualified, and hash-mismatched entries are never eligible;
+    unregistered files are eligible with a warning (locally-created checkpoints
+    predate registration), except that a *disqualified* record for the same
+    path always wins over "unregistered".
+    """
+    verdict = registry_checkpoint_verdict(path)
+    status = verdict.get("status")
+    if status in ("quarantined", "disqualified", "hash_mismatch", "missing"):
+        logger.warning(
+            "[DEFAULT-MODEL] refusing %s as a default: registry status %s (%s)",
+            path,
+            status,
+            verdict.get("detail", ""),
+        )
+        return False
+    if status == "unregistered":
+        logger.info(
+            "[DEFAULT-MODEL] %s is unregistered; using it as a default by explicit "
+            "file presence only",
+            path,
+        )
+    return True
+
+
+def get_default_checkpoint_path() -> Optional[Path]:
+    """Find the best/latest checkpoint to use as a default model.
+
+    Preference order is by artifact role (a designated supervised baseline, then
+    fine-tuned, then RL recovery artifacts), but a candidate is only accepted if
+    the checkpoint registry does not mark it missing/quarantined/disqualified
+    (audit CKP-11: the old chain named four files that no longer exist and would
+    otherwise fall through to a disqualified artifact).
+    """
+    candidates = [REPO_ROOT / "models" / d / n for d, n in _DEFAULT_CHECKPOINT_NAMES]
+    disqualified_present = []
+    for c in candidates:
+        if not c.is_file():
+            continue
+        verdict = registry_checkpoint_verdict(c)  # one cheap verdict per candidate
+        status = verdict.get("status")
+        if status in ("quarantined", "disqualified", "hash_mismatch", "missing"):
+            disqualified_present.append((c, status))
+            logger.warning(
+                "[DEFAULT-MODEL] refusing %s as a default: registry status %s (%s)",
+                c,
+                status,
+                verdict.get("detail", ""),
+            )
+            continue
+        if status == "unregistered":
+            logger.info(
+                "[DEFAULT-MODEL] %s is unregistered; using it as a default by explicit "
+                "file presence only",
+                c,
+            )
+        return c
+    if disqualified_present:
+        logger.warning(
+            "[DEFAULT-MODEL] %d preferred name(s) exist but are not eligible: %s",
+            len(disqualified_present),
+            ", ".join(f"{p.name}={s}" for p, s in disqualified_present),
+        )
+
+    all_ckpts = [c for c in get_available_checkpoints() if is_selectable_default(c["path"])]
     if all_ckpts:
+        # Prefer registry-verified entries (in particular a designated warm
+        # start) over merely-present files.
+        def _rank(item: dict[str, Any]) -> tuple[int, int, float]:
+            verdict = registry_checkpoint_verdict(item["path"])
+            if verdict.get("status") == "verified":
+                status_rank = 2 if verdict.get("designated_warm_start") else 1
+            else:
+                status_rank = 0
+            step = item.get("step")
+            step_val = step if isinstance(step, int) else -1
+            return (status_rank, step_val, item.get("mtime", 0.0))
+
+        all_ckpts.sort(key=_rank, reverse=True)
         return all_ckpts[0]["path"]
 
     return None
