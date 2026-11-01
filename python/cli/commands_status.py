@@ -117,7 +117,29 @@ def run_status(args: argparse.Namespace) -> int:
 
     # 2. Checkpoints (first 12, newest first)
     checkpoints = get_available_checkpoints()
-    ckpt_rows = [("checkpoints_found", f"{len(checkpoints)} (M)")]
+
+    # Effective default identity (audit M-2): which artifact commands will
+    # actually load, or why none is usable.  The registry is the source of
+    # truth — never "whichever file the listing ranks first".
+    try:
+        from python.cli.models import try_get_default_model_path
+
+        default_path = try_get_default_model_path()
+    except Exception as e:  # pragma: no cover - defensive
+        logger.debug("default resolution probe failed: %s", e)
+        default_path = None
+    if default_path is not None:
+        default_desc = f"{default_path} (registry-designated, hash-verified) (M)"
+    else:
+        default_desc = (
+            "none — no designated, verified default in docs/checkpoint_registry.json; "
+            "default-loading commands will refuse until one is restored/designated (M)"
+        )
+
+    ckpt_rows = [
+        ("default_checkpoint", default_desc),
+        ("checkpoints_found", f"{len(checkpoints)} (M)"),
+    ]
     for i, c in enumerate(checkpoints[:12]):
         date_str = datetime.datetime.fromtimestamp(c["mtime"]).strftime("%Y-%m-%d %H:%M")
         latest = " latest" if i == 0 else ""

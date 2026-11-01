@@ -334,10 +334,21 @@ def test_match_human_eval_callback_preserves_history_and_repetition(
     )
 
     # Human (Black) plays the mirror of the engine's knight shuffle, then quits.
+    # Swap the module-level console for a scripted fake rather than patching
+    # ``commands_match.console.input``: the shared rich Console is an instance,
+    # and monkeypatching an attribute it inherits from its class leaves a
+    # shadowing instance attribute behind after undo, which breaks other tests
+    # that patch rich.console.Console.input at the class level.
     answers = iter(["g8f6", "f6g8", "quit"])
-    monkeypatch.setattr(
-        commands_match.console, "input", lambda *a, **k: next(answers)
-    )
+
+    class _ScriptedConsole:
+        def print(self, *args, **kwargs) -> None:
+            pass
+
+        def input(self, *args, **kwargs) -> str:
+            return next(answers)
+
+    monkeypatch.setattr(commands_match, "console", _ScriptedConsole())
 
     args = SimpleNamespace(
         checkpoint=str(dummy_ckpt),

@@ -22,6 +22,30 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
+def _has_designated_default_model() -> bool:
+    """True when a registry-designated, verified default checkpoint resolves.
+
+    The interactive MCTS search wizard executes a real ``zeropawn search``,
+    which (audit M-2) is fail-closed: without a designated default it refuses
+    to run rather than substituting an arbitrary checkpoint.  Trees without
+    the gitignored ``models/`` artifacts skip the real-search assertions.
+    """
+    try:
+        sys.path.insert(0, str(REPO_ROOT))
+        from python.cli.models import try_get_default_model_path
+
+        return try_get_default_model_path() is not None
+    except Exception:
+        return False
+
+
+requires_default_model = pytest.mark.skipif(
+    not _has_designated_default_model(),
+    reason="real search execution requires a designated default checkpoint "
+    "(gitignored models/ absent in this tree)",
+)
+
+
 def run_interactive_session(
     input_sequence: str, timeout: float = 30.0, extra_env: dict | None = None
 ) -> tuple[int, str]:
@@ -96,6 +120,7 @@ def test_interactive_status_quick_action():
     assert "Goodbye!" in out
 
 
+@requires_default_model
 def test_interactive_mcts_search_wizard_execution():
     """Verify full Configuration Wizard (Path B) for MCTS Search through interactive UI.
 
@@ -122,6 +147,7 @@ def test_interactive_mcts_search_wizard_execution():
     assert "Goodbye!" in out
 
 
+@requires_default_model
 def test_interactive_mcts_serial_search_wizard_execution():
     """Verify Configuration Wizard execution of serial search with 15 simulations."""
     # Category 6 -> Op 3 -> Mode 2 (Wizard) -> Edit 2 (sims=15) -> Edit 3 (mode=serial) -> X -> Enter -> B -> B -> Q
