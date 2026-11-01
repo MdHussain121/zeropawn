@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import hashlib
 import json
+import subprocess
 import sys
 import threading
 import time
@@ -33,8 +35,27 @@ sys.path.insert(0, str(ROOT))
 
 import python  # noqa: F401
 import zeropawn_cpp
+from python.cli.common import get_default_checkpoint_path
 from python.eval.sprt import compute_sprt_llr, wilson_interval
 from python.model.chess_net import ChessNet
+
+
+def _file_sha256(path: Path | str) -> str:
+    p = Path(path)
+    if not p.is_file():
+        return "missing"
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _git_commit() -> str:
+    try:
+        return subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    except Exception:
+        return "unknown"
 
 # Pre-registered search-parameter candidates from the 2026-10-16 screen
 # (locked baseline: c_puct=2.0, fpu_reduction=0.2).
@@ -230,8 +251,8 @@ class SprtMatchRunner:
 
         if game.is_checkmate():
             loser_is_white = bool(game.side_to_move())
-            return _done("0-1" if loser_is_white else "1-0")
-        return _done("1/2-1/2")
+            return _done("0-1" if loser_is_white else "1-0", reason="checkmate")
+        return _done("1/2-1/2", reason="max_plies_cap")
 
     def run_sprt(
         self,
@@ -378,10 +399,18 @@ class SprtMatchRunner:
                 json.dump(
                     {
                         "name": name,
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "git_commit": _git_commit(),
                         "cand_cfg": cand_cfg,
                         "base_cfg": base_cfg,
                         "candidate_checkpoint": self.candidate_checkpoint,
+                        "candidate_checkpoint_sha256": _file_sha256(self.candidate_checkpoint),
                         "base_checkpoint": self.base_checkpoint,
+                        "base_checkpoint_sha256": _file_sha256(self.base_checkpoint),
+                        "device": str(self.device),
+                        "sims": self.sims,
+                        "openings_file": "data/openings/eval_openings_50.epd",
+                        "openings_sha256": _file_sha256("data/openings/eval_openings_50.epd"),
                         "sprt": sprt,
                         "games": games_played,
                     },
@@ -396,7 +425,18 @@ class SprtMatchRunner:
         final_status = sprt["decision"] if sprt["decision"] != "CONTINUE" else "INCONCLUSIVE"
         return {
             "name": name,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "git_commit": _git_commit(),
+            "candidate_checkpoint": self.candidate_checkpoint,
+            "candidate_checkpoint_sha256": _file_sha256(self.candidate_checkpoint),
+            "base_checkpoint": self.base_checkpoint,
+            "base_checkpoint_sha256": _file_sha256(self.base_checkpoint),
             "cand_cfg": cand_cfg,
+            "base_cfg": base_cfg,
+            "device": str(self.device),
+            "sims": self.sims,
+            "openings_file": "data/openings/eval_openings_50.epd",
+            "openings_sha256": _file_sha256("data/openings/eval_openings_50.epd"),
             "sprt": sprt,
             "final_status": final_status,
             "games_count": len(games_played),
@@ -431,7 +471,12 @@ def main() -> int:
     parser.add_argument("--name", default=None, help="Override the result name (promotion tests)")
     args = parser.parse_args()
 
-    base_ckpt = args.base_checkpoint or args.candidate_checkpoint or "models/checkpoints_scaled/best_model.pt"
+    try:
+        default_ckpt = str(get_default_checkpoint_path())
+    except Exception:
+        default_ckpt = "models/checkpoints_scaled/best_model.pt"
+
+    base_ckpt = args.base_checkpoint or args.candidate_checkpoint or default_ckpt
     cand_ckpt = args.candidate_checkpoint or base_ckpt
 
     runner = SprtMatchRunner(

@@ -65,6 +65,10 @@ def main() -> int:
     ap.add_argument("--outdir", default="runs/baseline")
     ap.add_argument("--smoke", action="store_true")
     ap.add_argument("--stockfish", default="tools/stockfish.exe")
+    ap.add_argument("--book", default=None, help="Path to curated opening book JSON")
+    ap.add_argument("--no-book", action="store_true", default=True, help="Disable opening book (default: True)")
+    ap.add_argument("--enable-book", dest="no_book", action="store_false", help="Enable opening book")
+    ap.add_argument("--cap-policy", default="exclude", choices=["exclude", "draw", "loss", "adjudicate"])
     args = ap.parse_args()
 
     n_open = 5 if args.smoke else args.openings
@@ -86,6 +90,7 @@ def main() -> int:
     import zeropawn_cpp
 
     print(f"pyd: {zeropawn_cpp.__file__}", flush=True)
+    use_book = not args.no_book
     runner = MatchRunner(
         model=model,
         device=device,
@@ -98,6 +103,10 @@ def main() -> int:
         search_mode="serial",
         seed=args.seed,
         stockfish_elo=args.elo,
+        use_book=use_book,
+        book_path=args.book or "data/openings/curated_book.json",
+        cap_policy=args.cap_policy,
+        enable_value_adjudication=False,
     )
     t0 = time.time()
     try:
@@ -107,7 +116,12 @@ def main() -> int:
     wall = time.time() - t0
 
     w, d, l = res["engine_wins"], res["engine_draws"], res["engine_losses"]
-    ei = elo_interval(w, d, l)
+    genuine_d = res.get("genuine_draws", d)
+    capped = res.get("capped_games", 0)
+    eff_n = res.get("effective_games", w + d + l)
+
+    elo_diff = res.get("elo_diff", 0.0)
+    elo_lo, elo_hi = res.get("elo_ci_95", (None, None))
     resc = rescore_pgn(pgn_path)
     row = {
         "tag": tag,
@@ -123,14 +137,19 @@ def main() -> int:
         "openings_sha256": sha256_file(Path("data/openings/eval_openings_50.epd")),
         "num_openings": n_open,
         "total_games": res["total_games"],
+        "effective_games": eff_n,
         "engine_wins": w,
         "engine_draws": d,
+        "genuine_draws": genuine_d,
+        "capped_games": capped,
         "engine_losses": l,
         "score": round(res["engine_score"], 4),
-        "elo_diff": ei["elo_diff"],
-        "elo_lo95": ei["lo"],
-        "elo_hi95": ei["hi"],
-        "elo_formula": "diff=-400*log10(1/s-1); Wald 95% on score, endpoints clamped (0.001,0.999); approximate (shared openings, N games)",
+        "elo_diff": elo_diff,
+        "elo_lo95": elo_lo,
+        "elo_hi95": elo_hi,
+        "pairing_analysis": res.get("pairing_analysis", {}),
+        "sensitivity_analysis": res.get("sensitivity_analysis", {}),
+        "elo_formula": "diff=-400*log10(1/s-1); Agresti-Caffo logit 95% CI + cluster-robust paired SE",
         "search_mode": res["search_mode"],
         "mcts_sims": args.sims,
         "seed": args.seed,
@@ -139,7 +158,11 @@ def main() -> int:
         "noise": False,
         "temperature": False,
         "tablebase": False,
-        "book": False,
+        "book": use_book,
+        "book_sha256": res.get("book_sha256"),
+        "book_policy": res.get("book_policy"),
+        "book_moves_played": res.get("book_moves_played", 0),
+        "cap_policy": args.cap_policy,
         "commit": git_head(),
         "pyd_sha256": sha256_file(Path(zeropawn_cpp.__file__)),
         "pgn": str(pgn_path),
@@ -149,6 +172,7 @@ def main() -> int:
             "w": resc["engine_wins"],
             "d": resc["engine_draws"],
             "l": resc["engine_losses"],
+            "capped": resc.get("capped_games", 0),
             "problems": resc["problem_rows"],
         },
         "rescore_agrees": (resc["engine_wins"], resc["engine_draws"], resc["engine_losses"])

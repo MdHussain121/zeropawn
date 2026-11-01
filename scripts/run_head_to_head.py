@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import queue
 import sys
 import threading
@@ -114,7 +115,12 @@ class PlayerContext:
         g = zeropawn_cpp.ChessGame(fen)
         max_plies = 400
         ply = 0
+        search_failed = False
+        failed_side_white = False
+
         while not g.is_game_over() and ply < max_plies:
+            if hasattr(g, "half_move_clock") and g.half_move_clock() >= 100:
+                return ("1/2-1/2", "genuine_draw", "fifty_move_rule")
             white_to_move = g.side_to_move()
             if white_to_move == a_is_white:
                 res = mcts_a.search(g, self.sims, eval_a)
@@ -122,22 +128,35 @@ class PlayerContext:
                 res = mcts_b.search(g, self.sims, eval_b)
             act = res.best_action
             if act < 0:
+                search_failed = True
+                failed_side_white = bool(white_to_move)
                 break
             g.apply_action(act)
             ply += 1
+
+        if search_failed:
+            # F-07: Engine search failure is a forfeit loss for the failing engine, NEVER a draw
+            board_res = "0-1" if failed_side_white else "1-0"
+            return (board_res, "engine_failure", "search_failure_forfeit")
+
         if g.is_checkmate():
             loser_is_white = bool(g.side_to_move())
-            return "0-1" if loser_is_white else "1-0"
-        return "1/2-1/2"
+            board_res = "0-1" if loser_is_white else "1-0"
+            return (board_res, "decisive", "checkmate")
+
+        if g.is_game_over() or (hasattr(g, "is_draw") and g.is_draw()):
+            return ("1/2-1/2", "genuine_draw", "chess_rules_draw")
+
+        # Reached max_plies without terminal state: evaluation cap
+        return ("*", "capped", "max_plies_cap")
 
 
-def trinomial_ci_95(w: int, l: int, d: int) -> tuple[float | None, float | None]:
-    """Elo difference 95% CI (engine − opponent) from W/D/L, via
-    python.eval.match_runner.elo_interval (Wald on the logistic score)."""
-    from python.eval.match_runner import elo_interval
+def trinomial_ci_95(w: int, l: int, d: int) -> tuple[float | None, float | None, float | None]:
+    """Elo difference and 95% Agresti-Caffo CI (engine A − engine B)."""
+    from python.eval.stats import elo_confidence_interval
 
-    res = elo_interval(w, d, l)
-    return res.get("lo"), res.get("hi")
+    res = elo_confidence_interval(w, d, l)
+    return res["elo_diff"], res["lo"], res["hi"]
 
 
 def main() -> int:
@@ -150,7 +169,7 @@ def main() -> int:
     ap.add_argument("--num-openings", type=int, default=20, help="pairs: 2 games per opening")
     ap.add_argument(
         "--openings",
-        default=r"C:\Users\<user>\Music\chess\chess-rl\data\openings\eval_openings_50.epd",
+        default=str(_repo_root / "data" / "openings" / "eval_openings_50.epd"),
     )
     ap.add_argument("--c-puct", type=float, default=2.0)
     ap.add_argument("--workers", type=int, default=8)
@@ -172,7 +191,7 @@ def main() -> int:
     with open(games_csv, "w", newline="", encoding="utf-8") as f:
         csv.writer(f).writerow(
             ["timestamp", "opening_idx", "a_is_white", "result_board", "a_result",
-             "seed", "sims", "fpu_a", "fpu_b"]
+             "outcome_class", "termination_reason", "seed", "sims", "fpu_a", "fpu_b"]
         )
 
     sha_a = compute_sha256(args.engine_a)
@@ -184,8 +203,9 @@ def main() -> int:
     ctx_queue: queue.Queue[PlayerContext] = queue.Queue()
     lock = threading.Lock()
     rows: list[list] = []
-    tally = {"a_wins": 0, "draws": 0, "b_wins": 0}
+    tally = {"a_wins": 0, "draws": 0, "b_wins": 0, "capped": 0, "failures": 0}
     done = {"n": 0}
+    pairs_results: dict[int, list[tuple[bool, str]]] = {}
     start = time.time()
 
     def game_task(idx: int, fen: str):
@@ -193,12 +213,16 @@ def main() -> int:
         try:
             results = []
             for a_is_white, seed in ((True, args.seed + 2 * idx), (False, args.seed + 2 * idx + 1)):
-                board_res = ctx.play_game(fen, a_is_white, seed)
-                a_res = (
-                    "win" if board_res == ("1-0" if a_is_white else "0-1")
-                    else ("loss" if board_res == ("0-1" if a_is_white else "1-0") else "draw")
-                )
-                results.append((a_is_white, board_res, a_res, seed))
+                board_res, outcome_class, term_reason = ctx.play_game(fen, a_is_white, seed)
+                if board_res == "*":
+                    a_res = "capped"
+                elif board_res == ("1-0" if a_is_white else "0-1"):
+                    a_res = "win"
+                elif board_res == ("0-1" if a_is_white else "1-0"):
+                    a_res = "loss"
+                else:
+                    a_res = "draw"
+                results.append((a_is_white, board_res, a_res, outcome_class, term_reason, seed))
             return idx, results
         finally:
             ctx_queue.put(ctx)
@@ -210,6 +234,7 @@ def main() -> int:
         )
 
     import concurrent.futures
+    from python.eval.stats import paired_score_and_ci
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as ex:
         # Prime one context before starting (model load takes seconds).
@@ -220,9 +245,10 @@ def main() -> int:
             for fut in concurrent.futures.as_completed(futures):
                 idx, results = fut.result()
                 with lock:
-                    for a_is_white, board_res, a_res, seed in results:
+                    pairs_results[idx] = []
+                    for a_is_white, board_res, a_res, outcome_class, term_reason, seed in results:
                         row = [time.time(), idx, int(a_is_white), board_res, a_res,
-                               seed, args.sims, args.fpu_a, args.fpu_b]
+                               outcome_class, term_reason, seed, args.sims, args.fpu_a, args.fpu_b]
                         rows.append(row)
                         with open(games_csv, "a", newline="", encoding="utf-8") as f:
                             csv.writer(f).writerow(row)
@@ -231,23 +257,47 @@ def main() -> int:
                             tally["a_wins"] += 1
                         elif a_res == "loss":
                             tally["b_wins"] += 1
-                        else:
+                        elif a_res == "draw":
                             tally["draws"] += 1
+                        elif a_res == "capped":
+                            tally["capped"] += 1
+                        if outcome_class == "engine_failure":
+                            tally["failures"] += 1
                         done["n"] += 1
+                        pairs_results[idx].append((a_is_white, a_res))
                     n = done["n"]
                     total = 2 * len(openings)
-                    score = (tally["a_wins"] + 0.5 * tally["draws"]) / n
+                    n_eff = tally["a_wins"] + tally["b_wins"] + tally["draws"]
+                    score = (tally["a_wins"] + 0.5 * tally["draws"]) / n_eff if n_eff else 0.0
                     print(
                         f"Progress {n:3d}/{total} | A: +{tally['a_wins']} ={tally['draws']} "
-                        f"-{tally['b_wins']} | score {score*100:.1f}% | "
-                        f"{time.time()-start:.0f}s"
+                        f"-{tally['b_wins']} (capped={tally['capped']}, fail={tally['failures']}) | "
+                        f"score {score*100:.1f}% | {time.time()-start:.0f}s"
                     )
         except KeyboardInterrupt:
             print("Interrupted; partial tally returned")
 
     n = done["n"]
-    score = (tally["a_wins"] + 0.5 * tally["draws"]) / n if n else 0.0
-    lo, hi = trinomial_ci_95(tally["a_wins"], tally["b_wins"], tally["draws"])
+    n_eff = tally["a_wins"] + tally["b_wins"] + tally["draws"]
+    score = (tally["a_wins"] + 0.5 * tally["draws"]) / n_eff if n_eff else 0.0
+    elo_diff, lo, hi = trinomial_ci_95(tally["a_wins"], tally["b_wins"], tally["draws"])
+
+    # Compute paired opening statistics
+    pair_scores: list[tuple[float, float]] = []
+    for idx, games in pairs_results.items():
+        if len(games) == 2:
+            w_score = None
+            b_score = None
+            for a_white, res in games:
+                score_val = 1.0 if res == "win" else (0.5 if res == "draw" else 0.0)
+                if a_white:
+                    w_score = score_val
+                else:
+                    b_score = score_val
+            if w_score is not None and b_score is not None:
+                pair_scores.append((w_score, b_score))
+    paired_analysis = paired_score_and_ci(pair_scores)
+
     summary = {
         "label": args.label,
         "date": stamp,
@@ -259,10 +309,18 @@ def main() -> int:
             "noise": False, "temperature": "greedy (argmax visits)",
         },
         "completed_games": n,
+        "effective_games": n_eff,
         "planned_games": 2 * len(openings),
-        "a_wins": tally["a_wins"], "draws": tally["draws"], "b_wins": tally["b_wins"],
+        "a_wins": tally["a_wins"],
+        "draws": tally["draws"],
+        "b_wins": tally["b_wins"],
+        "capped_games": tally["capped"],
+        "engine_failures": tally["failures"],
         "a_score": round(score, 4),
-        "elo_diff_a_minus_b_95ci": [round(lo, 1), round(hi, 1)],
+        "elo_diff": round(elo_diff, 1) if not math.isinf(elo_diff) else None,
+        "elo_diff_a_minus_b_95ci": [round(lo, 1) if not math.isinf(lo) else None,
+                                    round(hi, 1) if not math.isinf(hi) else None],
+        "pairing_analysis": paired_analysis,
         "games_csv": str(games_csv),
     }
     summary_json.write_text(json.dumps(summary, indent=2), encoding="utf-8")
