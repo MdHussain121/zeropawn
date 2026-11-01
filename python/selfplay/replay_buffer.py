@@ -1791,6 +1791,7 @@ class ReplayBuffer:
             )
             for warning in gate.warnings:
                 logger.warning(warning)
+            self.human_data_gate = gate
             self.human_dataset = BinaryChessDataset(p)
             logger.info(f"Loaded human dataset with {len(self.human_dataset)} positions from {p}")
             self._load_human_cache(cache_size=cache_size, device=device)
@@ -1859,6 +1860,11 @@ class ReplayBuffer:
             planes_np = np.ascontiguousarray(self.human_dataset.planes[indices], dtype=np.float32)
             moves_np = np.ascontiguousarray(self.human_dataset.moves[indices], dtype=np.int64)
             outcomes_np = np.ascontiguousarray(self.human_dataset.outcomes[indices], dtype=np.int64)
+            if getattr(self.human_dataset, "is_syzygy", False) or getattr(
+                self.human_dataset, "metadata", {}
+            ).get("role") == "endgame_syzygy":
+                from python.data.dataset_contract import remap_syzygy_outcomes
+                outcomes_np = remap_syzygy_outcomes(outcomes_np)
 
             if target_dev is not None and target_dev.type == "cuda" and torch.cuda.is_available():
                 # Direct placement in GPU VRAM - zero host RAM used!
@@ -2429,6 +2435,11 @@ class ReplayBuffer:
                 h_planes = np.array(self.human_dataset.planes[h_indices], dtype=np.float32)
                 h_moves = np.array(self.human_dataset.moves[h_indices], dtype=np.int64)
                 h_outcomes = np.array(self.human_dataset.outcomes[h_indices], dtype=np.int64)
+                if getattr(self.human_dataset, "is_syzygy", False) or getattr(
+                    self.human_dataset, "metadata", {}
+                ).get("role") == "endgame_syzygy":
+                    from python.data.dataset_contract import remap_syzygy_outcomes
+                    h_outcomes = remap_syzygy_outcomes(h_outcomes)
 
             # Create one-hot visit distribution for human moves (vectorized)
             h_visits = np.zeros((num_human, self.num_actions), dtype=np.float32)
@@ -2720,6 +2731,11 @@ class ReplayBuffer:
                     h_outcomes_np = np.array(
                         self.human_dataset.outcomes[h_indices], dtype=np.int64
                     )
+                    if getattr(self.human_dataset, "is_syzygy", False) or getattr(
+                        self.human_dataset, "metadata", {}
+                    ).get("role") == "endgame_syzygy":
+                        from python.data.dataset_contract import remap_syzygy_outcomes
+                        h_outcomes_np = remap_syzygy_outcomes(h_outcomes_np)
 
                 h_visits_np = np.zeros((num_human, self.num_actions), dtype=np.float32)
                 _valid_h = (h_moves_np >= 0) & (h_moves_np < self.num_actions)

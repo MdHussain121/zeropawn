@@ -161,7 +161,10 @@ def compute_legal_mask(cpp_game) -> np.ndarray:
     return np.packbits(legal)  # uint8, 584 bytes
 
 
-def process_pgn_game(game: chess.pgn.Game) -> tuple[int, str, list[PositionData]]:
+def process_pgn_game(
+    game: chess.pgn.Game,
+    diag_out: Optional[dict[str, Any]] = None,
+) -> tuple[int, str, list[PositionData]]:
     """Process a single chess.pgn.Game using the C++ ChessGame and encoder.
 
     Splits games deterministically by game-ID hash into three buckets
@@ -173,6 +176,20 @@ def process_pgn_game(game: chess.pgn.Game) -> tuple[int, str, list[PositionData]
     Returns:
         (game_id_hash, split_name, list of PositionData)
     """
+    if diag_out is not None:
+        diag_out["unparsable_result"] = False
+        diag_out["truncated_replay"] = False
+        diag_out["game_errors"] = len(game.errors) if hasattr(game, "errors") else 0
+        diag_out["header_encoding_error"] = any(
+            "\ufffd" in str(v)
+            for v in (
+                game.headers.get("Date", ""),
+                game.headers.get("White", ""),
+                game.headers.get("Black", ""),
+                game.headers.get("Site", ""),
+            )
+        )
+
     # Snapshot the canonical mainline first so the fallback game identity can
     # bind to game content (collision-resistant, audit F-03).
     mainline_uci = [move.uci() for move in game.mainline_moves()]
@@ -190,6 +207,8 @@ def process_pgn_game(game: chess.pgn.Game) -> tuple[int, str, list[PositionData]
     raw_res = game.headers.get("Result", "")
     res = parse_result(raw_res)
     if res is None:
+        if diag_out is not None:
+            diag_out["unparsable_result"] = True
         return game_id, split, []
 
     positions: list[PositionData] = []
@@ -200,7 +219,9 @@ def process_pgn_game(game: chess.pgn.Game) -> tuple[int, str, list[PositionData]
         move_idx = zeropawn_cpp.move_to_index(cpp_game, uci_move)
 
         if move_idx < 0 or move_idx >= 4672:
-            # Move could not be mapped (e.g. malformed), stop game replay
+            # Move could not be mapped (e.g. malformed), stop game replay (DI-19)
+            if diag_out is not None:
+                diag_out["truncated_replay"] = True
             break
 
         legal_mask = compute_legal_mask(cpp_game)
@@ -242,6 +263,9 @@ def process_pgn_game(game: chess.pgn.Game) -> tuple[int, str, list[PositionData]
         )
 
         cpp_game.make_move_uci(uci_move)
+
+    if diag_out is not None and len(positions) < len(mainline_uci):
+        diag_out["truncated_replay"] = True
 
     return game_id, split, positions
 
@@ -399,6 +423,7 @@ def build_binary_dataset(
     max_games: int | None = None,
     progress_interval: int = 0,
     chunk_size: int = 5_000,
+    force: bool = False,
 ) -> tuple[int, int, int]:
     """Parse PGN, split 98/2 by game hash, deduplicate val positions, and save.
 
@@ -409,6 +434,12 @@ def build_binary_dataset(
     import shutil
 
     out_dir = Path(output_dir)
+    if out_dir.exists() and any(out_dir.iterdir()) and not force:
+        raise FileExistsError(
+            f"Output directory {out_dir} already exists and is non-empty. "
+            "Pass force=True (or CLI --force) to overwrite, or build into a staging directory."
+        )
+
     train_dir = out_dir / "train"
     val_dir = out_dir / "val"
     test_dir = out_dir / "test"
@@ -459,6 +490,12 @@ def build_binary_dataset(
     duplicate_games = 0
     conflicting_duplicate_games = 0
 
+    # Silent skip and replay error accounting (DI-19)
+    unparsable_results_count = 0
+    truncated_replays_count = 0
+    game_errors_count = 0
+    header_encoding_errors_count = 0
+
     try:
         with (
             open(train_part_paths["planes"], "wb") as f_tr_planes,
@@ -483,7 +520,17 @@ def build_binary_dataset(
                         break
                     total_games_seen += 1
 
-                    game_id, split, pos_list = process_pgn_game(game)
+                    diag: dict[str, Any] = {}
+                    game_id, split, pos_list = process_pgn_game(game, diag_out=diag)
+                    if diag.get("unparsable_result"):
+                        unparsable_results_count += 1
+                    if diag.get("truncated_replay"):
+                        truncated_replays_count += 1
+                    if diag.get("game_errors", 0) > 0:
+                        game_errors_count += 1
+                    if diag.get("header_encoding_error"):
+                        header_encoding_errors_count += 1
+
                     if not pos_list:
                         continue
 
@@ -589,30 +636,41 @@ def build_binary_dataset(
             json.dump(train_metadata, f, indent=2)
 
         # Deduplicate validation positions against training positions by the
-        # exact serialized state identity.
+        # exact serialized state identity, AND within-val deduplicate (DI-29).
         final_val_positions: list[PositionData] = []
-        removed_count = 0
+        val_seen_keys: set[bytes] = set()
+        val_removed_cross = 0
+        val_removed_within = 0
         for pos in candidate_val_positions:
             if pos.state_key in train_state_keys:
-                removed_count += 1
+                val_removed_cross += 1
+            elif pos.state_key in val_seen_keys:
+                val_removed_within += 1
             else:
+                val_seen_keys.add(pos.state_key)
                 final_val_positions.append(pos)
 
         n_val_final = len(final_val_positions)
+        removed_count = val_removed_cross + val_removed_within
 
         # The test split must be independent of BOTH train and the final val
-        # split (audit SLQ-09): a position whose exact encoded state survives
-        # in train or val cannot serve as test data.
-        val_state_keys = {pos.state_key for pos in final_val_positions}
+        # split (audit SLQ-09), AND within-test deduplicate (DI-32).
+        val_state_keys = val_seen_keys
         final_test_positions: list[PositionData] = []
-        test_removed_count = 0
+        test_seen_keys: set[bytes] = set()
+        test_removed_cross = 0
+        test_removed_within = 0
         for pos in candidate_test_positions:
             if pos.state_key in train_state_keys or pos.state_key in val_state_keys:
-                test_removed_count += 1
+                test_removed_cross += 1
+            elif pos.state_key in test_seen_keys:
+                test_removed_within += 1
             else:
+                test_seen_keys.add(pos.state_key)
                 final_test_positions.append(pos)
 
         n_test_final = len(final_test_positions)
+        test_removed_count = test_removed_cross + test_removed_within
 
         def _write_candidate_split(
             split_dir: Path,
@@ -620,6 +678,8 @@ def build_binary_dataset(
             positions: list[PositionData],
             candidate_count: int,
             dedup_removed: int,
+            dedup_removed_cross: int = 0,
+            dedup_removed_within: int = 0,
         ) -> None:
             part_paths = _part_paths(split_dir)
             with (
@@ -675,16 +735,24 @@ def build_binary_dataset(
                 ),
                 "candidate_positions": candidate_count,
                 "dedup_removed_positions": dedup_removed,
+                "dedup_removed_cross": dedup_removed_cross,
+                "dedup_removed_within": dedup_removed_within,
                 "dedup_rule": (
                     "positions whose exact serialized-state identity (MD5 of encoded "
-                    "planes) occurs in an earlier split are dropped"
+                    "planes) occurs in an earlier split or earlier within the split are dropped (DI-29/DI-32)"
                 ),
             }
             with open(split_dir / "metadata.json", "w", encoding="utf-8") as f:
                 json.dump(metadata, f, indent=2)
 
         _write_candidate_split(
-            val_dir, "val", final_val_positions, len(candidate_val_positions), removed_count
+            val_dir,
+            "val",
+            final_val_positions,
+            len(candidate_val_positions),
+            removed_count,
+            dedup_removed_cross=val_removed_cross,
+            dedup_removed_within=val_removed_within,
         )
         _write_candidate_split(
             test_dir,
@@ -692,6 +760,8 @@ def build_binary_dataset(
             final_test_positions,
             len(candidate_test_positions),
             test_removed_count,
+            dedup_removed_cross=test_removed_cross,
+            dedup_removed_within=test_removed_within,
         )
 
     except Exception:
@@ -721,13 +791,17 @@ def build_binary_dataset(
     print(f"Training positions:              {n_train}")
     print(f"Candidate validation positions:  {len(candidate_val_positions)}")
     pct_removed = (removed_count / max(1, len(candidate_val_positions))) * 100
-    print(f"Validation positions removed:    {removed_count} ({pct_removed:.2f}%)")
+    print(f"Validation positions removed:    {removed_count} ({pct_removed:.2f}%) [cross: {val_removed_cross}, within-val: {val_removed_within}]")
     print(f"Final validation positions:      {n_val_final}")
     print(f"Candidate test positions:        {len(candidate_test_positions)}")
-    print(f"Test positions removed:          {test_removed_count}")
+    print(f"Test positions removed:          {test_removed_count} [cross: {test_removed_cross}, within-test: {test_removed_within}]")
     print(f"Final test positions:            {n_test_final}")
     print(f"Duplicate games skipped:         {duplicate_games}")
     print(f"Conflicting duplicate games:     {conflicting_duplicate_games}")
+    print(f"Unparsable results skipped:      {unparsable_results_count}")
+    print(f"Truncated replays:               {truncated_replays_count}")
+    print(f"Game errors encountered:         {game_errors_count}")
+    print(f"Header encoding errors:          {header_encoding_errors_count}")
     print("=" * 60 + "\n")
 
     # Provenance build record (audit F-04 Layer C): binds this build to its
@@ -756,11 +830,12 @@ def build_binary_dataset(
                 "hash_game_id(game_id) % 100: <2 -> val, 2..<3 -> test (independent "
                 "held-out set, audit SLQ-09), else train"
             ),
-            "val_dedup": "val positions whose exact serialized-state identity (MD5 of encoded planes) occurs in train are dropped",
-            "test_dedup": "test positions whose exact serialized-state identity occurs in train OR the final val split are dropped",
+            "val_dedup": "val positions whose exact serialized-state identity occurs in train or within val are dropped",
+            "test_dedup": "test positions whose exact serialized-state identity occurs in train, val, or within test are dropped",
             "stm_sidecar": "stm.bin uint8 (1 = white to move, 0 = black), stored per position because the 19-plane encoder is side-relative",
             "max_games": max_games,
             "chunk_size": chunk_size,
+            "force": force,
         },
         label_semantics={
             "role": "games_wdl",
@@ -776,12 +851,20 @@ def build_binary_dataset(
             "train_positions": n_train,
             "candidate_val_positions": len(candidate_val_positions),
             "dedup_removed_val_positions": removed_count,
+            "dedup_removed_val_cross": val_removed_cross,
+            "dedup_removed_val_within": val_removed_within,
             "final_val_positions": n_val_final,
             "candidate_test_positions": len(candidate_test_positions),
             "dedup_removed_test_positions": test_removed_count,
+            "dedup_removed_test_cross": test_removed_cross,
+            "dedup_removed_test_within": test_removed_within,
             "final_test_positions": n_test_final,
             "duplicate_games_skipped": duplicate_games,
             "conflicting_duplicate_games_skipped": conflicting_duplicate_games,
+            "unparsable_results_skipped": unparsable_results_count,
+            "truncated_replays": truncated_replays_count,
+            "game_errors": game_errors_count,
+            "header_encoding_errors": header_encoding_errors_count,
         },
         outputs=output_hashes,
         git_commit=detect_git_commit(),
@@ -803,6 +886,12 @@ def main() -> None:
     parser.add_argument("--pgn", type=str, required=True, help="Input filtered PGN file.")
     parser.add_argument("--output-dir", type=str, default="data/dataset", help="Output directory.")
     parser.add_argument("--max-games", type=int, default=None, help="Max games to process.")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        default=False,
+        help="Overwrite non-empty output directory.",
+    )
 
     args = parser.parse_args()
 
@@ -829,13 +918,18 @@ def main() -> None:
                     "user" if args.output_dir != "data/dataset" else "default",
                 ),
                 ("max_games", args.max_games, "user" if args.max_games is not None else "default"),
+                ("force", args.force, "user" if args.force else "default"),
             ]
         )
     )
 
     try:
         build_binary_dataset(
-            args.pgn, args.output_dir, max_games=args.max_games, progress_interval=1000
+            args.pgn,
+            args.output_dir,
+            max_games=args.max_games,
+            progress_interval=1000,
+            force=args.force,
         )
         records = []
         for split in ("train", "val"):

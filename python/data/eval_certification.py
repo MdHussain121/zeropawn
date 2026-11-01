@@ -61,8 +61,19 @@ def verify_eval_certification(csv_path: str | Path) -> Tuple[bool, List[str], Op
         if actual_rows != recorded_rows:
             reasons.append(f"eval CSV row count {actual_rows} != certified {recorded_rows}")
     for source in data.get("train_sources", []):
-        src_path = Path(source.get("path", ""))
+        raw_path = source.get("path", "")
+        src_path = Path(raw_path)
         src_hash = source.get("sha256")
+        if not src_path.is_file():
+            # DI-13 / P2-4: Resolve relative to repo root or manifest directory before failing
+            try:
+                from python.cli.common import REPO_ROOT
+                if (REPO_ROOT / src_path).is_file():
+                    src_path = REPO_ROOT / src_path
+            except Exception:
+                pass
+            if not src_path.is_file() and (manifest_path.parent / src_path.name).is_file():
+                src_path = manifest_path.parent / src_path.name
         if not src_path.is_file():
             reasons.append(f"training source missing: {src_path}")
         elif not src_hash:

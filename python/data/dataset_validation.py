@@ -130,7 +130,7 @@ class ValidationReport:
     def overall(self) -> str:
         if self.has_fail:
             return "fail"
-        if self.has_skipped_required:
+        if self.has_skipped_required or self.has_bounded:
             return "incomplete"
         return "pass"
 
@@ -781,22 +781,28 @@ def verify_receipt(
     receipt = receipt or read_receipt(dataset_dir)
     if receipt is None:
         return False, [f"no validation receipt at {dataset_dir / RECEIPT_NAME}"], None
-    # Resolve file paths against the receipt's recorded dataset root so a
-    # split-level lookup still verifies the whole recorded artifact.
-    recorded_dir = receipt.get("dataset_dir")
-    base = Path(recorded_dir) if recorded_dir and Path(recorded_dir).is_dir() else dataset_dir
-    if not (recorded_dir and Path(recorded_dir).is_dir()) and base.name in ("train", "val", "test"):
-        # The receipt was written at the dataset root but the recorded root has
-        # since moved (e.g. a staged build promoted to its production location).
-        # The file identities are path-independent; resolve the recorded
-        # split-relative paths against the moved root, not the split directory.
-        base = base.parent
     reasons: List[str] = []
     if str(receipt.get("receipt_version", "")) != RECEIPT_VERSION:
         reasons.append(f"unknown receipt version {receipt.get('receipt_version')!r}")
     if receipt.get("overall") != "pass":
         reasons.append(f"recorded validation overall={receipt.get('overall')!r}, not 'pass'")
     files: Dict[str, Dict[str, Any]] = receipt.get("files", {})
+    # Resolve file paths against the candidate dataset root first (DI-13/P2-4):
+    # a copied or promoted dataset must be verified against its CURRENT bytes,
+    # never against a surviving original/staging directory.
+    candidate_root = (
+        dataset_dir.parent if dataset_dir.name in ("train", "val", "test") else dataset_dir
+    )
+    first_rel = next(iter(files.keys()), None) if files else None
+    recorded_dir = receipt.get("dataset_dir")
+    recorded_path = Path(recorded_dir) if recorded_dir else None
+
+    if first_rel and (candidate_root / first_rel).is_file():
+        base = candidate_root
+    elif recorded_path and recorded_path.is_dir() and first_rel and (recorded_path / first_rel).is_file():
+        base = recorded_path
+    else:
+        base = candidate_root
     if not files:
         reasons.append("receipt records no file identities")
     for rel, ident in sorted(files.items()):

@@ -251,12 +251,29 @@ class BinaryChessDataset(Dataset):
         # Optional Stockfish blended value targets: (N, 3) float32
         val_targets_path = self.data_dir / "value_targets.bin"
         if val_targets_path.exists():
+            _check_st_size(val_targets_path, self.num_samples * 3 * 4)
             self.value_targets = np.memmap(
                 val_targets_path,
                 dtype=np.float32,
                 mode="r",
                 shape=(self.num_samples, 3),
             )
+            # Consistency check (DI-22): spot-check row consistency against outcomes.bin
+            check_n = min(self.num_samples, 1000)
+            if check_n > 0:
+                sample_outcomes = np.array(self.outcomes[:check_n])
+                sample_vt = np.array(self.value_targets[:check_n])
+                if not np.all(np.isfinite(sample_vt)) or np.any(sample_vt < 0.0):
+                    raise ValueError(
+                        f"Non-finite or negative values in value_targets.bin in {self.data_dir}"
+                    )
+                valid_outcomes = (sample_outcomes != OUTCOME_UNAVAILABLE) & (sample_outcomes <= 2)
+                if np.any(valid_outcomes):
+                    vt_sums = sample_vt[valid_outcomes].sum(axis=-1)
+                    if np.any(vt_sums <= 0.0):
+                        raise ValueError(
+                            f"value_targets.bin row sum is 0 for unmasked outcomes in {self.data_dir}"
+                        )
         else:
             self.value_targets = None
 
@@ -325,7 +342,7 @@ class BinaryChessDataset(Dataset):
             "outcome": torch.tensor(-1 if is_tac else outcome, dtype=torch.long),
             "game_id": torch.tensor(game_id_val, dtype=torch.int64),
             # Stored ply passes through for every row (SLQ-06): supervision is
-            # decided by the WDL loss mask (ply >= 10 ∧ target sum > 0) and the
+            # decided by the WDL loss mask (ply >= 10 and target sum > 0) and the
             # stored label, never by the dataset kind. Mate-labelled tactical
             # rows (ply=10, outcome=0) therefore reach the value head, while
             # OUTCOME_UNAVAILABLE rows stay masked by their zero target.
@@ -449,7 +466,8 @@ class SourceAwareCombinedDataset(Dataset):
         # head, OUTCOME_UNAVAILABLE rows stay masked. Only the is_tactical
         # marker is enforced here.
         sample = self.tactics_ds[idx - self.n_master]
-        sample["is_tactical"] = torch.tensor(True, dtype=torch.bool)
+        is_syzygy = getattr(self.tactics_ds, "is_syzygy", False)
+        sample["is_tactical"] = torch.tensor(not is_syzygy, dtype=torch.bool)
         return sample
 
     def get_sampler(
@@ -729,10 +747,12 @@ class GpuResidentDataLoader:
                 outcomes_arr = np.asarray(outcomes_m, dtype=np.uint8)
                 tactics_mask = outcomes_arr == OUTCOME_UNAVAILABLE
             else:
-                # No outcomes file and no tactics concatenated; rely on ply==0
-                # but only when tactics_dir actually indicates tactical data.
-                plies_arr = np.asarray(plies_m, dtype=np.int16)
-                tactics_mask = plies_arr == 0
+                # No outcomes file and no tactics concatenated; relying on ply==0
+                # without explicit confirmation is unsafe (opening positions are at ply 0).
+                raise ValueError(
+                    f"Cannot infer tactical mask in {self.data_dir}: outcomes.bin is missing. "
+                    f"Relying on ply==0 as a tactics proxy is unsafe without explicit outcomes."
+                )
             n_tactics = int(tactics_mask.sum())
             n_master = self.num_samples - n_tactics
 

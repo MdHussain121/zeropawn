@@ -349,7 +349,7 @@ def test_incomplete_validation_never_certifies(tmp_path):
     report = validate_split(
         d, role=ROLE_GAMES_WDL, scan_planes="bounded", compute_hashes=True, check_build_record=False
     )
-    assert report.overall == "pass"
+    assert report.overall == "incomplete"
     assert not report.is_definitive  # bounded plane scan
     write_receipt(d.parent, {"train": report}, overall="incomplete")
     ok, reasons, _ = verify_receipt(d.parent, deep=True)

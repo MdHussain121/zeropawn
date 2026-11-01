@@ -348,7 +348,7 @@ def _write_split_from_records(
                 # Mate contract (audit SLQ-06, builder side): when the solver
                 # move delivers checkmate the outcome IS available and must
                 # not be silently discarded — label the row as a mover-relative
-                # win at ply 10 so the trainer's WDL mask (ply >= 10 ∧ non-zero
+                # win at ply 10 so the trainer's WDL mask (ply >= 10 and non-zero
                 # target) supervises the value head. The line ends at mate.
                 if row is not None and game.is_checkmate():
                     row.outcome = 0

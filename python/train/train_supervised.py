@@ -728,11 +728,16 @@ def _build_run_metadata(
     def _receipt_summary(label: str) -> dict[str, Any]:
         info = gate_receipts.get(label, {})
         receipt = info.get("receipt")
+        files_digest = None
+        if isinstance(receipt, dict) and "files" in receipt:
+            files_str = json.dumps(receipt["files"], sort_keys=True)
+            files_digest = f"sha256:{hashlib.sha256(files_str.encode()).hexdigest()[:16]}"
         if not isinstance(receipt, dict):
             return {
                 "data_dir": info.get("data_dir"),
                 "certified": info.get("certified", False),
                 "receipt_id": None,
+                "files_digest": None,
             }
         return {
             "data_dir": info.get("data_dir"),
@@ -740,6 +745,7 @@ def _build_run_metadata(
             "receipt_id": (
                 f"sha256:{hashlib.sha256(json.dumps(receipt, sort_keys=True).encode()).hexdigest()[:16]}"
             ),
+            "files_digest": files_digest,
             "validated_at": receipt.get("validated_at"),
             "receipt_overall": receipt.get("overall"),
             "role": receipt.get("role"),
@@ -1193,6 +1199,27 @@ def train_supervised(
         run_metadata["parent_checkpoint"] = _ckpt_identity(resume_path, hash_file=True)
         run_metadata["predecessor_run"] = predecessor_ledger
         run_metadata["run_type"] = "supervised-warm-start" if resume_weights_only else "supervised-resume"
+
+        # Dataset identity compatibility check (DI-04 / P1-5)
+        saved_dataset = None
+        if predecessor_ledger and isinstance(predecessor_ledger.get("dataset"), dict):
+            saved_dataset = predecessor_ledger.get("dataset")
+        elif isinstance(checkpoint.get("provenance"), dict) and isinstance(checkpoint["provenance"].get("dataset"), dict):
+            saved_dataset = checkpoint["provenance"].get("dataset")
+
+        if saved_dataset and run_metadata.get("dataset"):
+            saved_train = saved_dataset.get("train", {}) if isinstance(saved_dataset, dict) else {}
+            curr_train = run_metadata["dataset"].get("train", {})
+            saved_receipt_id = saved_train.get("receipt_id")
+            curr_receipt_id = curr_train.get("receipt_id")
+            if saved_receipt_id and curr_receipt_id and saved_receipt_id != curr_receipt_id:
+                logger.warning(
+                    "[DATASET-MISMATCH] Resumed checkpoint '%s' was trained on dataset receipt %s, "
+                    "but current run is gated against dataset receipt %s. Training data differs!",
+                    Path(resume_path).name,
+                    saved_receipt_id,
+                    curr_receipt_id,
+                )
 
         model.load_state_dict(checkpoint.get("model"))
         if not resume_weights_only:
@@ -1899,6 +1926,19 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+
+    if args.train_dir == default_train:
+        logger.warning(
+            "[DATASET-FALLBACK] No explicit --train-dir provided; using auto-detected path: %s. "
+            "Pass --train-dir explicitly to avoid retargeting runs across dataset builds (DI-30).",
+            args.train_dir,
+        )
+    if args.val_dir == default_val:
+        logger.warning(
+            "[DATASET-FALLBACK] No explicit --val-dir provided; using auto-detected path: %s. "
+            "Pass --val-dir explicitly to avoid retargeting runs across dataset builds (DI-30).",
+            args.val_dir,
+        )
 
     ctx = run_context("warm-start")
     t0 = time.time()

@@ -27,25 +27,19 @@ def get_baselines_file_path() -> Path:
 
 
 def _file_sha256(path: Path) -> str:
-    """Compute SHA-256 hex digest of a file with mtime/size in-memory caching.
+    """Compute SHA-256 hex digest of a file.
 
     Reads in 1MB chunks to handle ~100MB model checkpoints efficiently without
-    excessive memory consumption.
+    excessive memory consumption. Freshly computed to avoid stale cache on
+    same-mtime/same-size content modifications (DI-16).
     """
     try:
-        resolved = str(path.resolve())
-        stat = path.stat()
-        cache_key = (resolved, stat.st_mtime_ns, stat.st_size)
-        cached = _SHA256_CACHE.get(cache_key)
-        if cached:
-            return cached
-
         h = hashlib.sha256()
         with open(path, "rb") as f:
             for chunk in iter(lambda: f.read(1024 * 1024), b""):
                 h.update(chunk)
         digest = h.hexdigest()
-        _SHA256_CACHE[cache_key] = digest
+        _SHA256_CACHE[str(path.resolve())] = digest
         return digest
     except Exception as e:
         logger.debug("Failed to compute SHA-256 for %s: %s", path, e)

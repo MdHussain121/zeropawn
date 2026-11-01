@@ -1626,6 +1626,20 @@ class Phase4Orchestrator:
         self._known_ckpt_names.add(ckpt_name)
         self._event("CHECKPOINT", f"saved {ckpt_path} sha={short_hash(str(ckpt_path))} (eval)")
 
+        # DI-17: Re-verify puzzle evaluation set certification per eval cycle.
+        # Catches mid-run eval CSV swap or corruption across long-running cycles.
+        self.puzzle_certified = self._report_puzzle_certification()
+        if (
+            not self.puzzle_certified
+            and self.require_certified_eval
+            and not self.allow_uncertified_eval
+            and not self.is_verify_mode
+        ):
+            raise RuntimeError(
+                f"[EVAL CYCLE] Refusing evaluation cycle: puzzle set {self.puzzle_csv_path} "
+                f"failed certification check. Manifest is missing, stale, or hash mismatched."
+            )
+
         # 1. Evaluate Puzzles (policy top-1) — a policy metric, never a rating.
         logger.info(
             f"[EVAL CYCLE] Evaluating {len(self.puzzles) if not max_puzzles else max_puzzles} puzzles..."
@@ -1783,6 +1797,8 @@ class Phase4Orchestrator:
                 8,
                 policy_target_temp=self.policy_target_temp,
                 entropy_bonus=self.entropy_bonus,
+                stockfish_elo=self.stockfish_elo,
+                seed=int(match_runner.seed),
             ),
             match_res.get("search_mode", "serial"),
             0,
