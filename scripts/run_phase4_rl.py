@@ -760,7 +760,7 @@ class Phase4Orchestrator:
             self._active_checkpoint_sha256 = None
         # Auto-detect Syzygy tablebase if not explicitly disabled
         if self.tablebase_path is None:
-            for candidate in ("data/syzygy", "syzygy", "/usr/share/syzygy"):
+            for candidate in (str(_repo_root / "data" / "syzygy"), "data/syzygy", "syzygy", "/usr/share/syzygy"):
                 p = Path(candidate)
                 if p.is_dir():
                     files = [

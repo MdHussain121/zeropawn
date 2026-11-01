@@ -63,6 +63,7 @@ def analyze_dataset(path: str, name: str, max_games: Optional[int] = None) -> No
     draw_to_win = 0
     draw_remains_draw = 0
     decisive_unchanged = 0
+    network_failures = 0
     plies_saved_list = []
 
     for g in games:
@@ -120,26 +121,30 @@ def analyze_dataset(path: str, name: str, max_games: Optional[int] = None) -> No
             adj_res = "1-0" if it["stm"] == "white" else "0-1"
         elif cat == "loss":
             adj_res = "0-1" if it["stm"] == "white" else "1-0"
-        else:
+        elif cat == "draw":
             adj_res = "1/2-1/2"
+        else:
+            # cat is None (network failure / timeout / API error) - SY-07: NEVER map to draw
+            network_failures += 1
+            adj_res = None
 
         orig = it["orig_result"]
-        if orig in ("1/2-1/2", "draw"):
-            if adj_res in ("1-0", "0-1"):
-                draw_to_win += 1
+        if adj_res is not None:
+            if orig in ("1/2-1/2", "draw"):
+                if adj_res in ("1-0", "0-1"):
+                    draw_to_win += 1
+                else:
+                    draw_remains_draw += 1
             else:
-                draw_remains_draw += 1
-        else:
-            decisive_unchanged += 1
-
-        plies_saved_list.append(it["total_plies"] - it["ply"])
+                decisive_unchanged += 1
+            plies_saved_list.append(it["total_plies"] - it["ply"])
 
     orig_draws = sum(1 for g in games if g["result"] in ("1/2-1/2", "draw"))
     unreached_draws = orig_draws - sum(
         1 for it in reaches_le5 if it["orig_result"] in ("1/2-1/2", "draw")
     )
     adjudicated_draws = sum(
-        1 for it in reaches_le5 if it.get("cat") in ("draw", "cursed-win", "blessed-loss", None)
+        1 for it in reaches_le5 if it.get("cat") in ("draw", "cursed-win", "blessed-loss")
     )
     new_draws = unreached_draws + adjudicated_draws
     new_decisive = len(games) - new_draws
@@ -154,6 +159,7 @@ def analyze_dataset(path: str, name: str, max_games: Optional[int] = None) -> No
                 ("dataset", f"{name}{subset_note}"),
                 ("draw_to_win", f"{draw_to_win} games ({draw_conv} of draws) (M)"),
                 ("cursed_blessed", f"cursed={cursed_wins} blessed={blessed_losses} (M)"),
+                ("network_failures", f"{network_failures} (unresolved API probes) (M)"),
                 ("plies_saved_avg", f"{mean_saved:.1f} (M)"),
                 (
                     "draw_rate_orig",
@@ -220,12 +226,12 @@ if __name__ == "__main__":
     )
     try:
         analyze_dataset(
-            "docs/resignfix/diagnosis_games.jsonl",
+            str(_repo_root / "docs" / "resignfix" / "diagnosis_games.jsonl"),
             "Warm-Start best_model.pt",
             max_games=fargs.max_games,
         )
         analyze_dataset(
-            "docs/resignfix/diagnosis_step850_games.jsonl",
+            str(_repo_root / "docs" / "resignfix" / "diagnosis_step850_games.jsonl"),
             "Step-850 phase4_final_checkpoint.pt",
             max_games=fargs.max_games,
         )

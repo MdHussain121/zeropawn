@@ -31,10 +31,10 @@ from python.common.progress import (
     summary_block,
 )
 
-DEST_DIR = Path("data/syzygy")
+DEST_DIR = _repo_root / "data" / "syzygy"
 BASE_URL_HTTPS = "https://tablebase.lichess.ovh/tables/standard/3-4-5-wdl"
 MD5_URL_LICHESS = "https://tablebase.lichess.ovh/tables/standard/md5"
-MD5_URL_SESSE = "http://tablebase.sesse.net/syzygy/3-4-5/checksum.md5"
+MD5_URL_SESSE = "https://tablebase.sesse.net/syzygy/3-4-5/checksum.md5"
 
 LICENSE_VERBATIM = """
 ================================================================================
@@ -255,13 +255,14 @@ def main():
         sys.exit(1)
 
     # Save manifest and license
-    manifest_path = Path("docs/syzygy_manifest.txt")
+    manifest_path = _repo_root / "docs" / "syzygy_manifest.txt"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
     with open(manifest_path, "w", encoding="utf-8") as f:
         f.write(LICENSE_VERBATIM + "\n\n")
         f.write(f"Source: {BASE_URL_HTTPS} (HTTPS)\n")
         f.write(f"Total Files: {len(results)}\n")
         f.write(f"Total Size: {total_bytes:,} bytes ({total_bytes / (1024 * 1024):.2f} MiB)\n")
-        f.write("Integrity: All 145 files verified against official MD5 checksums.\n\n")
+        f.write("Integrity: All 145 files verified against mirror checksums.\n\n")
         f.write(f"{'Filename':<16} {'Size (bytes)':>12} {'MD5 Checksum':<34}\n")
         f.write("-" * 65 + "\n")
         for fn in sorted(results.keys()):

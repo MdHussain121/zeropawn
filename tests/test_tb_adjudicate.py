@@ -86,16 +86,59 @@ def test_known_positions_outcomes(adjudicator: TablebaseAdjudicator):
 
 
 def test_cursed_win_maps_to_draw(adjudicator: TablebaseAdjudicator):
-    """Verify that a cursed-win (or blessed-loss) position maps to draw (0)."""
-    # Known 5-piece cursed win position under 50-move rule:
-    # KNNvKP where mate requires >50 moves without pawn move
-    fen_cursed = "8/8/8/8/8/1N6/2N5/K2k3p w - - 0 1"
-    qualifies, _ = adjudicator.fast_filter(fen_cursed, max_pieces=5)
+    """Verify that cursed-win and blessed-loss positions map to draw (0) unconditionally.
+
+    Remediates SY-03 (vacuous test with illegal h1-pawn FEN and conditional assertion).
+    Exercises genuine 5-piece KNNvKP positions verified against Syzygy WDL.
+    """
+    # 1. Genuine cursed win position: White to move, forced mate requires >50 moves
+    #    KNNvKP: 7k/8/4N3/4p3/1N6/8/8/K7 w - - 0 1
+    fen_cursed = "7k/8/4N3/4p3/1N6/8/8/K7 w - - 0 1"
+    board_cursed = chess.Board(fen_cursed)
+    assert board_cursed.is_valid(), f"Fixture {fen_cursed} must be a valid chess board"
+    assert board_cursed.castling_rights == chess.BB_EMPTY
+    assert len(board_cursed.piece_map()) == 5
+
+    qualifies, pc = adjudicator.fast_filter(fen_cursed, max_pieces=5)
     assert qualifies
+    assert pc == 5
+
     res, meta = adjudicator.probe(fen_cursed)
-    if meta.get("raw_wdl") in (1, -1):
-        # Cursed win (+1) or blessed loss (-1) must map to 0
-        assert res == 0
+    assert meta["qualified"] is True
+    assert meta["raw_wdl"] == 1, f"Expected raw_wdl == 1 (cursed win), got {meta.get('raw_wdl')}"
+    assert res == 0, f"Cursed win (+1) must map to draw (0), got {res}"
+
+    # 2. Genuine blessed loss position: Black to move, defending against forced mate >50 moves
+    #    KNNvKP: 7k/4N3/3p4/8/5N2/8/8/K7 b - - 0 1
+    fen_blessed = "7k/4N3/3p4/8/5N2/8/8/K7 b - - 0 1"
+    board_blessed = chess.Board(fen_blessed)
+    assert board_blessed.is_valid(), f"Fixture {fen_blessed} must be a valid chess board"
+    assert board_blessed.castling_rights == chess.BB_EMPTY
+    assert len(board_blessed.piece_map()) == 5
+
+    qualifies_b, pc_b = adjudicator.fast_filter(fen_blessed, max_pieces=5)
+    assert qualifies_b
+    assert pc_b == 5
+
+    res_b, meta_b = adjudicator.probe(fen_blessed)
+    assert meta_b["qualified"] is True
+    assert meta_b["raw_wdl"] == -1, f"Expected raw_wdl == -1 (blessed loss), got {meta_b.get('raw_wdl')}"
+    assert res_b == 0, f"Blessed loss (-1) must map to draw (0), got {res_b}"
+
+    # 3. Additional verified cursed win fixtures (KNNvKP family)
+    additional_cursed = [
+        "7k/8/7p/8/8/8/1N6/KN6 w - - 0 1",
+        "N6k/8/7p/8/8/8/8/K5N1 w - - 0 1",
+        "7k/8/1N6/3N4/2p5/8/8/K7 w - - 0 1",
+        "7k/7N/p7/8/8/N7/8/K7 w - - 0 1",
+        "7k/4N3/8/8/4p3/8/6N1/K7 w - - 0 1",
+    ]
+    for fen in additional_cursed:
+        b = chess.Board(fen)
+        assert b.is_valid()
+        r, m = adjudicator.probe(fen)
+        assert m["raw_wdl"] == 1, f"Expected raw_wdl 1 for {fen}, got {m.get('raw_wdl')}"
+        assert r == 0, f"Expected outcome 0 (draw) for cursed win {fen}, got {r}"
 
 
 def test_filter_rejection_castling_and_piece_count(adjudicator: TablebaseAdjudicator):

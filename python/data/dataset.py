@@ -150,8 +150,8 @@ def _outcome_to_value_target(outcomes: np.ndarray, is_syzygy: bool) -> np.ndarra
     """Map stored outcome labels to (N, 3) one-hot value targets.
 
     3-class master labels are mover-relative 0=W, 1=D, 2=L. 5-class Syzygy
-    labels map 0/1 (win/cursed win) -> W, 2 (draw) -> D, 3/4 (blessed
-    loss/loss) -> L. OUTCOME_UNAVAILABLE (255) rows are left all-zero so the
+    labels map 0 (win) -> W, 1/2/3 (cursed win/draw/blessed loss) -> D, 4 (loss) -> L
+    under FIDE rule 50 (SY-02). OUTCOME_UNAVAILABLE (255) rows are left all-zero so the
     WDL loss masks them. This is the single source of truth for both loaders;
     the GPU chunk loop previously applied the Syzygy mapping unconditionally,
     decoding 3-class draws as wins (mover-relative semantics, Stage A §3.3).
@@ -160,7 +160,7 @@ def _outcome_to_value_target(outcomes: np.ndarray, is_syzygy: bool) -> np.ndarra
     targets = np.zeros((outcomes.shape[0], 3), dtype=np.float32)
     if is_syzygy:
         valid = (outcomes != OUTCOME_UNAVAILABLE) & (outcomes <= 4)
-        cls = np.where(outcomes[valid] <= 1, 0, np.where(outcomes[valid] == 2, 1, 2))
+        cls = np.where(outcomes[valid] == 0, 0, np.where(outcomes[valid] == 4, 2, 1))
     else:
         valid = (outcomes != OUTCOME_UNAVAILABLE) & (outcomes <= 2)
         cls = outcomes[valid].astype(np.int64)
@@ -199,7 +199,7 @@ class BinaryChessDataset(Dataset):
             self.metadata: Dict[str, Any] = json.load(f)
 
         self.is_tactical = determine_is_tactical(self.data_dir, self.metadata, is_tactical)
-        kind = str(self.metadata.get("kind", "")).lower()
+        kind = str(self.metadata.get("kind") or self.metadata.get("source") or "").lower()
         self.is_syzygy = (
             kind.startswith("endgame_syzygy")
             or kind.startswith("syzygy")
@@ -292,12 +292,22 @@ class BinaryChessDataset(Dataset):
         # Optional DTZ distance-to-zero targets: (N,) float32
         dtz_targets_path = self.data_dir / "dtz_targets.bin"
         if dtz_targets_path.exists():
-            self.dtz_targets = np.memmap(
+            dtz_mm = np.memmap(
                 dtz_targets_path,
                 dtype=np.float32,
                 mode="r",
                 shape=(self.num_samples,),
             )
+            # Guard against legacy all-NaN DTZ files (SY-04): ignore if entirely NaN
+            check_len = min(1024, self.num_samples)
+            if np.isnan(dtz_mm[:check_len]).all() and np.isnan(dtz_mm).all():
+                logger.debug(
+                    "dtz_targets.bin in %s contains all-NaN entries; ignoring unsupported DTZ targets",
+                    self.data_dir,
+                )
+                self.dtz_targets = None
+            else:
+                self.dtz_targets = dtz_mm
         else:
             self.dtz_targets = None
 
@@ -365,16 +375,16 @@ class BinaryChessDataset(Dataset):
             # One-hot outcome by default: [P(win), P(draw), P(loss)]
             one_hot = np.zeros(3, dtype=np.float32)
             if getattr(self, "is_syzygy", False):
-                # Map 5-class syzygy outcomes back to 3-class value targets.
+                # Map 5-class syzygy outcomes back to 3-class value targets under FIDE rule 50 (SY-02).
                 if 0 <= outcome <= 4:
-                    if outcome in (0, 1):
-                        # Win (+2) or Cursed Win (+1) -> Win
+                    if outcome == 0:
+                        # Win (+2) -> Win
                         one_hot[0] = 1.0
-                    elif outcome == 2:
-                        # Draw (0)
+                    elif outcome in (1, 2, 3):
+                        # Cursed Win (+1), Draw (0), Blessed Loss (-1) -> Draw
                         one_hot[1] = 1.0
-                    elif outcome in (3, 4):
-                        # Blessed Loss (-1) or Loss (-2) -> Loss
+                    elif outcome == 4:
+                        # Loss (-2) -> Loss
                         one_hot[2] = 1.0
             elif 0 <= outcome <= 2:
                 one_hot[outcome] = 1.0
@@ -545,7 +555,7 @@ class GpuResidentDataLoader:
             metadata: Dict[str, Any] = json.load(f)
 
         self.is_tactical = determine_is_tactical(self.data_dir, metadata, None)
-        kind = str(metadata.get("kind", "")).lower()
+        kind = str(metadata.get("kind") or metadata.get("source") or "").lower()
         self.is_syzygy = (
             kind.startswith("endgame_syzygy")
             or kind.startswith("syzygy")
