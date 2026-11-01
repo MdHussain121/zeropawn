@@ -532,7 +532,10 @@ def test_orchestrator_eval_persistence_helpers(tmp_path):
     assert lines[0].endswith(
         ",model_sha256,stockfish_sha256_16,commit,partial,"
         "sf_engine,sf_elo,sf_elo_verified,mcts_puzzle_sims,"
-        "mcts_puzzle_solved,mcts_puzzle_total,mcts_puzzle_rate"
+        "mcts_puzzle_solved,mcts_puzzle_total,mcts_puzzle_rate,"
+        # Promotion evidence columns appended by the 2026-10-31 checkpoint &
+        # artifact lifecycle remediation (audit CKP-15).
+        "promotion_decision,promotion_reason,promotion_generation"
     )
     assert len(lines) == 2
     # match_games ledger: header + one per-game row.

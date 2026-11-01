@@ -491,10 +491,28 @@ def test_slq08_gate_accepts_certified_dataset(certified_dataset):
 def test_registry_rejects_disqualified_warm_start(tmp_path, monkeypatch):
     from python.model import checkpoint_registry as cr
 
+    # Build a real file whose header matches the project architecture and whose
+    # weights are non-empty, so the status check (not the arch check and not the
+    # weight-less-container rejection added by the 2026-10-31 lifecycle
+    # remediation, finding CKP-06) is what rejects it. The registry entry names
+    # this exact path: registry matching is path-first (a byte-identical copy at
+    # another path must not inherit the original's status).
+    from python.model.chess_net import ChessNet
+
+    ckpt = tmp_path / "latest_checkpoint.pt"
+    torch.save(
+        {
+            "model": ChessNet(num_blocks=2, num_filters=32).state_dict(),
+            "num_blocks": 12,
+            "num_filters": 128,
+        },
+        ckpt,
+    )
     registry = {
         "checkpoints": [
             {
-                "path": "models/x/latest_checkpoint.pt",
+                "path": str(ckpt),
+                "file": str(ckpt),
                 "sha256": "aa" * 32,
                 "status": "disqualified",
                 "disqualified_at": "2026-10-31",
@@ -506,11 +524,6 @@ def test_registry_rejects_disqualified_warm_start(tmp_path, monkeypatch):
         ]
     }
     monkeypatch.setattr(cr, "load_registry", lambda repo_root=".": registry)
-
-    # Build a real file whose header matches the project architecture so the
-    # status check (not the arch check) is what rejects it.
-    ckpt = tmp_path / "latest_checkpoint.pt"
-    torch.save({"model": {}, "num_blocks": 12, "num_filters": 128}, ckpt)
     monkeypatch.setattr(cr, "compute_sha256", lambda path, chunk_size=1 << 20: "aa" * 32)
 
     with pytest.raises(cr.WarmStartValidationError) as excinfo:
