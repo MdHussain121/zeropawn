@@ -645,10 +645,11 @@ class RLTrainer:
         elif isinstance(ckpt.get("provenance"), dict) and isinstance(ckpt["provenance"].get("dataset"), dict):
             saved_dataset = ckpt["provenance"].get("dataset")
 
-        if saved_dataset and getattr(self.buffer, "human_data_gate", None) is not None:
+        buf = getattr(self, "replay_buffer", None) or getattr(self, "buffer", None)
+        if saved_dataset and buf is not None and getattr(buf, "human_data_gate", None) is not None:
             saved_human = saved_dataset.get("human", {}) if isinstance(saved_dataset, dict) else {}
             saved_receipt_id = saved_human.get("receipt_id")
-            gate = self.buffer.human_data_gate
+            gate = buf.human_data_gate
             curr_receipt_id = (
                 f"sha256:{hashlib.sha256(json.dumps(gate.receipt, sort_keys=True).encode()).hexdigest()[:16]}"
                 if isinstance(gate.receipt, dict)
@@ -1378,8 +1379,9 @@ class RLTrainer:
             ledger["step"] = int(self.step_num)
 
         # Bind dataset identity into checkpoint provenance (DI-04 / P1-5)
-        if getattr(self.buffer, "human_data_gate", None) is not None:
-            gate = self.buffer.human_data_gate
+        buf = getattr(self, "replay_buffer", None) or getattr(self, "buffer", None)
+        if buf is not None and getattr(buf, "human_data_gate", None) is not None:
+            gate = buf.human_data_gate
             receipt = gate.receipt
             receipt_id = (
                 f"sha256:{hashlib.sha256(json.dumps(receipt, sort_keys=True).encode()).hexdigest()[:16]}"
