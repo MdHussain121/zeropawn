@@ -33,8 +33,32 @@ import torch
 
 import zeropawn_cpp
 from python.model.chess_net import ChessNet
+from python.eval.stats import (
+    agresti_caffo_elo_ci,
+    elo_confidence_interval,
+    paired_score_and_ci,
+    score_to_elo,
+)
 
 logger = logging.getLogger("match_runner")
+
+
+def _compute_material_balance(opening_fen: str, moves: list[str], engine_is_white: bool) -> int:
+    """Compute material balance (engine - opponent) from pawn values (P=1, N=3, B=3, R=5, Q=9)."""
+    try:
+        import chess
+
+        board = chess.Board(opening_fen)
+        for m in moves:
+            board.push_uci(m)
+        vals = {chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3, chess.ROOK: 5, chess.QUEEN: 9}
+        w_mat = sum(len(board.pieces(pt, chess.WHITE)) * v for pt, v in vals.items())
+        b_mat = sum(len(board.pieces(pt, chess.BLACK)) * v for pt, v in vals.items())
+        eng_mat = w_mat if engine_is_white else b_mat
+        opp_mat = b_mat if engine_is_white else w_mat
+        return eng_mat - opp_mat
+    except Exception:
+        return 0
 
 VALID_SEARCH_MODES = ("serial", "batched")
 
@@ -98,13 +122,16 @@ def require_serial_search(search_mode: str, caller: str) -> None:
 
 
 def engine_outcome(board_result: str, engine_is_white: bool) -> str:
-    """Map a BOARD-relative result ("1-0"/"1/2-1/2"/"0-1") to engine-relative.
+    """Map a BOARD-relative result ("1-0"/"1/2-1/2"/"0-1"/"*") to engine-relative.
 
-    Returns one of "win", "draw", "loss". Anything that is not an explicit
-    white-win or draw counts as a loss (matches historical tally behavior).
+    Returns one of "win", "draw", "loss", or "capped" (Audit F-01).
+    A game reaching the ply cap without a decisive or rule-based draw outcome
+    is mapped to "capped" rather than being silently counted as a draw or loss.
     """
     if board_result == "1/2-1/2":
         return "draw"
+    if board_result in ("*", "inconclusive", "capped"):
+        return "capped"
     white_won = board_result == "1-0"
     return "win" if white_won == engine_is_white else "loss"
 
@@ -115,16 +142,21 @@ def score_board_results(results_white: list[str], results_black: list[str]) -> d
     ``results_white``: board-relative results of games where the engine was
     White; ``results_black``: where the engine was Black.
     """
-    wins = draws = losses = 0
+    wins = draws = losses = capped = 0
     for res, is_white in [(r, True) for r in results_white] + [(r, False) for r in results_black]:
         outcome = engine_outcome(res, is_white)
         if outcome == "win":
             wins += 1
         elif outcome == "draw":
             draws += 1
+        elif outcome == "capped":
+            capped += 1
         else:
             losses += 1
-    return {"engine_wins": wins, "engine_draws": draws, "engine_losses": losses}
+    tally = {"engine_wins": wins, "engine_draws": draws, "engine_losses": losses}
+    if capped > 0:
+        tally["capped_games"] = capped
+    return tally
 
 
 def eval_config_hash(
@@ -137,11 +169,16 @@ def eval_config_hash(
     entropy_bonus: Optional[float] = None,
     stockfish_elo: Optional[int] = None,
     seed: Optional[int] = None,
+    fpu_reduction: Optional[float] = None,
+    use_book: Optional[bool] = None,
+    book_hash: Optional[str] = None,
+    book_policy: Optional[str] = None,
+    max_plies: Optional[int] = None,
 ) -> str:
     """Short stable hash of the eval-match configuration for CSV provenance.
 
-    Audit DI-15: binds actual openings file content SHA-256 (falling back to filename
-    only if unreadable), plus optional stockfish_elo and match seed.
+    Audit DI-15 & F-15: binds actual openings file content SHA-256, stockfish_elo,
+    match seed, fpu_reduction, opening book configuration/hash, and max_plies.
     """
     import hashlib
 
@@ -163,6 +200,16 @@ def eval_config_hash(
         canonical += f"|sf_elo={stockfish_elo}"
     if seed is not None:
         canonical += f"|seed={seed}"
+    if fpu_reduction is not None:
+        canonical += f"|fpu={fpu_reduction}"
+    if use_book is not None:
+        canonical += f"|book={use_book}"
+    if book_hash is not None:
+        canonical += f"|book_hash={book_hash}"
+    if book_policy is not None:
+        canonical += f"|book_pol={book_policy}"
+    if max_plies is not None:
+        canonical += f"|max_plies={max_plies}"
     if policy_target_temp is not None:
         canonical += f"|temp={policy_target_temp}"
     if entropy_bonus is not None:
@@ -176,31 +223,19 @@ def default_mcts_seed() -> int:
 
 
 def elo_interval(wins: int, draws: int, losses: int) -> dict[str, Optional[float]]:
-    """Elo difference (engine − opponent) from W/D/L with Wald 95% interval.
+    """Elo difference (engine - opponent) from W/D/L with canonical Agresti-Caffo 95% interval.
 
-    Formula: score s = (W + D/2) / N; diff = -400 * log10(1/s - 1) (logistic).
-    Interval: s ± 1.96 * sqrt(s(1-s)/N), endpoints clamped to (0.001, 0.999)
-    and transformed by the same logistic. Returns None endpoints when the
-    score is exactly 0 or 1 (unbounded). This is approximate: game pairs share
-    openings (not independent) and 100 games give wide intervals (±~70+ Elo
-    near 50%).
+    Replaces the defective clamped-Wald variant with authoritative Agresti-Caffo (Audit F-03).
+    Prevents artificial finite bounds at shutouts while matching logistic difference.
+    Returns {"elo_diff": ..., "lo": ..., "hi": ..., "score": ...}.
     """
-    import math
-
-    n = wins + draws + losses
-    if n <= 0:
-        return {"elo_diff": None, "lo": None, "hi": None, "score": 0.0}
-    s = (wins + 0.5 * draws) / n
-
-    def _to_elo(x: float) -> Optional[float]:
-        if x <= 0.0 or x >= 1.0:
-            return None
-        return -400.0 * math.log10(1.0 / x - 1.0)
-
-    se = math.sqrt(max(s * (1.0 - s), 0.0) / n)
-    lo_s = max(s - 1.96 * se, 0.001)
-    hi_s = min(s + 1.96 * se, 0.999)
-    return {"elo_diff": _to_elo(s), "lo": _to_elo(lo_s), "hi": _to_elo(hi_s), "score": s}
+    res = elo_confidence_interval(wins, draws, losses, confidence=0.95, method="agresti_caffo")
+    return {
+        "elo_diff": res["elo_diff"],
+        "lo": res["lo"],
+        "hi": res["hi"],
+        "score": res["score"],
+    }
 
 
 def engine_identity(stockfish_path: Union[str, Path]) -> dict:
@@ -226,7 +261,8 @@ def write_match_pgn(games: list[dict], pgn_path: Union[str, Path]) -> str:
     """Append match games as PGN (board-relative results). Returns path str.
 
     Each game dict: opening_idx, opening_fen, engine_is_white, result, moves,
-    seed. Headers include engine color, seed, and opening index for audit.
+    seed. Headers include engine color, seed, opening index, termination, and
+    material balance for independent verification (Audit F-01).
     """
     import chess
     import chess.pgn
@@ -254,6 +290,14 @@ def write_match_pgn(games: list[dict], pgn_path: Union[str, Path]) -> str:
             pgn_game.headers["OpeningIdx"] = str(game["opening_idx"])
             pgn_game.headers["MCTSSeed"] = str(game["seed"])
             pgn_game.headers["FEN"] = game["opening_fen"]
+            if game.get("termination_reason"):
+                pgn_game.headers["Termination"] = str(game["termination_reason"])
+            if game.get("outcome_class"):
+                pgn_game.headers["OutcomeClass"] = str(game["outcome_class"])
+            if "final_material_balance" in game:
+                pgn_game.headers["FinalMaterialBalance"] = str(game["final_material_balance"])
+            if game.get("book_moves_count"):
+                pgn_game.headers["BookMoves"] = str(game["book_moves_count"])
             print(pgn_game, file=f, end="\n\n")
     return str(pgn_path)
 
@@ -300,13 +344,15 @@ def rescore_pgn(pgn_path: Union[str, Path]) -> dict:
     ok = [r for r in rows if r["illegal"] == 0 and not r["mate_contradiction"]]
     wins = sum(1 for r in ok if engine_outcome(r["recorded"], r["engine_is_white"]) == "win")
     draws = sum(1 for r in ok if r["recorded"] == "1/2-1/2")
-    losses = len(ok) - wins - draws
+    capped = sum(1 for r in ok if r["recorded"] == "*")
+    losses = sum(1 for r in ok if engine_outcome(r["recorded"], r["engine_is_white"]) == "loss")
     return {
         "games": len(rows),
         "clean_games": len(ok),
         "engine_wins": wins,
         "engine_draws": draws,
         "engine_losses": losses,
+        "capped_games": capped,
         "problem_rows": [r for r in rows if r["illegal"] or r["mate_contradiction"]],
     }
 
@@ -482,7 +528,10 @@ class MatchRunner:
     use_book: bool = True
     book_path: Optional[str] = "data/openings/curated_book.json"
     book_policy: str = "weighted_blend"
+    book_sha256: Optional[str] = None
     opening_book: Optional[Any] = None
+    enable_value_adjudication: bool = True  # Class default enables _bare_runner unit tests
+    cap_policy: str = "exclude"  # Audit F-01: exclude cap games from primary WDL tally
 
     def __init__(
         self,
@@ -502,6 +551,8 @@ class MatchRunner:
         book_policy: str = "weighted_blend",
         batch_size: Union[int, str] = 1,
         reuse_tree: bool = False,
+        enable_value_adjudication: bool = False,
+        cap_policy: str = "exclude",
     ) -> None:
         self.model = model
         self.device = device
@@ -517,6 +568,8 @@ class MatchRunner:
         self.seed = int(seed)
         self.stockfish_elo = stockfish_elo
         self.reuse_tree = reuse_tree
+        self.enable_value_adjudication = enable_value_adjudication
+        self.cap_policy = cap_policy
 
         self.stockfish_path = Path(stockfish_path)
         self.stockfish_nodes = stockfish_nodes
@@ -526,23 +579,38 @@ class MatchRunner:
         self.num_workers = num_workers
         self._lock = threading.Lock()
 
-        # Opening book support (defaults to 'weighted_blend' to align with UCI default policy)
+        # Opening book support with provenance (Audit F-05)
         self.use_book = use_book
         self.book_path = str(book_path) if book_path else None
         self.book_policy = book_policy
+        self.book_sha256 = None
         self.opening_book = None
-        if self.use_book and self.book_path and Path(self.book_path).is_file():
-            try:
-                from python.data.opening_book import OpeningBook
+        if self.use_book and self.book_path:
+            p_book = Path(self.book_path)
+            if p_book.is_file():
+                try:
+                    h = hashlib.sha256()
+                    with open(p_book, "rb") as fh:
+                        for chunk in iter(lambda: fh.read(65536), b""):
+                            h.update(chunk)
+                    self.book_sha256 = h.hexdigest()
+                    from python.data.opening_book import OpeningBook
 
-                self.opening_book = OpeningBook(
-                    book_path=self.book_path,
-                    policy=self.book_policy,
-                    enabled=True,
+                    self.opening_book = OpeningBook(
+                        book_path=self.book_path,
+                        policy=self.book_policy,
+                        enabled=True,
+                    )
+                except Exception as e:
+                    logger.warning("Opening book load failed in MatchRunner: %s; disabling book", e)
+                    self.opening_book = None
+                    self.use_book = False
+            else:
+                logger.warning(
+                    "Opening book requested at '%s' but file does not exist; opening book is DISABLED.",
+                    self.book_path,
                 )
-            except Exception as e:
-                logger.debug("Opening book disabled in MatchRunner: %s", e)
-                self.opening_book = None
+                self.use_book = False
 
     def _load_openings(self, path: Path) -> list[str]:
         if not path.exists():
@@ -685,17 +753,45 @@ class MatchRunner:
             ctx.mcts.set_seed(game_seed)
         moves: list[str] = []
         last_engine_action: Optional[int] = None
-        # Audit RL-20: record every adjudicated ending so promotion evidence
-        # can separate value-head-decided games from natural ones.
+        book_moves_count = 0
+        # Audit RL-20 & F-01: record every adjudicated and terminated ending with
+        # explicit outcome classifications, reasons, and material balance.
         adjudication_info: dict = {}
 
-        def _finish(result: str, reason: Optional[str] = None) -> tuple[str, list[str]]:
+        def _finish(
+            result: str,
+            reason: Optional[str] = None,
+            outcome_class: Optional[str] = None,
+        ) -> tuple[str, list[str]]:
             if reason is not None:
-                adjudication_info["adjudicated"] = True
+                adjudication_info["termination_reason"] = reason
+            if outcome_class is not None:
+                adjudication_info["outcome_class"] = outcome_class
+            else:
+                if result in ("1-0", "0-1"):
+                    adjudication_info["outcome_class"] = "decisive"
+                elif result == "1/2-1/2":
+                    adjudication_info["outcome_class"] = "genuine_draw"
+                else:
+                    adjudication_info["outcome_class"] = "capped"
+
+            is_adjudicated = reason in (
+                "value_cutoff_loss",
+                "value_cutoff_win",
+                "fifty_move_countdown",
+                "max_plies_cap",
+            )
+            adjudication_info["adjudicated"] = is_adjudicated
+            if is_adjudicated:
                 adjudication_info["adjudication_reason"] = reason
+
+            adjudication_info["final_fen"] = game.get_fen()
+            adjudication_info["final_material_balance"] = _compute_material_balance(
+                opening_fen, moves, engine_is_white
+            )
+            adjudication_info["book_moves_count"] = book_moves_count
             if info is not None:
                 info.update(adjudication_info)
-                info.setdefault("adjudicated", False)
             return (result, moves)
 
         plies = 0
@@ -708,7 +804,11 @@ class MatchRunner:
 
             # Adjudication: 50-move countdown reaches >= 60 plies (30 full moves no progress)
             if game.half_move_clock() >= 60:
-                return _finish("1/2-1/2", reason="fifty_move_countdown")
+                return _finish(
+                    "1/2-1/2",
+                    reason="fifty_move_countdown",
+                    outcome_class="genuine_draw",
+                )
 
             # NOTE: ChessGame.side_to_move() returns bool (True = White to move).
             # Never compare it with == 0 / == 1 (True == 0 is False).
@@ -733,6 +833,7 @@ class MatchRunner:
                     move_uci = book_move.uci()
                     root_val = 0.0
                     last_engine_action = None
+                    book_moves_count += 1
                     if getattr(self, "reuse_tree", False):
                         ctx.mcts.reset_root()
                 else:
@@ -756,27 +857,31 @@ class MatchRunner:
                 # Adjudication checks based on root value (engine-relative value:
                 # negative = engine losing, positive = engine winning). Returns
                 # are BOARD-relative: map the engine outcome to White/Black.
-                if root_val < -0.92:
-                    consecutive_hopeless += 1
-                    if consecutive_hopeless >= 4:
-                        # Engine forfeits: engine loses board-relatively.
-                        return _finish(
-                            "0-1" if engine_is_white else "1-0",
-                            reason="value_cutoff_loss",
-                        )
-                else:
-                    consecutive_hopeless = 0
+                # Audit F-04: only enabled if explicitly configured.
+                if getattr(self, "enable_value_adjudication", False):
+                    if root_val < -0.92:
+                        consecutive_hopeless += 1
+                        if consecutive_hopeless >= 4:
+                            # Engine forfeits: engine loses board-relatively.
+                            return _finish(
+                                "0-1" if engine_is_white else "1-0",
+                                reason="value_cutoff_loss",
+                                outcome_class="decisive",
+                            )
+                    else:
+                        consecutive_hopeless = 0
 
-                if root_val > 0.92:
-                    consecutive_winning += 1
-                    if consecutive_winning >= 4:
-                        # Engine adjudicated winner board-relatively.
-                        return _finish(
-                            "1-0" if engine_is_white else "0-1",
-                            reason="value_cutoff_win",
-                        )
-                else:
-                    consecutive_winning = 0
+                    if root_val > 0.92:
+                        consecutive_winning += 1
+                        if consecutive_winning >= 4:
+                            # Engine adjudicated winner board-relatively.
+                            return _finish(
+                                "1-0" if engine_is_white else "0-1",
+                                reason="value_cutoff_win",
+                                outcome_class="decisive",
+                            )
+                    else:
+                        consecutive_winning = 0
             else:
                 move_uci = ctx.stockfish.get_move(game.get_fen())
                 if (
@@ -799,7 +904,13 @@ class MatchRunner:
             if not move_uci or not game.is_legal(move_uci):
                 # Side to move forfeits (illegal/missing move): loser is the
                 # mover, board-relatively (True = White to move = White loses).
-                return _finish("0-1" if game.side_to_move() else "1-0")
+                mover_is_white = bool(game.side_to_move())
+                reason = "forfeit_illegal_move" if move_uci else "forfeit_timeout"
+                return _finish(
+                    "0-1" if mover_is_white else "1-0",
+                    reason=reason,
+                    outcome_class="forfeit",
+                )
 
             game.make_move_uci(move_uci)
             moves.append(move_uci)
@@ -809,9 +920,21 @@ class MatchRunner:
             # Loser is the side to move (True = White mated => Black won).
             # Board-relative: loser White -> "0-1", loser Black -> "1-0".
             loser_is_white = bool(game.side_to_move())
-            return _finish("0-1" if loser_is_white else "1-0")
+            return _finish(
+                "0-1" if loser_is_white else "1-0",
+                reason="checkmate",
+                outcome_class="decisive",
+            )
+        elif plies >= max_plies:
+            # Audit F-01: Maximum ply cap reached without a decisive or rule-based draw outcome.
+            # Must not be treated as a genuine chess draw by default.
+            cap_pol = getattr(self, "cap_policy", "exclude")
+            if cap_pol == "draw":
+                return _finish("1/2-1/2", reason="max_plies_cap", outcome_class="capped")
+            else:
+                return _finish("*", reason="max_plies_cap", outcome_class="capped")
         else:
-            return _finish("1/2-1/2")
+            return _finish("1/2-1/2", reason="rule_draw", outcome_class="genuine_draw")
 
     def run_match(
         self,
@@ -897,9 +1020,14 @@ class MatchRunner:
                         "result": res_w,
                         "moves": moves_w,
                         "seed": self.seed + 2 * idx,
-                        # Audit RL-20: value-cutoff adjudication provenance.
+                        # Audit RL-20 & F-01: adjudication and termination provenance.
                         "adjudicated": bool(info_w.get("adjudicated", False)),
                         "adjudication_reason": info_w.get("adjudication_reason"),
+                        "outcome_class": info_w.get("outcome_class", "unknown"),
+                        "termination_reason": info_w.get("termination_reason", "unknown"),
+                        "final_material_balance": info_w.get("final_material_balance", 0),
+                        "final_fen": info_w.get("final_fen", ""),
+                        "book_moves_count": info_w.get("book_moves_count", 0),
                     },
                     {
                         "opening_idx": idx,
@@ -910,6 +1038,11 @@ class MatchRunner:
                         "seed": self.seed + 2 * idx + 1,
                         "adjudicated": bool(info_b.get("adjudicated", False)),
                         "adjudication_reason": info_b.get("adjudication_reason"),
+                        "outcome_class": info_b.get("outcome_class", "unknown"),
+                        "termination_reason": info_b.get("termination_reason", "unknown"),
+                        "final_material_balance": info_b.get("final_material_balance", 0),
+                        "final_fen": info_b.get("final_fen", ""),
+                        "book_moves_count": info_b.get("book_moves_count", 0),
                     },
                 )
             finally:
@@ -963,13 +1096,18 @@ class MatchRunner:
 
                         completed_pairs += 1
                         games_done = completed_pairs * 2
-                        score = (engine_wins + 0.5 * engine_draws) / games_done
+                        eff_done = engine_wins + engine_draws + engine_losses
+                        score = (
+                            (engine_wins + 0.5 * engine_draws) / eff_done
+                            if eff_done > 0
+                            else 0.0
+                        )
                         elapsed = time.time() - start_time
                         logger.info(
                             f"Match Progress: {games_done:3d}/{total_games} games | "
                             f"W: {engine_wins:2d} D: {engine_draws:2d} L: {engine_losses:2d} | "
-                            f"Score: {score * 100:5.1f}% | Elapsed: {elapsed:5.1f}s "
-                            f"({elapsed / games_done:.1f}s/game)"
+                            f"Score: {score * 100:5.1f}% (effective N={eff_done}) | "
+                            f"Elapsed: {elapsed:5.1f}s ({elapsed / games_done:.1f}s/game)"
                         )
                 except (KeyboardInterrupt, Exception) as exc:
                     # Interruption or worker failure: keep every completed game
@@ -990,12 +1128,129 @@ class MatchRunner:
             for ctx in contexts:
                 ctx.close()
 
-        # Rates cover exactly the completed games when interrupted so the tally
-        # never counts unplayed games as losses.
-        completed_total = len(results_as_white) + len(results_as_black)
+        # Outcome classification & statistical integrity (Audit F-01, F-03, F-16)
+        decisive_wins = 0
+        decisive_losses = 0
+        genuine_draws = 0
+        capped_games = 0
+        forfeit_wins = 0
+        forfeit_losses = 0
+
+        for g in games:
+            res = g["result"]
+            eng_white = g["engine_is_white"]
+            outcome_class = g.get("outcome_class")
+            term_reason = g.get("termination_reason", "")
+
+            if res == "*":
+                capped_games += 1
+            elif res == "1/2-1/2":
+                if outcome_class == "capped" or term_reason == "max_plies_cap":
+                    capped_games += 1
+                else:
+                    genuine_draws += 1
+            elif res == "1-0":
+                if eng_white:
+                    if outcome_class == "forfeit":
+                        forfeit_wins += 1
+                    else:
+                        decisive_wins += 1
+                else:
+                    if outcome_class == "forfeit":
+                        forfeit_losses += 1
+                    else:
+                        decisive_losses += 1
+            elif res == "0-1":
+                if eng_white:
+                    if outcome_class == "forfeit":
+                        forfeit_losses += 1
+                    else:
+                        decisive_losses += 1
+                else:
+                    if outcome_class == "forfeit":
+                        forfeit_wins += 1
+                    else:
+                        decisive_wins += 1
+
+        engine_wins = decisive_wins + forfeit_wins
+        engine_losses = decisive_losses + forfeit_losses
+        engine_draws = genuine_draws
+        effective_games = engine_wins + engine_draws + engine_losses
+
+        completed_total = len(games)
         denominator = completed_total if interrupted else total_games
-        score_pct = (engine_wins + 0.5 * engine_draws) / denominator if denominator > 0 else 0.0
-        draw_rate = engine_draws / denominator if denominator > 0 else 0.0
+        primary_score = (
+            (engine_wins + 0.5 * engine_draws) / effective_games
+            if effective_games > 0
+            else 0.0
+        )
+        draw_rate = engine_draws / effective_games if effective_games > 0 else 0.0
+        capped_rate = capped_games / completed_total if completed_total > 0 else 0.0
+
+        primary_elo_res = elo_confidence_interval(
+            engine_wins, engine_draws, engine_losses, confidence=0.95, method="agresti_caffo"
+        )
+
+        # Cluster-adjusted paired analysis across complete opening pairs (Audit F-16)
+        pairs_dict: dict[int, dict[str, float]] = {}
+        for g in games:
+            idx = g["opening_idx"]
+            res = g["result"]
+            eng_white = g["engine_is_white"]
+            if res == "1-0":
+                s = 1.0 if eng_white else 0.0
+            elif res == "0-1":
+                s = 0.0 if eng_white else 1.0
+            elif res == "1/2-1/2" and g.get("outcome_class") != "capped":
+                s = 0.5
+            else:
+                s = None  # capped or incomplete
+            if s is not None:
+                if idx not in pairs_dict:
+                    pairs_dict[idx] = {}
+                pairs_dict[idx]["white" if eng_white else "black"] = s
+
+        valid_pairs = [
+            (p["white"], p["black"])
+            for p in pairs_dict.values()
+            if "white" in p and "black" in p
+        ]
+        pairing_res = paired_score_and_ci(valid_pairs, confidence=0.95)
+
+        # Sensitivity analyses (Audit F-01):
+        # 1. Capped scored as draw (legacy comparison)
+        cd_draws = engine_draws + capped_games
+        cd_total = engine_wins + cd_draws + engine_losses
+        cd_score = (engine_wins + 0.5 * cd_draws) / cd_total if cd_total > 0 else 0.0
+        cd_elo = elo_confidence_interval(engine_wins, cd_draws, engine_losses)
+
+        # 2. Capped scored as loss (worst-case sensitivity)
+        cl_losses = engine_losses + capped_games
+        cl_total = engine_wins + engine_draws + cl_losses
+        cl_score = (engine_wins + 0.5 * engine_draws) / cl_total if cl_total > 0 else 0.0
+        cl_elo = elo_confidence_interval(engine_wins, engine_draws, cl_losses)
+
+        # 3. Capped adjudicated by material balance (>= +2 pawns win, <= -2 pawns loss, else draw)
+        cm_wins = engine_wins
+        cm_losses = engine_losses
+        cm_draws = engine_draws
+        for g in games:
+            if (
+                g.get("outcome_class") == "capped"
+                or g.get("termination_reason") == "max_plies_cap"
+                or g.get("result") == "*"
+            ):
+                mat = g.get("final_material_balance", 0)
+                if mat >= 2:
+                    cm_wins += 1
+                elif mat <= -2:
+                    cm_losses += 1
+                else:
+                    cm_draws += 1
+        cm_total = cm_wins + cm_draws + cm_losses
+        cm_score = (cm_wins + 0.5 * cm_draws) / cm_total if cm_total > 0 else 0.0
+        cm_elo = elo_confidence_interval(cm_wins, cm_draws, cm_losses)
+
         games.sort(key=lambda g: (g["opening_idx"], not g["engine_is_white"]))
 
         pgn_saved: Optional[str] = str(pgn_path) if (pgn_path is not None and games) else None
@@ -1003,11 +1258,21 @@ class MatchRunner:
         return {
             "total_games": denominator if interrupted else total_games,
             "completed_games": completed_total,
+            "effective_games": effective_games,
             "engine_wins": engine_wins,
             "engine_draws": engine_draws,
             "engine_losses": engine_losses,
-            "engine_score": score_pct,
+            "capped_games": capped_games,
+            "forfeit_wins": forfeit_wins,
+            "forfeit_losses": forfeit_losses,
+            "engine_score": primary_score,
+            "primary_score": primary_score,
             "draw_rate": draw_rate,
+            "capped_rate": capped_rate,
+            "primary_elo": primary_elo_res,
+            "elo_diff": primary_elo_res["elo_diff"],
+            "elo_lo": primary_elo_res["lo"],
+            "elo_hi": primary_elo_res["hi"],
             "search_mode": self.search_mode,
             "seed": self.seed,
             "stockfish_elo": self.stockfish_elo,
@@ -1017,10 +1282,6 @@ class MatchRunner:
             "games": games,
             "pgn_path": pgn_saved,
             "elapsed_sec": round(time.time() - start_time, 2),
-            # Audit RL-20: how many of the completed games were decided by
-            # adjudication rather than natural termination, split by cause.
-            # A promotion decision backed mostly by value-cutoff wins is
-            # exactly the uncalibrated-value-head risk this surfaces.
             "adjudicated_games": sum(1 for g in games if g.get("adjudicated")),
             "adjudicated_value_cutoff_wins": sum(
                 1 for g in games if g.get("adjudication_reason") == "value_cutoff_win"
@@ -1028,6 +1289,18 @@ class MatchRunner:
             "adjudicated_value_cutoff_losses": sum(
                 1 for g in games if g.get("adjudication_reason") == "value_cutoff_loss"
             ),
+            "use_book": self.use_book,
+            "book_path": self.book_path,
+            "book_sha256": self.book_sha256,
+            "book_policy": self.book_policy,
+            "book_moves_total": sum(int(g.get("book_moves_count", 0)) for g in games),
+            "book_games_total": sum(1 for g in games if int(g.get("book_moves_count", 0)) > 0),
+            "pairing_analysis": pairing_res,
+            "sensitivity_analysis": {
+                "capped_as_draw": cd_elo,
+                "capped_as_loss": cl_elo,
+                "capped_by_material": cm_elo,
+            },
         }
 
     def close(self) -> None:

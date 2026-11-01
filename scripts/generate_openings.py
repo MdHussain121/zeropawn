@@ -58,7 +58,7 @@ OPENINGS = [
     ("d4 d5 Nc3 Nf6 Bg5 Nbd7", "Richter-Veresov"),
     ("d4 Nf6 Bg5 d5 Bxf6 exf6", "Trompowsky Attack"),
     ("b3 e5 Bb2 Nc6 e3 d5", "Nimzo-Larsen Attack"),
-    ("g3 d5 Bg2 Nf6 Nf3 c6", "Benko Opening"),
+    ("g3 e5 Bg2 d5 Nf3 Nc6", "Hungarian Opening"),
     ("e4 g6 d4 Bg7 Nf3 d6", "Modern Defense"),
 ]
 
@@ -67,15 +67,24 @@ def generate_openings_epd(output_path: Path = Path("data/openings/eval_openings_
     assert len(OPENINGS) == 50, f"Expected 50 openings, got {len(OPENINGS)}"
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with open(output_path, "w", encoding="utf-8") as f:
-        for san_moves, name in OPENINGS:
-            board = chess.Board()
-            for m in san_moves.split():
-                board.push_san(m)
-            fen = board.fen()
-            f.write(f'{fen} ; id "{name}";\n')
+    fens: list[str] = []
+    lines: list[str] = []
+    for san_moves, name in OPENINGS:
+        board = chess.Board()
+        for m in san_moves.split():
+            board.push_san(m)
+        fen = board.fen()
+        fens.append(fen)
+        lines.append(f'{fen} ; id "{name}";\n')
 
-    print(f"Successfully generated {len(OPENINGS)} openings to {output_path}")
+    assert len(set(fens)) == len(fens) == 50, (
+        f"All 50 opening positions must be unique, found {len(set(fens))} unique positions"
+    )
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+
+    print(f"Successfully generated {len(OPENINGS)} unique openings to {output_path}")
     return output_path
 
 

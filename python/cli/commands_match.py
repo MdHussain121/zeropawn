@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import threading
 import time
@@ -50,21 +51,37 @@ logger = logging.getLogger(__name__)
 
 
 def _elo_diff_ci(wins: int, draws: int, losses: int) -> str:
-    """Elo difference + 95% CI from W/D/L (logistic, binomial SE).
+    """Elo difference + 95% Agresti-Caffo CI from W/D/L.
 
-    elo = -400*log10(1/s - 1), s = (W + 0.5*D) / N;
-    SE = (400/ln10) * sqrt(1 / (N*s*(1-s))); CI = elo +/- 1.96*SE.
-    Returns 'n/a (reason)' at the s=0/1 edges instead of inventing numbers.
+    Replaces legacy clamped Wald binomial SE with canonical Agresti-Caffo logit CI.
     """
+    from python.eval.stats import elo_confidence_interval
+
     n = wins + draws + losses
     if n <= 0:
         return "n/a (no games)"
-    s = (wins + 0.5 * draws) / n
-    if s <= 0.0 or s >= 1.0:
-        return "n/a (score 0% or 100%: unbounded)"
-    elo = -400.0 * math.log10(1.0 / s - 1.0)
-    se = (400.0 / math.log(10.0)) * math.sqrt(1.0 / (n * s * (1.0 - s)))
-    return f"{elo:+.1f} +/- {1.96 * se:.1f} (95% CI, N={n})"
+    res = elo_confidence_interval(wins, draws, losses)
+    elo = res["elo_diff"]
+    lo, hi = res["lo"], res["hi"]
+    if elo is not None and abs(elo) < 1e-9:
+        elo = 0.0
+    if elo is None:
+        return f"n/a (score 0% or 100%: unbounded) [{lo:+.1f}, {hi:+.1f}]"
+    half = (hi - lo) / 2.0
+    return f"{elo:+.1f} +/- {half:.1f} (95% CI Agresti-Caffo: [{lo:+.1f}, {hi:+.1f}], N={n})"
+
+
+def _append_match_ledger(
+    entry: dict, ledger_path: str = "runs/matches/match_ledger.jsonl"
+) -> None:
+    """Append a match summary record to the persistent match ledger."""
+    try:
+        p = Path(ledger_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception as e:
+        logger.warning("Failed to write to match ledger %s: %s", ledger_path, e)
 
 
 def _validate_match_numerics(args: argparse.Namespace) -> Optional[str]:
@@ -235,6 +252,43 @@ def _add_batch_args(parser: argparse.ArgumentParser) -> None:
         choices=["best", "weighted_blend", "frequency", "score", "uniform"],
         default="best",
         help="Opening book selection policy for matches (default: best)",
+    )
+    parser.add_argument(
+        "--pgn",
+        type=str,
+        default=None,
+        help="Path to output PGN file (default: auto-saved in runs/matches/match_<stamp>.pgn)",
+    )
+    parser.add_argument(
+        "--no-pgn",
+        action="store_true",
+        help="Disable automatic PGN recording for the match",
+    )
+    parser.add_argument(
+        "--output",
+        "--json",
+        dest="output_json",
+        type=str,
+        default=None,
+        help="Path to output JSON match summary (default: auto-saved in runs/matches/match_<stamp>.json)",
+    )
+    parser.add_argument(
+        "--cap-policy",
+        choices=["exclude", "draw", "loss", "adjudicate"],
+        default="exclude",
+        help="Termination policy for games reaching maximum plies (default: exclude)",
+    )
+    parser.add_argument(
+        "--enable-value-adjudication",
+        action="store_true",
+        default=False,
+        help="Enable value-head resignation/win adjudication (default: False)",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for opening shuffle and evaluation (default: None)",
     )
     _add_search_mode_arg(parser)
 
@@ -453,6 +507,23 @@ def run_batch_match(args: argparse.Namespace) -> int:
     num_openings = max(1, args.games // 2)
     total_games = num_openings * 2
 
+    timestamp_str = time.strftime("%Y%m%d_%H%M%S")
+    runs_dir = Path("runs/matches")
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_tag = short_hash(str(ckpt_path))
+
+    if getattr(args, "no_pgn", False):
+        pgn_path = None
+    elif getattr(args, "pgn", None):
+        pgn_path = str(safe_resolve(args.pgn))
+    else:
+        pgn_path = str(runs_dir / f"match_{timestamp_str}_{ckpt_tag}.pgn")
+
+    if getattr(args, "output_json", None):
+        json_path = str(safe_resolve(args.output_json))
+    else:
+        json_path = str(runs_dir / f"match_{timestamp_str}_{ckpt_tag}.json")
+
     ckpt_id = f"{Path(ckpt_path).name} step={info['step']} sha={short_hash(str(ckpt_path))} (M)"
     emit_report(
         header_block(
@@ -511,6 +582,21 @@ def run_batch_match(args: argparse.Namespace) -> int:
                     getattr(args, "batch_size", "auto"),
                     "user" if getattr(args, "batch_size", "auto") != "auto" else "default",
                 ),
+                (
+                    "pgn",
+                    pgn_path or "disabled",
+                    "user" if getattr(args, "pgn", None) or getattr(args, "no_pgn", False) else "default (auto)",
+                ),
+                (
+                    "output_json",
+                    json_path,
+                    "user" if getattr(args, "output_json", None) else "default (auto)",
+                ),
+                (
+                    "cap_policy",
+                    getattr(args, "cap_policy", "exclude"),
+                    "user" if getattr(args, "cap_policy", "exclude") != "exclude" else "default",
+                ),
             ]
         )
     )
@@ -531,6 +617,9 @@ def run_batch_match(args: argparse.Namespace) -> int:
         book_path=getattr(args, "book", "data/openings/curated_book.json"),
         book_policy=getattr(args, "book_policy", "best"),
         reuse_tree=getattr(args, "reuse_tree", False),
+        cap_policy=getattr(args, "cap_policy", "exclude"),
+        enable_value_adjudication=getattr(args, "enable_value_adjudication", False),
+        seed=getattr(args, "seed", None),
     )
 
     emit_report(
@@ -553,34 +642,151 @@ def run_batch_match(args: argparse.Namespace) -> int:
 
     hb_thread = threading.Thread(target=_beat, name="match-heartbeat", daemon=True)
     hb_thread.start()
+    interrupted = False
+    results = None
     try:
         t_match = time.time()
-        results = runner.run_match(num_openings=num_openings)
+        results = runner.run_match(
+            num_openings=num_openings,
+            pgn_path=pgn_path,
+        )
         elapsed = time.time() - t_match
+        if results.get("interrupted", False):
+            interrupted = True
+    except KeyboardInterrupt:
+        elapsed = time.time() - t_match
+        interrupted = True
+        logger.info("Match interrupted by user.")
     finally:
         hb_stop.set()
 
+    if results is None:
+        results = {
+            "total_games": 0,
+            "engine_wins": 0,
+            "engine_draws": 0,
+            "engine_losses": 0,
+            "genuine_draws": 0,
+            "capped_games": 0,
+            "effective_games": 0,
+            "engine_score": 0.0,
+            "draw_rate": 0.0,
+            "elo_diff": 0.0,
+            "elo_ci_95": [-math.inf, math.inf],
+            "interrupted": True,
+        }
+
+    match_status = "INTERRUPTED" if interrupted else "COMPLETED"
+
+    # Save JSON summary
+    summary_record = {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t0)),
+        "match_status": match_status,
+        "command": ctx["command"],
+        "git_commit": ctx["commit"],
+        "checkpoint": str(ckpt_path),
+        "checkpoint_sha256": short_hash(str(ckpt_path)),
+        "device": str(device),
+        "stockfish_path": str(sf_path),
+        "stockfish_nodes": args.stockfish_nodes,
+        "stockfish_elo": getattr(args, "elo", None),
+        "mcts_sims": args.mcts_sims,
+        "c_puct": args.c_puct,
+        "workers": args.workers,
+        "search_mode": getattr(args, "search_mode", "serial"),
+        "openings_path": str(openings_path),
+        "use_book": not getattr(args, "no_book", False),
+        "book_path": getattr(args, "book", "data/openings/curated_book.json"),
+        "book_policy": getattr(args, "book_policy", "best"),
+        "cap_policy": getattr(args, "cap_policy", "exclude"),
+        "enable_value_adjudication": getattr(args, "enable_value_adjudication", False),
+        "pgn_path": pgn_path,
+        "json_path": json_path,
+        "elapsed_seconds": elapsed,
+        "results": results,
+    }
+    try:
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(summary_record, f, indent=2)
+    except Exception as e:
+        logger.warning("Failed to write JSON summary %s: %s", json_path, e)
+
+    # Append to match ledger
+    ledger_entry = {
+        "timestamp": summary_record["timestamp"],
+        "match_status": match_status,
+        "checkpoint": Path(ckpt_path).name,
+        "checkpoint_sha256": short_hash(str(ckpt_path)),
+        "git_commit": ctx["commit"],
+        "stockfish_nodes": args.stockfish_nodes,
+        "stockfish_elo": getattr(args, "elo", None),
+        "total_games_scheduled": total_games,
+        "total_games_completed": results.get("total_games", 0),
+        "effective_games": results.get("effective_games", results.get("total_games", 0)),
+        "engine_wins": results.get("engine_wins", 0),
+        "engine_draws": results.get("engine_draws", 0),
+        "engine_losses": results.get("engine_losses", 0),
+        "genuine_draws": results.get("genuine_draws", results.get("engine_draws", 0)),
+        "capped_games": results.get("capped_games", 0),
+        "engine_score": results.get("engine_score", 0.0),
+        "elo_diff": results.get("elo_diff", 0.0),
+        "elo_ci_95": results.get("elo_ci_95", [0.0, 0.0]),
+        "pairing_analysis": results.get("pairing_analysis", {}),
+        "pgn_path": pgn_path,
+        "json_path": json_path,
+    }
+    _append_match_ledger(ledger_entry)
+
     # Display results (same numbers, ASCII key=value layout + Elo CI)
-    w, d, l = results["engine_wins"], results["engine_draws"], results["engine_losses"]
-    emit_report(
-        results_table(
-            [
-                ("games", f"{results['total_games']} (M)"),
-                ("engine_wins", f"{w} (M)"),
-                ("engine_draws", f"{d} (M)"),
-                ("engine_losses", f"{l} (M)"),
-                ("score", f"{results['engine_score'] * 100:.1f}% (M, (W+0.5D)/N)"),
-                ("search_mode", f"{results.get('search_mode', 'serial')} (M)"),
-                ("draw_rate", f"{results['draw_rate'] * 100:.1f}% (M)"),
-                ("elo_diff_95ci", f"{_elo_diff_ci(w, d, l)} (D, logistic+binomial)"),
-                (
-                    "crashes_illegal_forfeits",
-                    "n/a (not tracked by runner; non-decisive engine faults count as losses)",
-                ),
-                ("total_time", f"{elapsed:.1f}s ({elapsed / max(1, total_games):.1f}s/game) (M)"),
-            ]
+    w = results.get("engine_wins", 0)
+    d = results.get("engine_draws", 0)
+    l = results.get("engine_losses", 0)
+    genuine_d = results.get("genuine_draws", d)
+    capped = results.get("capped_games", 0)
+    eff_n = results.get("effective_games", w + d + l)
+    score = results.get("engine_score", 0.0)
+
+    pairing = results.get("pairing_analysis", {})
+    paired_str = "n/a"
+    if pairing and pairing.get("pairs_count", 0) > 0:
+        p_elo = pairing.get("elo_diff", 0.0)
+        p_lo, p_hi = pairing.get("ci_95", (0.0, 0.0))
+        p_half = (p_hi - p_lo) / 2.0
+        paired_str = f"{p_elo:+.1f} +/- {p_half:.1f} (paired 95%: [{p_lo:+.1f}, {p_hi:+.1f}])"
+
+    res_items = [
+        ("scheduled_games", f"{total_games}"),
+        ("completed_games", f"{results['total_games']} (M)"),
+        ("effective_games", f"{eff_n} (M, decisive + genuine draws)"),
+        ("engine_wins", f"{w} (M)"),
+        ("genuine_draws", f"{genuine_d} (M)"),
+        ("capped_games", f"{capped} (M, cap_policy={getattr(args, 'cap_policy', 'exclude')})"),
+        ("engine_losses", f"{l} (M)"),
+        ("effective_score", f"{score * 100:.1f}% (M, (W+0.5*D_genuine)/N_eff)"),
+        ("search_mode", f"{results.get('search_mode', 'serial')} (M)"),
+        ("draw_rate", f"{results.get('draw_rate', 0.0) * 100:.1f}% (M)"),
+        ("elo_diff_95ci", f"{_elo_diff_ci(w, genuine_d, l)}"),
+        ("paired_elo_diff_95ci", f"{paired_str}"),
+        ("pgn_file", pgn_path or "disabled"),
+        ("json_file", json_path),
+        (
+            "crashes_illegal_forfeits",
+            "n/a (not tracked by runner; non-decisive engine faults count as losses)",
+        ),
+        ("total_time", f"{elapsed:.1f}s ({elapsed / max(1, results['total_games']):.1f}s/game) (M)"),
+    ]
+    emit_report(results_table(res_items))
+
+    if interrupted:
+        emit_report(
+            event_line(
+                "INTERRUPTED",
+                f"Match stopped early: completed {results['total_games']} of {total_games} scheduled games. Results saved to {json_path}.",
+            )
         )
-    )
+        emit_report(summary_block("INTERRUPTED", time.time() - t0, 0, 1))
+        return 130
+
     emit_report(summary_block("SUCCESS", time.time() - t0, 0, 0))
     return 0
 

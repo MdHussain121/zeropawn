@@ -350,6 +350,7 @@ class Phase4Orchestrator:
         promotion_min_score: float = 0.55,
         # ── Checkpoint provenance (2026-10-30 integration) ────────────────
         promotion_sprt_max_games: int = 0,
+        allow_unverified_promotion: bool = False,
         # ──────────────────────────────────────────────────────────────────
     ) -> None:
         self.max_hours = max_hours
@@ -458,6 +459,7 @@ class Phase4Orchestrator:
         # 0 disables the promotion SPRT (threshold gate only, documented);
         # >0 requires an ACCEPT_H1 SPRT vs best_eval/warm-start to promote.
         self.promotion_sprt_max_games = int(promotion_sprt_max_games)
+        self.allow_unverified_promotion = bool(allow_unverified_promotion)
         self._baseline_puzzle_rate: Optional[float] = None
         self._steps_this_run = 0
 
@@ -1855,21 +1857,25 @@ class Phase4Orchestrator:
                 eligible = False
                 gate_reason = f"SPRT {sprt_decision}: {sprt_detail}"
         elif eligible:
-            # Audit RL-16: with SPRT disabled (the default), a threshold pass on
-            # a ~±90-140 Elo CI sample is PROVISIONAL evidence. Never present it
-            # as statistically validated promotion.
-            adjudicated = int(match_res.get("adjudicated_games", 0) or 0)
-            logger.warning(
-                "[PROMOTION] PROVISIONAL: promoting on threshold evidence only — SPRT is "
-                "disabled (promotion_sprt_max_games=0) and a %d-game match has an Elo CI of "
-                "roughly ±90-140. Enable --promotion-sprt-max-games for statistically "
-                "supported promotion.%s",
-                int(match_res.get("total_games", 0) or 0),
-                f" {adjudicated} of the completed games were value-cutoff adjudicated "
-                "(see the match_games.csv adjudicated column)."
-                if adjudicated
-                else "",
-            )
+            # F-11 remediation: With SPRT disabled, require explicit opt-in via allow_unverified_promotion
+            if not self.allow_unverified_promotion:
+                eligible = False
+                gate_reason = (
+                    "SPRT disabled (promotion_sprt_max_games=0); promotion refused without statistical validation. "
+                    "Enable --promotion-sprt-max-games >= 100 or pass --allow-unverified-promotion."
+                )
+            else:
+                adjudicated = int(match_res.get("adjudicated_games", 0) or 0)
+                logger.warning(
+                    "[PROMOTION] PROVISIONAL: promoting on threshold evidence only — SPRT is "
+                    "disabled and --allow-unverified-promotion was passed. A %d-game match has an Elo CI of "
+                    "roughly ±90-140.%s",
+                    int(match_res.get("total_games", 0) or 0),
+                    f" {adjudicated} of the completed games were value-cutoff adjudicated "
+                    "(see the match_games.csv adjudicated column)."
+                    if adjudicated
+                    else "",
+                )
         previous_best = self._best_eval_comp_score
         promotion_decision = "skipped"
         promotion_generation = ""
@@ -3085,6 +3091,12 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--allow-unverified-promotion",
+        action="store_true",
+        default=False,
+        help="Allow provisional promotion when SPRT is disabled (not statistically validated).",
+    )
+    parser.add_argument(
         "--device", type=str, default=None, help="Execution device (default: auto cuda/cpu)"
     )
     parser.add_argument(
@@ -3265,6 +3277,7 @@ def main() -> None:
             allow_uncertified_data=args.allow_uncertified_data,
             allow_uncertified_eval=args.allow_uncertified_eval,
             require_certified_eval=args.require_certified_eval,
+            allow_unverified_promotion=args.allow_unverified_promotion,
         )
         sys.exit(orchestrator.run())
     else:
@@ -3318,6 +3331,7 @@ def main() -> None:
             allow_uncertified_data=args.allow_uncertified_data,
             allow_uncertified_eval=args.allow_uncertified_eval,
             require_certified_eval=args.require_certified_eval,
+            allow_unverified_promotion=args.allow_unverified_promotion,
         )
         sys.exit(orchestrator.run())
 
