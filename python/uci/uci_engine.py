@@ -54,11 +54,11 @@ class UCIEngine:
 
         self.zeropawn_cpp = zeropawn_cpp
         self.device = resolve_device(device)
-        if checkpoint_path:
+        if checkpoint_path is not None:
             # "" is the explicit "no model" signal; any non-empty path is the
             # operator's explicit choice (provenance warnings are emitted by
             # load_engine_model).  None means "use the designated default".
-            self.checkpoint_path = checkpoint_path
+            self.checkpoint_path = checkpoint_path if checkpoint_path != "" else None
         else:
             try:
                 self.checkpoint_path = get_default_checkpoint_path()
