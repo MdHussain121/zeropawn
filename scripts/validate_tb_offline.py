@@ -42,11 +42,16 @@ from python.data.stockfish_eval import StockfishEvaluator
 def audit_dataset(
     jsonl_path: str,
     name: str,
-    tb_dir: str = "data/syzygy",
+    tb_dir: Optional[str] = None,
     sf_nodes: int = 50_000,
-    stockfish_path: str = "tools/stockfish.exe",
+    stockfish_path: Optional[str] = None,
     max_games: Optional[int] = None,
 ) -> Dict[str, Any]:
+    if tb_dir is None:
+        tb_dir = str(_repo_root / "data" / "syzygy")
+    if stockfish_path is None:
+        stockfish_path = str(_repo_root / "tools" / "stockfish.exe")
+
     with open(jsonl_path, "r", encoding="utf-8") as f:
         games = [json.loads(line) for line in f if line.strip()]
     total_available = len(games)
@@ -269,7 +274,7 @@ def audit_dataset(
     }
 
 
-def main():
+def main(argv=None):
     setup_logging(log_dir="logs", log_filename="validate_tb_offline.log")
     parser = argparse.ArgumentParser(description="Offline validation of tablebase adjudication.")
     parser.add_argument(
@@ -284,11 +289,29 @@ def main():
         default=50_000,
         help="Stockfish nodes per cut position (default: 50000).",
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--tb-dir",
+        type=str,
+        default=str(_repo_root / "data" / "syzygy"),
+        help="Path to Syzygy tablebase directory.",
+    )
+    parser.add_argument(
+        "--stockfish-path",
+        type=str,
+        default=str(_repo_root / "tools" / "stockfish.exe"),
+        help="Path to Stockfish engine executable.",
+    )
+    parser.add_argument(
+        "--min-agreement",
+        type=float,
+        default=0.90,
+        help="Minimum required Stockfish agreement ratio for successful validation (default: 0.90).",
+    )
+    args = parser.parse_args(argv)
 
     ctx = run_context("tablebase-audit")
     t0 = time.time()
-    log_path = "logs/validate_tb_offline.log"
+    log_path = str(_repo_root / "logs" / "validate_tb_offline.log")
     emit_report(banner("tablebase-audit", ctx["start"] + " (local)"))
     emit_report(
         header_block(
@@ -307,23 +330,57 @@ def main():
             [
                 ("max_games", args.max_games, "user" if args.max_games is not None else "default"),
                 ("sf_nodes", args.sf_nodes, "user" if args.sf_nodes != 50_000 else "default"),
+                ("tb_dir", args.tb_dir, "default"),
+                ("min_agreement", args.min_agreement, "default"),
             ]
         )
     )
     try:
-        res100 = audit_dataset(
-            "docs/resignfix/diagnosis_games.jsonl",
-            "Warm-Start Checkpoint best_model.pt (100 Games)",
-            sf_nodes=args.sf_nodes,
-            max_games=args.max_games,
-        )
-        res50 = audit_dataset(
-            "docs/resignfix/diagnosis_step850_games.jsonl",
-            "Halted Run Step-850 Checkpoint (50 Games)",
-            sf_nodes=args.sf_nodes,
-            max_games=args.max_games,
-        )
+        datasets = [
+            (
+                str(_repo_root / "docs" / "resignfix" / "diagnosis_games.jsonl"),
+                "Warm-Start Checkpoint best_model.pt (100 Games)",
+            ),
+            (
+                str(_repo_root / "docs" / "resignfix" / "diagnosis_step850_games.jsonl"),
+                "Halted Run Step-850 Checkpoint (50 Games)",
+            ),
+        ]
+        results = []
+        fail_reasons = []
+        for path_str, name in datasets:
+            res = audit_dataset(
+                path_str,
+                name,
+                tb_dir=args.tb_dir,
+                sf_nodes=args.sf_nodes,
+                stockfish_path=args.stockfish_path,
+                max_games=args.max_games,
+            )
+            results.append(res)
+            adj_count = res["adjudicated_count"]
+            sf_count = res["sf_agreement_count"]
+            if adj_count > 0:
+                agreement = sf_count / adj_count
+                if agreement < args.min_agreement:
+                    fail_reasons.append(
+                        f"{name}: Stockfish agreement {agreement:.1%} ({sf_count}/{adj_count}) < threshold {args.min_agreement:.1%}"
+                    )
+
+        if fail_reasons:
+            emit_error(
+                error_block(
+                    "tablebase-audit validation gate failed",
+                    "; ".join(fail_reasons),
+                    "inspect logs and investigate Stockfish / tablebase disagreement",
+                    log_path,
+                )
+            )
+            emit_report(summary_block("FAILED", time.time() - t0, 1, 1))
+            sys.exit(1)
+
         emit_report(summary_block("SUCCESS", time.time() - t0, 0, 0))
+        sys.exit(0)
     except KeyboardInterrupt:
         emit_report(summary_block("INTERRUPTED", time.time() - t0, 0, 130))
         raise
@@ -332,7 +389,7 @@ def main():
             error_block(
                 f"tablebase-audit failed: {e}",
                 "missing game JSONL, tablebase path, or stockfish binary",
-                "check docs/resignfix/*.jsonl, data/syzygy, tools/stockfish.exe, then see LOG",
+                f"check docs/resignfix/*.jsonl, {args.tb_dir}, {args.stockfish_path}, then see LOG",
                 log_path,
             )
         )
