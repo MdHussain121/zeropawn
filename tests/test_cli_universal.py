@@ -124,36 +124,132 @@ def test_presets_diff():
     assert ret == 0
 
 
-def test_data_subcommands_registration():
-    """Verify extended dataset operations are executable without crashing."""
+def _write_hermetic_dataset(root: Path) -> Path:
+    """Build a tiny games_wdl dataset the data CLI can validate end-to-end.
+
+    Mirrors the split layout of tests/test_data_integrity.py::make_split so the
+    CLI's validate/inspect/check-leakage paths all find what they expect. The
+    dataset lives entirely under tmp_path — running the data CLI against the
+    production tree from a test is forbidden (a pre-2026-11-03 version of this
+    test validated data/dataset_training directly, and the then-default
+    --write-receipt rewrote the production receipt on every run).
+    """
+    import numpy as np
+
+    ds = root / "dataset_hermetic"
+    base_ids = {"train": 1000, "val": 5000, "test": 9000}  # disjoint game-id ranges
+    n = 24
+    rng = np.random.default_rng(11)
+    for split, count in (("train", n), ("val", 8), ("test", 8)):
+        sd = ds / split
+        sd.mkdir(parents=True, exist_ok=True)
+        planes = rng.random((count, 19, 8, 8), dtype=np.float32).round()
+        planes.tofile(sd / "planes.bin")
+        np.asarray([10] * count, dtype=np.int16).tofile(sd / "moves.bin")
+        np.zeros(count, dtype=np.uint8).tofile(sd / "outcomes.bin")  # all wins: real WDL labels
+        np.asarray(
+            [base_ids[split] + i for i in range(count)], dtype=np.uint64
+        ).tofile(sd / "game_ids.bin")
+        np.asarray([10 + i for i in range(count)], dtype=np.int16).tofile(sd / "plies.bin")
+        (sd / "metadata.json").write_text(
+            json.dumps(
+                {
+                    "split": split,
+                    "num_samples": count,
+                    "role": "games_wdl",
+                    "kind": "games",
+                    "label_semantics": {"role": "games_wdl", "wdl_supervised": True},
+                }
+            ),
+            encoding="utf-8",
+        )
+    (ds / "metadata.json").write_text(
+        json.dumps(
+            {
+                "name": "dataset_hermetic",
+                "kind": "games_wdl",
+                "role": "games_wdl",
+                "num_samples": n + 16,
+                "splits": ["train", "val", "test"],
+                "build_record": {
+                    "builder": "test_cli_universal hermetic fixture",
+                    "builder_version": "1",
+                    "source": "synthetic",
+                    "created_at": "2026-11-03T00:00:00Z",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    import hashlib
+
+    def _sha(path: Path) -> str:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    outputs = {}
+    for split in ("train", "val", "test"):
+        sd = ds / split
+        outputs[split] = {
+            name: {"sha256": _sha(sd / name)}
+            for name in ("planes.bin", "moves.bin", "outcomes.bin", "game_ids.bin", "plies.bin")
+        }
+    (ds / "build_record.json").write_text(
+        json.dumps(
+            {
+                "build_record_version": "1.0",
+                "builder": "test_cli_universal hermetic fixture",
+                "builder_version": "1",
+                "source": "synthetic",
+                "created_at": "2026-11-03T00:00:00Z",
+                "counts": {"train": n, "val": 8, "test": 8},
+                "outputs": outputs,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return ds
+
+
+def test_data_subcommands_registration(tmp_path):
+    """Verify extended dataset operations are executable without crashing.
+
+    Fully hermetic: operates on a synthetic dataset under tmp_path. The
+    validate leg runs an exhaustive (full) scan so the exit code exercises the
+    success path, and passes --write-receipt explicitly to prove certification
+    writes land in the temp dataset only.
+    """
     parser = build_parser()
 
     # list
     args_list = parser.parse_args(["data", "list"])
     assert args_list.func(args_list) == 0
 
-    if not Path("data/dataset_training").exists():
-        pytest.skip("data/dataset_training not present in worktree (gitignored dataset)")
+    ds = _write_hermetic_dataset(tmp_path)
 
     # inspect
-    args_insp = parser.parse_args(["data", "inspect", "data/dataset_training"])
+    args_insp = parser.parse_args(["data", "inspect", str(ds)])
     assert args_insp.func(args_insp) == 0
 
-    # validate
-    args_val = parser.parse_args(["data", "validate", "--dir", "data/dataset_training"])
+    # validate (full scan → definitive pass; receipt written into tmp dataset)
+    args_val = parser.parse_args(
+        ["data", "validate", "--dir", str(ds), "--scan-planes", "full", "--write-receipt"]
+    )
     assert args_val.func(args_val) == 0
+    assert (ds / "validation_receipt.json").is_file()
 
-    # leakage check
+    # leakage check (--max-positions makes it a bounded scan; --allow-bounded
+    # accepts the bounded result so the leg asserts executability, exit 0)
     args_leak = parser.parse_args(
         [
             "data",
             "check-leakage",
             "--train-dir",
-            "data/dataset_training/train",
+            str(ds / "train"),
             "--val-dir",
-            "data/dataset_training/val",
+            str(ds / "val"),
             "--max-positions",
             "100",
+            "--allow-bounded",
         ]
     )
     assert args_leak.func(args_leak) == 0

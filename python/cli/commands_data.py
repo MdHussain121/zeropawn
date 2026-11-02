@@ -204,14 +204,17 @@ def register_parser(subparsers: argparse._SubParsersAction) -> None:
         "--write-receipt",
         dest="write_receipt",
         action="store_true",
-        default=True,
-        help="Write validation_receipt.json into the dataset root on success.",
+        default=False,
+        help="Certify the dataset by writing validation_receipt.json into the dataset "
+        "root on success. Explicit by default-else-off: validation is read-only unless "
+        "certification is requested (a stray bounded-scan validate run must never "
+        "downgrade an existing definitive receipt).",
     )
     p_val.add_argument(
         "--no-write-receipt",
         dest="write_receipt",
         action="store_false",
-        help="Do not write a validation receipt.",
+        help="Do not write a validation receipt (the default).",
     )
     p_val.add_argument(
         "--allow-incomplete",
