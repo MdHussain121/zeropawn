@@ -171,7 +171,8 @@
         "seed": 42,
         "dataset_build_dir": "data/dataset_training (2026-10-31 rebuild from filtered.pgn sha256 2d28cfa0...)",
         "dataset_receipt_id": "sha256:156d528959dd463c",
-        "training": "1 epoch, 4801 optimizer steps, batch 512 (32x16), AdamW lr 2e-4 -> cosine, warmup 500; duration 1858 s; telemetry: models/checkpoints_baseline_20261031/telemetry.jsonl (4802 step records)"
+        "training": "1 epoch, 4801 optimizer steps, batch 512 (32x16), AdamW lr 2e-4 -> cosine, warmup 500; duration 1858 s; telemetry: models/checkpoints_baseline_20261031/telemetry.jsonl (4802 step records)",
+        "dataset_lineage_note_20261103": "The bound dataset (generation 2, receipt sha256:156d528959dd463c, 2,458,622/36,767/19,374 from filtered.pgn) was quarantined 2026-11-01 as data/QUARANTINE_dataset_training_unfiltered_bot_source_20261031 (DI-08). The current live data/dataset_training is generation 3 (2026-11-01 rebuild from filtered_elite_human_2500.pgn, BOT-purged, 384,587/6,120/3,266); no checkpoint has been trained on it. ckpt-10 remains a generation-2 artifact. Authoritative record: docs/dataset_lineage.md; disposition addendum: models/checkpoints_baseline_20261031/run_manifest.addendum_20261103.json."
       },
       "designation_evidence": {
         "procedure": "remediation roadmap P0-2 (audit/supervised-learning-quality-20261030) acceptance criteria, executed 2026-10-31",
