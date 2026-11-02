@@ -329,6 +329,11 @@ class Phase4Orchestrator:
         keep_checkpoints: int = 3,
         keep_tfevents: int = 1,
         # ── Task 5: memory-safety parameters ──────────────────────────────
+        # Audit S4-08: max_wait_ms is currently INERT end-to-end — it fed only
+        # the InferenceServer SHM-serving-loop knob (no production consumer);
+        # the worker's dispatcher uses its own default. The CLI flag is kept
+        # for interface stability and documented as a no-op until a deliberate
+        # decision threads it into the worker's aggregator (behavior change).
         max_wait_ms: float = 1.0,
         watchdog_rss_gb: float = 7.5,
         watchdog_free_ram_gb: float = 2.0,
@@ -817,17 +822,21 @@ class Phase4Orchestrator:
                 self._tb_files_found = 0
 
         # 2. Initialize Inference Server & Client
-        # Task 5: use caller-supplied max_wait_ms (default 1.0 ms for optimal throughput)
+        # Audit S4-08: the server's min_batch_size / max_wait_ms knobs are
+        # SHM-serving-loop-only (zero production consumers — the direct client
+        # path batches in the worker's aggregator), so the launcher no longer
+        # pretends to tune them. max_batch_size is still passed explicitly:
+        # its one live production effect is the batch_fill_rate telemetry
+        # normalization (predict_batch-driven), and dropping it would silently
+        # re-scale that recorded metric from /128 to the /512 ctor default.
         logger.info(
             f"Initializing Inference Server from checkpoint: {active_checkpoint} "
-            f"(device={self.infer_device}, max_wait_ms={max_wait_ms:.1f})..."
+            f"(device={self.infer_device})..."
         )
         self.server = InferenceServer(
             checkpoint_path=active_checkpoint,
             device=self.infer_device,
-            min_batch_size=48,
             max_batch_size=128,
-            max_wait_ms=max_wait_ms,
             use_bfloat16=(self.infer_device == "cuda"),
         )
         self.client = DirectInferenceClient(self.server)
@@ -876,6 +885,11 @@ class Phase4Orchestrator:
             temp_cutoff_range=(15, 30),
             resign_threshold=-0.95,
             consecutive_resign_moves=4,
+            # Deliberately 0.15 (B2-era calibration, the value used for the
+            # Oct-26 buffer): the production launcher pins 15% of games to run
+            # with resignation disabled, while SelfPlayGame's own default is
+            # 0.10 (used by benchmarks/profiles). Both are intentional; audit
+            # S2-05 records this as documentation drift, not a bug.
             disable_resign_prob=0.15,  # also stamped on self for banner/trigger text
             allow_resignation=True,
             min_resign_ply=30,
@@ -2941,6 +2955,19 @@ class Phase4Orchestrator:
                 self.buffer.close()
             except Exception as exc:
                 logger.error("Buffer close failed during shutdown: %s", exc)
+        # Audit S4-06: release the Syzygy tablebase file handles on shutdown.
+        # The adjudicator is a lazily-created process-wide singleton (the
+        # worker creates it on the first probe); reset_instance() closes it
+        # when it exists, drops it, and is a no-op when it was never created.
+        # get_instance() must NOT be used here: it would CONSTRUCT a disabled
+        # adjudicator at shutdown when none exists.
+        try:
+            from python.selfplay.tb_adjudicate import TablebaseAdjudicator
+
+            TablebaseAdjudicator.reset_instance()
+            logger.info("Tablebase adjudicator released (shutdown).")
+        except Exception as exc:  # never let tablebase cleanup block shutdown
+            logger.error("Tablebase adjudicator close failed during shutdown: %s", exc)
         # Shutdown diagnostics (audit SR-08): counters and provenance in one
         # durable JSON record, written before the janitor prunes anything.
         try:

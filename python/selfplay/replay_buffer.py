@@ -1915,7 +1915,25 @@ class ReplayBuffer:
             self._human_cache_size = 0
 
     def refresh_human_cache(self, cache_size: Optional[int] = None) -> None:
-        """Periodically refresh the cached human positions with fresh data."""
+        """Reload the human cache from the human dataset (currently UNSCHEDULED).
+
+        Audit S2-06: this method has NO production caller — neither the
+        orchestrator nor the trainer schedules a refresh — so production runs
+        train on a FROZEN, seeded sample of the human dataset for the run's
+        entire lifetime (the sample is drawn once at construction from the
+        persistent ``_cache_rng`` seeded per RL-25, so the frozen composition
+        is reproducible and sampling within it is unbiased).
+
+        Wiring a refresh cadence is a deliberate semantic change, not an
+        omission to fix silently: a scheduler (orchestrator or trainer) would
+        have to call this on a chosen trigger (e.g. alongside the human-mix
+        taper), the cadence would have to be recorded in run provenance/the
+        status ledger, and the refresh point would have to be checkpointed so
+        a resumed run reproduces the same refresh schedule — otherwise two
+        runs with identical seeds diverge in what the human cache contains
+        (breaking the RL-25 reproducibility contract). Until such a decision
+        is made, the frozen-sample behavior is the documented contract.
+        """
         target_size = (
             cache_size
             if cache_size is not None
@@ -2086,7 +2104,20 @@ class ReplayBuffer:
             self._tactical_cache_size = 0
 
     def refresh_tactical_cache(self, cache_size: Optional[int] = None) -> None:
-        """Periodically refresh the cached tactical positions with fresh data."""
+        """Reload the tactical cache from the tactical CSV (currently UNSCHEDULED).
+
+        Audit S2-06: like :meth:`refresh_human_cache`, this method has NO
+        production caller — no orchestrator/trainer schedule refreshes — so
+        production runs train on a FROZEN, seeded tactical sample for the
+        run's entire lifetime (drawn once at construction from the persistent
+        ``_cache_rng`` seeded per RL-25).
+
+        Wiring a refresh cadence is a deliberate semantic change: it needs a
+        scheduler, run-provenance/ledger recording of the cadence, and a
+        checkpointed refresh point so resumed runs reproduce the same cache
+        content (RL-25 reproducibility). Until then the frozen-sample
+        behavior is the documented contract.
+        """
         target_size = (
             cache_size
             if cache_size is not None
@@ -2345,6 +2376,19 @@ class ReplayBuffer:
     ) -> Tuple[Any, ...]:
         """Sample a training batch mixing self-play positions, human data, and tactical anchor positions.
 
+        CROSS-BINDING (audit S2-08): this numpy path is PAIRED with
+        :meth:`sample_batch_tensors` — the production trainer samples ONLY
+        through the tensor path (``train_rl.py``); this numpy variant is kept
+        for ``scripts/profile_selfplay.py`` and the test suites. Known
+        INTENTIONAL divergences between the pair:
+          * Empty-buffer+human condition: here 100% human when ``size == 0``;
+            the tensor path additionally requires the GPU cache to be empty.
+          * The tensor path samples self-play from the GPU cache + ring
+            coverage split (SR-06); this path is ring-only.
+        MAINTENANCE RULE: any sampling-semantics fix (RL-10/13/40, SR-05/06,
+        syzygy remap, ...) must be applied to BOTH paths or this numpy path
+        must be retired deliberately — never fix one and leave the other.
+
         Args:
             batch_size: Total batch size.
             step: Current RL training step (controls human taper schedule).
@@ -2545,6 +2589,20 @@ class ReplayBuffer:
         """Sample mini-batch directly as PyTorch tensors on target device.
 
         Leverages Tier 1 GPU cache for zero-PCIe sampling.
+
+        CROSS-BINDING (audit S2-08): this is the PRODUCTION sampling path
+        (``RLTrainer.train_step`` in ``train_rl.py``). It is PAIRED with the
+        numpy :meth:`sample_batch`, which survives for
+        ``scripts/profile_selfplay.py`` and the test suites. Known
+        INTENTIONAL divergences between the pair:
+          * Empty-buffer+human condition: here 100% human only when
+            ``size == 0`` AND the GPU cache is empty; the numpy path checks
+            ``size == 0`` alone.
+          * This path samples self-play from the GPU cache + ring coverage
+            split (SR-06); the numpy path is ring-only.
+        MAINTENANCE RULE: any sampling-semantics fix (RL-10/13/40, SR-05/06,
+        syzygy remap, ...) must be applied to BOTH paths or the numpy path
+        must be retired deliberately — never fix one and leave the other.
         """
         if batch_size <= 0:
             raise ValueError(f"batch_size must be > 0, got {batch_size}")
@@ -2919,24 +2977,6 @@ class ReplayBuffer:
             self._tactical_cache_size = 0
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-
-    def destroy_on_disk(self) -> dict[str, int]:
-        """Close memmaps then delete preallocated buffer files.
-
-        For post-run cleanup when the buffer is no longer needed
-        (final checkpoint already saved). Locked files count as
-        failed, never raise. Returns {"deleted","failed","freed_bytes"}.
-        """
-        self.close()
-        # Drop memmap references so Windows releases file locks.
-        for name in ("planes", "visits", "outcomes", "full_search", "versions", "game_ids"):
-            try:
-                setattr(self, name, None)
-            except (AttributeError, ValueError):
-                logger.debug("destroy: could not drop %s", name, exc_info=True)
-        from python.common.cleanup import cleanup_buffer
-
-        return cleanup_buffer(self.buffer_dir)
 
     def __del__(self) -> None:
         try:

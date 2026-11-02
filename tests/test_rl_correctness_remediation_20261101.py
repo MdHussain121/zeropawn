@@ -599,6 +599,30 @@ def test_rl22_failed_push_does_not_record_last_push_step(tmp_path):
     assert trainer.push_failure_count == 1
 
 
+def test_rl22_serverless_disk_sync_failure_does_not_record_last_push_step(
+    tmp_path, monkeypatch
+):
+    """Audit S2-04 (RL-22 residual): with no direct server attached, a failed
+    disk-sync write must count and raise like every other push failure — a
+    server-less run must neither swallow the error nor record ``last_push_step``
+    for a sync that never happened."""
+    trainer, _buf = _make_trainer(tmp_path, push_freq=1)
+    assert trainer.direct_server is None
+    assert trainer.sync_weights_path == tmp_path / "live.pt"
+
+    import python.train.train_rl as train_rl_module
+
+    def _boom(payload, destination):
+        raise OSError("simulated disk-sync write failure")
+
+    monkeypatch.setattr(train_rl_module, "_atomic_torch_save", _boom)
+    with pytest.raises(OSError):
+        trainer.train_step()
+    assert trainer.step_num == 1  # the SGD update itself succeeded
+    assert trainer.last_push_step == 0  # but the push never completed
+    assert trainer.push_failure_count == 1
+
+
 def test_rl22_successful_push_records_last_push_step(tmp_path):
     trainer, _buf = _make_trainer(tmp_path, push_freq=1)
     trainer.direct_server = _GoodServer()

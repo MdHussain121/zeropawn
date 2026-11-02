@@ -48,6 +48,12 @@ class TablebaseAdjudicator:
         self.max_pieces = max_pieces
         self.tablebase: Optional[chess.syzygy.Tablebase] = None
         self._probe_lock: threading.Lock = threading.Lock()
+        # Audit S4-04: telemetry counters are updated from up to 24 game
+        # threads; CPython ``+=`` on an attribute is a non-atomic
+        # read-modify-write, so cumulative counters need their own lock. This
+        # is deliberately NOT the probe lock: the fast filter must stay
+        # lock-free, only the counter updates serialize (µs-class hold).
+        self._telemetry_lock: threading.Lock = threading.Lock()
 
         # Telemetry counters
         self.filter_checks: int = 0
@@ -159,13 +165,18 @@ class TablebaseAdjudicator:
         qualifies, pc = self.fast_filter(fen, self.max_pieces)
         t_filter = time.perf_counter() - t0
 
-        self.filter_checks += 1
-        self.total_filter_time_sec += t_filter
+        # Audit S4-04: counter updates hold only the dedicated telemetry lock
+        # (never the probe lock), so the fast filter stays fast and the
+        # cumulative counters no longer lose updates under concurrency.
+        with self._telemetry_lock:
+            self.filter_checks += 1
+            self.total_filter_time_sec += t_filter
 
         if not qualifies:
             return None, {"qualified": False, "piece_count": pc, "filter_time_us": t_filter * 1e6}
 
-        self.filter_passed += 1
+        with self._telemetry_lock:
+            self.filter_passed += 1
 
         # Construct python-chess board ONLY after filter passes
         t_lock_start = time.perf_counter()

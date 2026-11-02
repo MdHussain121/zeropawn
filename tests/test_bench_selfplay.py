@@ -1,10 +1,14 @@
 """Tests for scripts/bench_selfplay.py benchmark protocol."""
 
 import json
+import logging
 from pathlib import Path
 import pytest
 
-from scripts.bench_selfplay import (
+pytest.importorskip("torch")
+import torch  # noqa: E402
+
+from scripts.bench_selfplay import (  # noqa: E402
     BenchmarkRunner,
     query_gpu_telemetry,
     query_system_telemetry,
@@ -30,7 +34,13 @@ def test_telemetry_query_functions():
 
 
 def test_benchmark_runner_dry_run(tmp_path):
-    """Verify BenchmarkRunner executes warm-up + counted phases, produces CSV and JSON."""
+    """Verify BenchmarkRunner executes warm-up + counted phases, produces CSV and JSON.
+
+    Updated for the S4-02 fail-closed contract: the harness-mechanics dry run
+    needs SOME weights, so it now opts into the explicit random-init mode
+    (``allow_random_init=True``). The old ``checkpoint_path=""`` relied on the
+    removed silent fallback to an untrained model.
+    """
     runner = BenchmarkRunner(
         mode="selfplay",
         warmup_sec=1.0,
@@ -44,6 +54,7 @@ def test_benchmark_runner_dry_run(tmp_path):
         tablebase_path=None,
         output_dir=str(tmp_path),
         checkpoint_path="",
+        allow_random_init=True,
         watchdog_free_ram_mb=0.0,
     )
 
@@ -61,3 +72,73 @@ def test_benchmark_runner_dry_run(tmp_path):
     with open(json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
     assert data["mode"] == "selfplay"
+
+
+# ---------------------------------------------------------------------------
+# Audit S4-02 — fail-closed checkpoint resolution (no silent random-init)
+# ---------------------------------------------------------------------------
+
+
+class _FailingResolver:
+    """Stands in for python.cli.common.get_default_checkpoint_path."""
+
+    def __call__(self):
+        from python.model.checkpoint_registry import DefaultCheckpointError
+
+        raise DefaultCheckpointError(
+            "No designated, verified default checkpoint is available (test stub)."
+        )
+
+
+def test_bench_checkpoint_default_missing_fails_closed(tmp_path, monkeypatch):
+    """Default resolution failure must be a hard error naming the recovery
+    actions — never a silent fallback to a random-init model (audit S4-02)."""
+    import python.cli.common as cli_common
+
+    monkeypatch.setattr(cli_common, "get_default_checkpoint_path", _FailingResolver())
+    with pytest.raises(RuntimeError) as excinfo:
+        BenchmarkRunner(
+            mode="selfplay",
+            output_dir=str(tmp_path),
+            checkpoint_path="default",
+            tablebase_path=None,
+        )
+    msg = str(excinfo.value)
+    assert "--checkpoint-path" in msg
+    assert "--allow-random-init" in msg
+
+
+def test_bench_explicit_checkpoint_path_is_used(tmp_path):
+    """An explicit, existing checkpoint path is used as-is (no registry round-trip)."""
+    ckpt = tmp_path / "tiny_model.pt"
+    torch.save({"model": {}}, ckpt)  # existence is what resolution checks
+    runner = BenchmarkRunner(
+        mode="selfplay",
+        output_dir=str(tmp_path),
+        checkpoint_path=str(ckpt),
+        tablebase_path=None,
+    )
+    assert runner.checkpoint_path == str(ckpt)
+
+
+def test_bench_allow_random_init_warns_and_proceeds(tmp_path, monkeypatch, caplog):
+    """--allow-random-init proceeds with an untrained model behind a loud
+    warning that the results are meaningless for strength (audit S4-02)."""
+    import python.cli.common as cli_common
+
+    monkeypatch.setattr(cli_common, "get_default_checkpoint_path", _FailingResolver())
+    with caplog.at_level(logging.WARNING, logger="bench_selfplay"):
+        runner = BenchmarkRunner(
+            mode="selfplay",
+            output_dir=str(tmp_path),
+            checkpoint_path="default",
+            allow_random_init=True,
+            tablebase_path=None,
+        )
+    assert runner.checkpoint_path is None
+    warnings = [
+        r
+        for r in caplog.records
+        if r.levelno >= logging.WARNING and "meaningless for strength" in r.getMessage()
+    ]
+    assert warnings, "expected a loud random-init warning"

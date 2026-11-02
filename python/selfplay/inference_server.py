@@ -41,6 +41,25 @@ class InferenceServer:
         use_bfloat16: bool = True,
         channels_last: bool = True,
     ) -> None:
+        """Construct the inference server.
+
+        BATCH-TUNING PARAMETERS — ``min_batch_size``, ``max_batch_size`` and
+        ``max_wait_ms`` (audit S4-08) — are consumed ONLY by the legacy SHM
+        serving loop (:meth:`start_serving`; SR-17 legacy path with zero
+        production callers). The production path is
+        ``DirectInferenceClient`` → :meth:`predict_batch`, whose batch size is
+        capped by the worker's ``WorkerBatchAggregator`` (max_batch_size =
+        num_concurrent_games), NOT by these knobs: passing them does not tune
+        production batching.
+
+        One exception: ``max_batch_size`` additionally normalizes the live
+        ``batch_fill_rate`` telemetry (:attr:`avg_batch_fill_rate`,
+        :meth:`get_window_stats` — both driven by ``predict_batch``), so
+        changing it re-scales that recorded metric even without the SHM loop.
+
+        The parameters are retained (not deleted) because the SHM path is
+        intentionally kept (SR-17).
+        """
         if device is None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         else:

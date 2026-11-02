@@ -179,6 +179,77 @@ def get_system_memory_snapshot() -> Dict[str, Any]:
     }
 
 
+def _resolve_bench_checkpoint(
+    checkpoint_path: Optional[str], allow_random_init: bool = False
+) -> Optional[str]:
+    """Fail-closed checkpoint resolution for the benchmark (audit S4-02).
+
+    The F-13 pattern (as in ``run_phase4_rl.py``): the default resolves
+    canonically through the checkpoint registry via
+    ``get_default_checkpoint_path()``; an explicitly passed path must exist on
+    disk. The previous behavior — a dead default path falling back to
+    ``InferenceServer(checkpoint_path=None)``, silently serving an untrained
+    random-init net — produced plausible-looking sims/s against meaningless
+    weights and is gone.
+
+    Returns:
+        A validated checkpoint path, or ``None`` for the EXPLICIT random-init
+        opt-in (``allow_random_init=True``), which logs a loud warning.
+
+    Raises:
+        RuntimeError: when resolution fails and ``allow_random_init`` is not
+            set. The message names the recovery actions.
+    """
+    is_default = checkpoint_path is None or checkpoint_path == "default" or (
+        isinstance(checkpoint_path, str) and checkpoint_path.strip() == ""
+    )
+    if is_default:
+        from python.cli.common import get_default_checkpoint_path
+        from python.model.checkpoint_registry import DefaultCheckpointError
+
+        try:
+            resolved = str(get_default_checkpoint_path())
+        except DefaultCheckpointError as e:
+            if allow_random_init:
+                logger.warning(
+                    "Checkpoint default could not be resolved (%s); "
+                    "benchmarking an UNTRAINED random-init model — results are "
+                    "meaningless for strength (explicit --allow-random-init).",
+                    e,
+                )
+                return None
+            raise RuntimeError(
+                "Refusing to benchmark: no trustworthy default checkpoint could "
+                "be resolved.\n"
+                f"{e}\n"
+                "Recovery: pass --checkpoint-path <path to a verified checkpoint> "
+                "to benchmark trained weights, or --allow-random-init to "
+                "explicitly benchmark an UNTRAINED random-init model (results "
+                "are meaningless for strength)."
+            ) from e
+        logger.info("Resolved canonical default checkpoint: %s", resolved)
+        return resolved
+
+    if not Path(checkpoint_path).exists():
+        if allow_random_init:
+            logger.warning(
+                "Checkpoint path '%s' does not exist; benchmarking an UNTRAINED "
+                "random-init model — results are meaningless for strength "
+                "(explicit --allow-random-init).",
+                checkpoint_path,
+            )
+            return None
+        raise RuntimeError(
+            f"Refusing to benchmark: checkpoint path '{checkpoint_path}' does "
+            "not exist. Previously this silently fell back to a random-init "
+            "model (audit S4-02).\n"
+            "Recovery: pass --checkpoint-path <path to a verified checkpoint>, "
+            "or --allow-random-init to explicitly benchmark an UNTRAINED "
+            "random-init model (results are meaningless for strength)."
+        )
+    return checkpoint_path
+
+
 class BenchmarkRunner:
     """Orchestrates 12-minute measurement runs across selfplay, train, and combined."""
 
@@ -197,7 +268,7 @@ class BenchmarkRunner:
         tablebase_max_pieces: int = 5,
         allow_resignation: bool = False,
         output_dir: str = "docs/perf/baseline",
-        checkpoint_path: str = "models/checkpoints_scaled/best_model.pt",
+        checkpoint_path: str = "default",
         human_data_dir: str = (
             "data/dataset_training/train"
             if Path("data/dataset_training/train").is_dir()
@@ -205,17 +276,16 @@ class BenchmarkRunner:
         ),
         batch_size: int = 256,
         base_seed: int = 42,
-        stop_on_rss_6gb: bool = False,
         max_wait_ms: float = 1.5,
         pipelined: bool = False,
         watchdog_free_ram_mb: float = 2000.0,
+        allow_random_init: bool = False,
     ) -> None:
         self.mode = mode
         self.warmup_sec = warmup_sec
         self.counted_sec = counted_sec
         self.sample_interval = sample_interval
         self.trials = trials
-        self.stop_on_rss_6gb = stop_on_rss_6gb
         self.max_wait_ms = max_wait_ms
         self.pipelined = pipelined
         self.watchdog_free_ram_mb = float(watchdog_free_ram_mb)
@@ -238,7 +308,12 @@ class BenchmarkRunner:
         self.allow_resignation = allow_resignation
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.checkpoint_path = checkpoint_path
+        self.allow_random_init = bool(allow_random_init)
+        # Audit S4-02: fail-closed resolution — a validated path or the
+        # explicit random-init opt-in (None). No silent fallback.
+        self.checkpoint_path = _resolve_bench_checkpoint(
+            checkpoint_path, allow_random_init=self.allow_random_init
+        )
         self.human_data_dir = human_data_dir
         self.batch_size = batch_size
         self.base_seed = base_seed
@@ -297,10 +372,17 @@ class BenchmarkRunner:
         games_completed = [0]
 
         if self.mode in ("selfplay", "combined"):
+            if self.checkpoint_path is None:
+                # Explicit opt-in path only (audit S4-02): the constructor
+                # already logged the random-init warning; repeat it at trial
+                # start so it lands in the trial log too.
+                logger.warning(
+                    "Trial %d: benchmarking an UNTRAINED random-init model — "
+                    "results are meaningless for strength.",
+                    trial_idx,
+                )
             server = InferenceServer(
-                checkpoint_path=self.checkpoint_path
-                if Path(self.checkpoint_path).exists()
-                else None,
+                checkpoint_path=self.checkpoint_path,
                 device=self.device,
                 min_batch_size=min(48, self.concurrency * 2),
                 max_batch_size=128,
@@ -339,7 +421,7 @@ class BenchmarkRunner:
             trainer_model = ChessNet(num_blocks=12, num_filters=128).to(self.device)
             if server is not None:
                 trainer_model.load_state_dict(server.model.state_dict())
-            elif Path(self.checkpoint_path).exists():
+            elif self.checkpoint_path is not None and Path(self.checkpoint_path).exists():
                 ckpt = torch.load(self.checkpoint_path, map_location=self.device, weights_only=True)
                 sd = ckpt.get("model", ckpt.get("state_dict", ckpt))
                 trainer_model.load_state_dict(sd)
@@ -862,16 +944,25 @@ def parse_args():
         "--checkpoint-path",
         "--checkpoint",
         type=str,
-        default="models/checkpoints_scaled/best_model.pt",
-        help="Path to checkpoint weights",
+        default="default",
+        help=(
+            "Path to checkpoint weights. 'default' resolves canonically through "
+            "the checkpoint registry (fail-closed); an explicit path must exist. "
+            "Without --allow-random-init a missing checkpoint is a hard error "
+            "(audit S4-02: no silent random-init fallback)."
+        ),
     )
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--base-seed", type=int, default=42)
     parser.add_argument(
-        "--stop-on-rss-6gb",
+        "--allow-random-init",
         action="store_true",
         default=False,
-        help="Halt trial if process RSS exceeds 6 GB",
+        help=(
+            "Explicitly benchmark an UNTRAINED random-init model when no "
+            "checkpoint resolves (results are meaningless for strength; a loud "
+            "warning is logged)."
+        ),
     )
     parser.add_argument(
         "--max-wait-ms", type=float, default=1.5, help="Dispatcher batch aggregation timeout in ms"
@@ -951,9 +1042,7 @@ def main():
                 (
                     "checkpoint_path",
                     args.checkpoint_path,
-                    "user"
-                    if args.checkpoint_path != "models/checkpoints_scaled/best_model.pt"
-                    else "default",
+                    "user" if args.checkpoint_path != "default" else "default",
                 ),
                 (
                     "human_data_dir",
@@ -963,9 +1052,9 @@ def main():
                 ("batch_size", args.batch_size, "user" if args.batch_size != 256 else "default"),
                 ("base_seed", args.base_seed, "user" if args.base_seed != 42 else "default"),
                 (
-                    "stop_on_rss_6gb",
-                    args.stop_on_rss_6gb,
-                    "user" if args.stop_on_rss_6gb else "default",
+                    "allow_random_init",
+                    args.allow_random_init,
+                    "user" if args.allow_random_init else "default",
                 ),
                 ("max_wait_ms", args.max_wait_ms, "user" if args.max_wait_ms != 1.5 else "default"),
                 ("pipelined", args.pipelined, "user" if args.pipelined else "default"),
@@ -994,7 +1083,7 @@ def main():
                 human_data_dir=args.human_data_dir,
                 batch_size=args.batch_size,
                 base_seed=args.base_seed,
-                stop_on_rss_6gb=args.stop_on_rss_6gb,
+                allow_random_init=args.allow_random_init,
                 max_wait_ms=args.max_wait_ms,
                 pipelined=args.pipelined,
             )

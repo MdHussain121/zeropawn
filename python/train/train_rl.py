@@ -331,6 +331,12 @@ class RLTrainer:
 
         self.base_lr = float(base_lr)
         self.min_lr = float(min_lr)
+        # Optimizer hyperparameters kept as attributes: _init_optimizer() and
+        # save_checkpoint() re-read them (audit S2-09 kept these two real
+        # assignments from the former alias block; the rest of that block was
+        # literal ``self.x = self.x`` no-ops and is deleted).
+        self.momentum = float(momentum)
+        self.weight_decay = float(weight_decay)
         self.warmup_steps = int(warmup_steps)
         self.total_steps = int(total_steps)
         self.policy_target_temp = float(policy_target_temp)
@@ -442,27 +448,11 @@ class RLTrainer:
                 )
                 self.replay_buffer.enable_gpu_cache(capacity=gpu_cap, device=self.device)
 
-        # Snapshot attribute aliases used by validator and recovery code so the
-        # RLTrainer API contract is inspectable and stable across refactors.
-        self.optimizer = self.optimizer
-        self.scheduler = self.scheduler
-        self.step_num = self.step_num
-        self.model_version = self.model_version
-        self.direct_server = self.direct_server
-        self.sync_weights_path = self.sync_weights_path
-        self._warm_start = getattr(self, "_warm_start", False)
-        self.entropy_bonus = self.entropy_bonus
-        self.policy_target_temp = self.policy_target_temp
-        self.base_lr = self.base_lr
-        self.min_lr = self.min_lr
-        self.warmup_steps = self.warmup_steps
-        self.total_steps = self.total_steps
-        self.learning_rate = self.base_lr
-        self.momentum = float(momentum)
-        self.weight_decay = weight_decay
-        self.batch_size = batch_size
-        self.last_checkpoint_time = self.last_checkpoint_time
-        self.last_push_step = self.last_push_step
+        # Audit S2-09: the former "snapshot attribute aliases" block here
+        # (``self.optimizer = self.optimizer`` and friends) was deleted — every
+        # statement was a literal self-assignment no-op, and reflection-style
+        # readers (getattr on run_metadata/step_num/push counters) reference
+        # attributes set above, not aliases.
 
     def _init_optimizer(self) -> SGD:
         """Recreate the SGD optimizer this RL trainer expects, preserving its constructor intent.
@@ -1830,6 +1820,11 @@ class RLTrainer:
                 the new weights or exposes no weight-loading API. The trainer's
                 ``model_version`` mirrors the server and advances only after a
                 successful push, so versions and served weights never diverge.
+            ArtifactPathError: when the disk sync destination is refused by the
+                artifact guard (configuration/authorization error).
+            Exception: when the disk sync write itself fails (audit S2-04) —
+                the failure is counted and propagated, never swallowed, so
+                ``last_push_step`` records successful pushes only.
         """
         num_blocks = getattr(self.model, "num_blocks", 12)
         num_filters = getattr(self.model, "num_filters", 128)
@@ -1928,12 +1923,20 @@ class RLTrainer:
                 logger.error("RL weight sync refused for %s: %s", self.sync_weights_path, e)
                 raise
             except Exception as e:
+                # Audit S2-04 (RL-22 residual): a failed disk-only sync is a
+                # failed push. Count and re-raise like every other failure
+                # path above, so a server-less run can neither swallow the
+                # error nor record last_push_step for a sync that never
+                # happened. The orchestrator's train_step guard (F-16) owns
+                # the retry/abort policy.
+                self.push_failure_count += 1
                 logger.error(
                     "RL weight sync write to %s failed: %s",
                     self.sync_weights_path,
                     e,
                     exc_info=True,
                 )
+                raise
 
         # Audit RL-22: record the push only after the whole push pipeline
         # succeeded (server version advanced and/or the disk sync artifact was

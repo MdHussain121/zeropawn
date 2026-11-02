@@ -661,6 +661,9 @@ class SelfPlayGame:
         temp_cutoff_range: Tuple[int, int] = (15, 30),
         resign_threshold: float = -0.95,
         consecutive_resign_moves: int = 4,
+        # Default 0.10 is the tool-path calibration (benchmarks/profiles); the
+        # production RL launcher deliberately pins 0.15 (B2-era, as used for
+        # the Oct-26 buffer). Audit S2-05: both values are intentional.
         disable_resign_prob: float = 0.10,
         dirichlet_alpha: float = 0.3,
         dirichlet_weight: float = 0.25,
