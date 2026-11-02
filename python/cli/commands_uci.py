@@ -21,7 +21,11 @@ def register_parser(subparsers: argparse._SubParsersAction) -> None:
         "--checkpoint",
         type=str,
         default=None,
-        help="Path to neural network model checkpoint (.pt).",
+        help=(
+            "Path to neural network model checkpoint (.pt). Omit for the "
+            "designated registry default; pass '' (empty string) for an "
+            "explicit model-less run (uniform policy, value 0.0)."
+        ),
     )
     parser.add_argument(
         "--device",
@@ -58,13 +62,20 @@ def register_parser(subparsers: argparse._SubParsersAction) -> None:
 
 
 def run_uci(args: argparse.Namespace) -> int:
+    # S5-07: "" is the explicit "no model" signal (engine contract c20cb95)
+    # and must reach UCIEngine unchanged; None keeps designated-default
+    # resolution inside the engine. The old `if args.checkpoint:` collapsed
+    # "" into None and silently loaded the default model instead.
     ckpt_path = None
-    if args.checkpoint:
-        try:
-            ckpt_path = resolve_path(args.checkpoint)
-        except Exception as e:
-            print_error(f"Invalid checkpoint path: {e}")
-            return 1
+    if args.checkpoint is not None:
+        if args.checkpoint == "":
+            ckpt_path = ""
+        else:
+            try:
+                ckpt_path = resolve_path(args.checkpoint)
+            except Exception as e:
+                print_error(f"Invalid checkpoint path: {e}")
+                return 1
 
     raw_bs = getattr(args, "batch_size", "1")
     bs_str = str(raw_bs).strip().lower()

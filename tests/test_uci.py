@@ -18,9 +18,29 @@ def test_uci_protocol_handshake():
         assert engine.handle_line("uci") is True
         output = stdout_buf.getvalue()
         assert "id name ZeroPawn" in output
-        assert "option name Hash" in output
-        assert "option name Simulations" in output
         assert "uciok" in output
+
+        # Audit S5-09.4: the advertised-but-inert "Hash" option was removed
+        # from the protocol surface (the C++ engine has no transposition
+        # table and no setoption handler for it). The remaining 12 options
+        # must still be advertised.
+        assert "option name Hash" not in output
+        for opt in (
+            "WeightsFile",
+            "Simulations",
+            "CP_UCT",
+            "FPU",
+            "ReuseTree",
+            "Device",
+            "SearchMode",
+            "BatchSize",
+            "OwnBook",
+            "BookFile",
+            "BookPolicy",
+            "BookMaxPly",
+        ):
+            assert f"option name {opt}" in output
+        assert output.count("option name ") == 12
 
         stdout_buf.truncate(0)
         stdout_buf.seek(0)
@@ -51,7 +71,9 @@ def test_uci_position_and_go():
             engine._search_thread.join(timeout=30)  # async go: wait for bestmove
         output = stdout_buf.getvalue()
         assert "bestmove" in output
-        assert "info depth" in output
+        # S5-09.4: depth is the honest constant 1 (MCTS exposes no depth);
+        # the completed simulation count is reported as nodes.
+        assert "info depth 1 nodes" in output
 
         # Test quit
         assert engine.handle_line("quit") is False
@@ -88,7 +110,7 @@ def test_uci_batched_search_options():
             engine._search_thread.join(timeout=30)  # async go: wait for bestmove
         go_out = stdout_buf.getvalue()
         assert "bestmove" in go_out
-        assert "info depth" in go_out
+        assert "info depth 1 nodes" in go_out
     finally:
         sys.stdout = old_stdout
 
@@ -170,3 +192,108 @@ def test_eval_callback_preserves_repetition_plane(tmp_path):
     policy, value = engine._eval_callback(game)
     assert policy.shape[0] == game.num_actions()
     assert np.isfinite(policy).all()
+
+
+def _write_one_position_book(tmp_path, uci_move: str = "e2e4") -> str:
+    """Synthesize a tiny one-position book: startpos -> ``uci_move``."""
+    import json
+
+    import chess as pychess
+
+    board = pychess.Board()
+    key = board.epd(en_passant="pawns")
+    book = {
+        "positions": {
+            key: {
+                "canonical_key": key,
+                "fen": board.fen(),
+                "side_to_move": True,
+                "ply": 0,
+                "moves": {
+                    uci_move: {
+                        "uci": uci_move,
+                        "frequency": 10,
+                        "qualification": "frequency",
+                    }
+                },
+            }
+        },
+        "summary": {},
+    }
+    book_path = tmp_path / "tiny_book.json"
+    book_path.write_text(json.dumps(book), encoding="utf-8")
+    return str(book_path)
+
+
+def test_book_move_announced_and_no_search(tmp_path):
+    """S8-01: in-book `go` short-circuits and must announce it.
+
+    The reply must be prefixed with `info string book move <uci>` so GUIs and
+    measurement harnesses can distinguish a book reply from a searched one,
+    and no MCTS search may run (the go budget is not honored on this path).
+    """
+    book_path = _write_one_position_book(tmp_path)
+    # checkpoint_path="" = explicit model-less engine (uniform policy):
+    # fast, CPU-only, and guarantees no checkpoint is loaded.
+    engine = UCIEngine(checkpoint_path="", book_path=book_path, use_book=True)
+
+    search_calls = []
+
+    class _SearchCountingMCTS:
+        """Forwarding proxy: the pybind MCTS object is read-only, so wrap it."""
+
+        def __init__(self, inner):
+            self._inner = inner
+
+        def search(self, *args, **kwargs):
+            search_calls.append(args)
+            return self._inner.search(*args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    engine.mcts = _SearchCountingMCTS(engine.mcts)
+
+    stdout_buf = io.StringIO()
+    old_stdout = sys.stdout
+    try:
+        sys.stdout = stdout_buf
+        assert engine.handle_line("ucinewgame") is True
+        assert engine.handle_line("position startpos") is True
+        assert engine.handle_line("go nodes 15") is True
+        if engine._search_thread is not None:
+            engine._search_thread.join(timeout=30)
+        output = stdout_buf.getvalue()
+    finally:
+        sys.stdout = old_stdout
+
+    assert "info string book move e2e4" in output, output
+    assert "bestmove e2e4" in output, output
+    # Book short-circuit: exactly one node "searched" (the book lookup), and
+    # the MCTS search never ran despite the nodes budget.
+    assert "info depth 1 nodes 1" in output, output
+    assert search_calls == [], "in-book go must not run the MCTS search"
+    assert engine._last_search_ran is False
+
+
+def test_model_less_engine_reports_honest_depth(tmp_path):
+    """S5-09.4: a searched (non-book) go reports depth 1, not a fake depth 10."""
+    book_path = _write_one_position_book(tmp_path)
+    engine = UCIEngine(checkpoint_path="", book_path=book_path, use_book=False)
+
+    stdout_buf = io.StringIO()
+    old_stdout = sys.stdout
+    try:
+        sys.stdout = stdout_buf
+        assert engine.handle_line("ucinewgame") is True
+        assert engine.handle_line("position startpos") is True
+        assert engine.handle_line("go nodes 12") is True
+        if engine._search_thread is not None:
+            engine._search_thread.join(timeout=60)
+        output = stdout_buf.getvalue()
+    finally:
+        sys.stdout = old_stdout
+
+    assert "bestmove" in output, output
+    assert "info depth 1 nodes" in output, output
+    assert "info depth 10" not in output, output

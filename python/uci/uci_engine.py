@@ -2,6 +2,21 @@
 
 Provides standard UCI protocol compliance for ZeroPawn to play against chess GUIs
 such as Arena, Lucas Chess, cutechess-cli, and standard chess tools.
+
+Protocol notes (audits S8-01 / S8-02 / S5-09.4):
+- OwnBook short-circuit: when ``OwnBook`` is on and the current position is in
+  book, ``go`` budgets (``nodes``/``movetime``/clock) are NOT honored — the
+  reply is the book move, emitted instantly as ``info string book move <uci>``
+  followed by ``info depth 1 nodes 1 ...`` and ``bestmove``. No search runs.
+  Benches/harnesses that measure search throughput must set ``OwnBook=false``.
+- Throughput EWMA vs NN cache: the C++ MCTS NN-cache serves repeat evals
+  without re-running the network, so cache-hit-heavy searches can inflate the
+  sims/s estimate that sizes later ``go movetime``/clock soft caps. The
+  wall-clock deadline remains the real budget (see ``_update_rate_estimate``).
+- ``info depth 1``: the MCTS SearchResult does not expose a search depth, so
+  the engine reports the honest constant ``depth 1`` plus the completed
+  simulation count as ``nodes`` (no transposition table exists, hence no
+  ``Hash`` option is advertised either).
 """
 
 from __future__ import annotations
@@ -268,7 +283,21 @@ class UCIEngine:
         return abort
 
     def _update_rate_estimate(self, sims: int, elapsed_sec: float) -> None:
-        """EWMA-update the rolling sims/s estimate used for clock allocation."""
+        """EWMA-update the rolling sims/s estimate used for clock allocation.
+
+        Known interaction (audit S8-02, deliberately accepted): the C++ MCTS
+        NN-cache serves leaf evals for repeated positions without re-running
+        the network, so a cache-hit-heavy search records an inflated sims/s
+        rate here, which inflates the soft simulation caps derived for later
+        ``go movetime``/clock moves (a repeat search can run far more "sims"
+        than its movetime alone would allow). This is accepted because the
+        wall-clock deadline remains the real budget: the in-search abort
+        predicate (``_make_abort_fn``) stops the search at the next ~32-sim
+        poll once the deadline passes, bounding any overshoot. Excluding
+        cache-hit searches would need fresh-eval counts from the native
+        layer; do not compensate by inflating the time margins here — that
+        changes play strength.
+        """
         if elapsed_sec <= 0.0 or sims <= 0:
             return
         measured = sims / elapsed_sec
@@ -368,29 +397,6 @@ class UCIEngine:
         # a memcpy fast path for arrays; .tolist() serialization cost the
         # batched play-time path a measured ~2.4x in throughput (audit H-4).
         return (p_probs.astype(np.float32), scalar_val)
-
-    def _batched_eval_callback(self, batch_planes: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        n = int(batch_planes.shape[0])
-        if n == 0 or self.model is None:
-            return (np.zeros((n, 4672), dtype=np.float32), np.zeros((n,), dtype=np.float32))
-
-        t = torch.from_numpy(np.ascontiguousarray(batch_planes, dtype=np.float32))
-        t = t.view(n, 19, 8, 8).to(self.device, non_blocking=True)
-        if self.device == "cuda":
-            t = t.to(memory_format=torch.channels_last)
-
-        with torch.no_grad():
-            with self._lock:
-                if self.device == "cuda":
-                    with torch.amp.autocast(self.device, dtype=torch.bfloat16):
-                        p_logits, v_wdl = self.model(t)
-                else:
-                    p_logits, v_wdl = self.model(t)
-            policy = torch.softmax(p_logits.float(), dim=-1).cpu().numpy()
-            wdl = torch.softmax(v_wdl.float(), dim=-1).cpu().numpy()
-            values = (wdl[:, 0] - wdl[:, 2]).astype(np.float32)
-
-        return (policy.astype(np.float32), values)
 
     def _eval_batch_callback(self, games: List[Any]) -> List[Tuple[Any, float]]:
         if not games:
@@ -492,6 +498,11 @@ class UCIEngine:
                     self.last_engine_action = None
                     self.last_engine_move = None
                     self.prev_moves_at_search = None
+                    # Audit S8-01: announce the book short-circuit so GUIs and
+                    # measurement harnesses can distinguish a book reply from
+                    # a searched one. No search runs here and the go budgets
+                    # (nodes/movetime) are intentionally not honored.
+                    sys.stdout.write(f"info string book move {book_move}\n")
                     sys.stdout.write(f"info depth 1 nodes 1 score cp 0 pv {book_move}\n")
                     sys.stdout.write(f"bestmove {book_move}\n")
                     sys.stdout.flush()
@@ -524,7 +535,11 @@ class UCIEngine:
 
         # Score in centipawns (AlphaZero approx: score_cp = int(root_val * 400))
         score_cp = int(root_val * 400)
-        sys.stdout.write(f"info depth 10 nodes {actual_sims} score cp {score_cp} pv {best_move}\n")
+        # Audit S5-09.4 (UCI-11): the MCTS SearchResult does not expose a
+        # search depth, so the previous hardcoded "depth 10" was false.
+        # Report the honest constant depth 1 (consistent with the book-move
+        # info line above); the completed simulation count travels as nodes.
+        sys.stdout.write(f"info depth 1 nodes {actual_sims} score cp {score_cp} pv {best_move}\n")
         sys.stdout.write(f"bestmove {best_move}\n")
         sys.stdout.flush()
         self._bestmove_emitted = True
@@ -542,10 +557,12 @@ class UCIEngine:
         self._last_actual_sims = None
         t_start = time.perf_counter()
         try:
-            try:
-                self.search_and_respond(sims, deadline_ms)
-            except TypeError:
-                self.search_and_respond(sims)
+            # The current signature accepts both (sims) and (sims, deadline_ms),
+            # so a TypeError raised here is a genuine internal error. Audit
+            # S1-04: the legacy single-argument retry was removed — it re-ran
+            # the whole search on a deterministic failure (doubling the latency)
+            # and masked the original traceback. Real errors propagate once.
+            self.search_and_respond(sims, deadline_ms)
         except Exception as e:
             self._last_search_ran = False
             self._last_actual_sims = 0
@@ -610,7 +627,10 @@ class UCIEngine:
         if cmd == "uci":
             sys.stdout.write("id name ZeroPawn\n")
             sys.stdout.write("id author ZeroPawn Team\n")
-            sys.stdout.write("option name Hash type spin default 64 min 1 max 2048\n")
+            # Audit S5-09.4 (UCI-08): the C++ engine has no transposition
+            # table, so the previously advertised (and inert) "Hash" spin
+            # option was removed from the protocol surface — GUIs no longer
+            # offer a hash-size control that would silently do nothing.
             ckpt_str = str(self.checkpoint_path) if self.checkpoint_path else "none"
             sys.stdout.write(f"option name WeightsFile type string default {ckpt_str}\n")
             sys.stdout.write(

@@ -385,3 +385,117 @@ def test_uci_stdout_zero_ansi():
     # ANSI regex check
     ansi_pattern = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
     assert not ansi_pattern.search(stdout), f"Found ANSI escape in UCI stdout: {stdout!r}"
+
+
+# ---------------------------------------------------------------------------
+# S5-07: the ""-means-no-model contract must be reachable from the CLI
+# ---------------------------------------------------------------------------
+
+
+def _stub_uci_engine(monkeypatch, captured):
+    """Replace commands_uci.UCIEngine with a recorder (no native engine)."""
+    from python.cli import commands_uci
+
+    class _StubEngine:
+        def __init__(self, checkpoint_path=None, **kwargs):
+            captured["checkpoint_path"] = checkpoint_path
+            captured["kwargs"] = kwargs
+
+        def run_stdio_loop(self):
+            captured["ran"] = True
+
+    monkeypatch.setattr(commands_uci, "UCIEngine", _StubEngine)
+
+
+def test_uci_checkpoint_empty_string_is_explicit_no_model(monkeypatch):
+    """`uci --checkpoint ''` must reach UCIEngine as "" (explicit no-model),
+    not be collapsed to None (which would load the designated default)."""
+    captured = {}
+    _stub_uci_engine(monkeypatch, captured)
+    parser = build_parser()
+    args = parser.parse_args(["uci", "--checkpoint", ""])
+    assert args.func(args) == 0
+    assert captured["ran"] is True
+    assert captured["checkpoint_path"] == ""
+
+
+def test_uci_checkpoint_absent_keeps_default_resolution(monkeypatch):
+    """Omitting --checkpoint leaves None so UCIEngine resolves the
+    designated registry default (engine-side contract c20cb95)."""
+    captured = {}
+    _stub_uci_engine(monkeypatch, captured)
+    parser = build_parser()
+    args = parser.parse_args(["uci"])
+    assert args.func(args) == 0
+    assert captured["checkpoint_path"] is None
+
+
+def test_uci_checkpoint_real_path_is_resolved(monkeypatch):
+    """A non-empty --checkpoint path is still resolved and passed through."""
+    from python.cli.common import REPO_ROOT
+
+    captured = {}
+    _stub_uci_engine(monkeypatch, captured)
+    parser = build_parser()
+    args = parser.parse_args(["uci", "--checkpoint", "models/latest_checkpoint.pt"])
+    assert args.func(args) == 0
+    # Compare fully resolved: models/ is a junction in worktree checkouts, so
+    # Path.resolve() canonicalizes it to the junction target.
+    expected = (REPO_ROOT / "models" / "latest_checkpoint.pt").resolve()
+    assert captured["checkpoint_path"] == expected
+
+
+def test_uci_help_documents_empty_string_semantics(capsys):
+    """--help must state that '' means an explicit model-less run."""
+    parser = build_parser()
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args(["uci", "--help"])
+    assert exc_info.value.code == 0
+    out = capsys.readouterr().out
+    assert "model-less" in out
+
+
+def test_match_checkpoint_empty_string_not_collapsed_to_default(monkeypatch):
+    """`match --checkpoint ''` must not silently resolve the designated
+    default; match play requires weights, so it is rejected explicitly."""
+    from python.cli import commands_match
+
+    def _must_not_resolve():
+        raise AssertionError("designated default must not be resolved for --checkpoint ''")
+
+    monkeypatch.setattr(commands_match, "get_default_checkpoint_path", _must_not_resolve)
+    parser = build_parser()
+    args = parser.parse_args(["match", "--checkpoint", ""])
+    assert args.func(args) == 1
+
+
+def test_match_human_checkpoint_empty_string_not_collapsed_to_default(monkeypatch):
+    """Same contract for `match human --checkpoint ''`."""
+    from python.cli import commands_match
+
+    def _must_not_resolve():
+        raise AssertionError("designated default must not be resolved for --checkpoint ''")
+
+    monkeypatch.setattr(commands_match, "get_default_checkpoint_path", _must_not_resolve)
+    parser = build_parser()
+    args = parser.parse_args(["match", "human", "--checkpoint", ""])
+    assert args.func(args) == 1
+
+
+def test_match_human_checkpoint_absent_resolves_default(monkeypatch):
+    """Omitting --checkpoint on `match human` still resolves the designated
+    default (the stub is called; the run then fails honestly on the missing
+    weights file, without loading anything)."""
+    from python.cli import commands_match
+
+    called = []
+
+    def _record_default():
+        called.append(True)
+        return "models/__no_such_remediation_probe__.pt"
+
+    monkeypatch.setattr(commands_match, "get_default_checkpoint_path", _record_default)
+    parser = build_parser()
+    args = parser.parse_args(["match", "human"])
+    assert args.func(args) != 0
+    assert called, "absent --checkpoint must resolve the designated default"

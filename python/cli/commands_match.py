@@ -178,7 +178,11 @@ def _add_batch_args(parser: argparse.ArgumentParser) -> None:
         "-c",
         type=str,
         default=None,
-        help="Path to AI model checkpoint (default: auto-detect latest)",
+        help=(
+            "Path to AI model checkpoint (default: auto-detect latest). "
+            "'' is the explicit no-model signal and is rejected here "
+            "(this command requires network weights)."
+        ),
     )
     parser.add_argument(
         "--stockfish-path",
@@ -312,7 +316,11 @@ def _add_live_args(parser: argparse.ArgumentParser) -> None:
         "-c",
         type=str,
         default=None,
-        help="Path to AI model checkpoint (default: auto-detect latest)",
+        help=(
+            "Path to AI model checkpoint (default: auto-detect latest). "
+            "'' is the explicit no-model signal and is rejected here "
+            "(this command requires network weights)."
+        ),
     )
     parser.add_argument(
         "--stockfish-path",
@@ -382,7 +390,11 @@ def _add_human_args(parser: argparse.ArgumentParser) -> None:
         "-c",
         type=str,
         default=None,
-        help="Path to AI model checkpoint (default: auto-detect latest)",
+        help=(
+            "Path to AI model checkpoint (default: auto-detect latest). "
+            "'' is the explicit no-model signal and is rejected here "
+            "(this command requires network weights)."
+        ),
     )
     parser.add_argument(
         "--mcts-sims",
@@ -428,7 +440,21 @@ def run_batch_match(args: argparse.Namespace) -> int:
         return _fail(err, "argument out of range", "fix the flagged argument, then see LOG")
 
     try:
-        ckpt_path = args.checkpoint or get_default_checkpoint_path()
+        # S5-07: "" is the explicit no-model signal (engine contract c20cb95)
+        # and must not collapse into the designated default. Batch matches
+        # require weights, so an explicit "" is rejected instead.
+        if args.checkpoint is None:
+            ckpt_path = get_default_checkpoint_path()
+        elif args.checkpoint == "":
+            return _fail(
+                "--checkpoint '' (explicit no-model) is not supported by 'match': "
+                "match play requires network weights.",
+                "explicit empty --checkpoint",
+                "omit --checkpoint for the designated default, or pass a .pt path, "
+                "then see LOG",
+            )
+        else:
+            ckpt_path = args.checkpoint
     except DefaultCheckpointError as e:
         return _fail(
             "No usable default model checkpoint.",
@@ -803,7 +829,19 @@ def run_live_game(args: argparse.Namespace) -> int:
         return 1
 
     try:
-        ckpt_path = args.checkpoint or get_default_checkpoint_path()
+        # S5-07: "" is the explicit no-model signal (engine contract c20cb95)
+        # and must not collapse into the designated default. This command
+        # requires weights, so an explicit "" is rejected instead.
+        if args.checkpoint is None:
+            ckpt_path = get_default_checkpoint_path()
+        elif args.checkpoint == "":
+            print_error(
+                "--checkpoint '' (explicit no-model) is not supported by this "
+                "command: it requires network weights."
+            )
+            return 1
+        else:
+            ckpt_path = args.checkpoint
     except DefaultCheckpointError as e:
         print_error(str(e))
         return 1
@@ -985,7 +1023,19 @@ def run_human_game(args: argparse.Namespace) -> int:
     print_banner("HUMAN VS AI CHESS", "Challenge our Neural Network Engine")
 
     try:
-        ckpt_path = args.checkpoint or get_default_checkpoint_path()
+        # S5-07: "" is the explicit no-model signal (engine contract c20cb95)
+        # and must not collapse into the designated default. This command
+        # requires weights, so an explicit "" is rejected instead.
+        if args.checkpoint is None:
+            ckpt_path = get_default_checkpoint_path()
+        elif args.checkpoint == "":
+            print_error(
+                "--checkpoint '' (explicit no-model) is not supported by this "
+                "command: it requires network weights."
+            )
+            return 1
+        else:
+            ckpt_path = args.checkpoint
     except DefaultCheckpointError as e:
         print_error(str(e))
         return 1
