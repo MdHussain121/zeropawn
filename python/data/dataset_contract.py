@@ -243,13 +243,21 @@ def bytes_per_sample() -> int:
 
 
 def remap_syzygy_outcomes(outcomes: Any) -> Any:
-    """Remap 5-class Syzygy outcomes into 3-class mover-relative targets (DI-06).
+    """Remap 5-class Syzygy outcomes into 3-class mover-relative targets (SY-02).
+
+    This is the RL-side twin of ``python.data.dataset._outcome_to_value_target``
+    (is_syzygy=True): both MUST implement the identical SY-02 convention, where
+    cursed wins and blessed losses are draws under FIDE rule 50
+    (commit c3cc6cc, 2026-11-01). ``tests/test_syzygy_mapping_unification_20261103.py``
+    pins the equality of the two paths.
 
     Convention:
-      0, 1 (Win / Cursed Win) -> 0 (Win for side to move)
-      2 (Draw) -> 1 (Draw)
-      3, 4 (Blessed Loss / Loss) -> 2 (Loss for side to move)
-      255 (OUTCOME_UNAVAILABLE) -> 255 (Masked / unavailable)
+      0 (Win)          -> 0 (Win for side to move)
+      1 (Cursed Win)   -> 1 (Draw; cannot be won within 50 moves)
+      2 (Draw)         -> 1 (Draw)
+      3 (Blessed Loss) -> 1 (Draw; loss averted by the 50-move rule)
+      4 (Loss)         -> 2 (Loss for side to move)
+      255 (OUTCOME_UNAVAILABLE) -> 255 (Masked / unavailable; policy-only row)
 
     Supports numpy ndarray or torch Tensor, or scalar integers.
     Raises ValueError on out-of-domain values.
@@ -263,9 +271,9 @@ def remap_syzygy_outcomes(outcomes: Any) -> Any:
             raise ValueError(f"Invalid Syzygy outcome value(s): {bad_vals}; expected 0..4 or 255")
         res = np.empty_like(arr)
         res[mask_255] = OUTCOME_UNAVAILABLE
-        res[(arr == 0) | (arr == 1)] = OUTCOME_WIN
-        res[arr == 2] = OUTCOME_DRAW
-        res[(arr == 3) | (arr == 4)] = OUTCOME_LOSS
+        res[arr == 0] = OUTCOME_WIN
+        res[(arr == 1) | (arr == 2) | (arr == 3)] = OUTCOME_DRAW
+        res[arr == 4] = OUTCOME_LOSS
         return res
 
     import torch
@@ -278,20 +286,20 @@ def remap_syzygy_outcomes(outcomes: Any) -> Any:
             raise ValueError(f"Invalid Syzygy outcome value(s): {bad_vals}; expected 0..4 or 255")
         res = torch.empty_like(t)
         res[mask_255] = OUTCOME_UNAVAILABLE
-        res[(t == 0) | (t == 1)] = OUTCOME_WIN
-        res[t == 2] = OUTCOME_DRAW
-        res[(t == 3) | (t == 4)] = OUTCOME_LOSS
+        res[t == 0] = OUTCOME_WIN
+        res[(t == 1) | (t == 2) | (t == 3)] = OUTCOME_DRAW
+        res[t == 4] = OUTCOME_LOSS
         return res
 
     # Scalar int
     val = int(outcomes)
     if val == OUTCOME_UNAVAILABLE:
         return OUTCOME_UNAVAILABLE
-    if val in (0, 1):
+    if val == 0:
         return OUTCOME_WIN
-    if val == 2:
+    if val in (1, 2, 3):
         return OUTCOME_DRAW
-    if val in (3, 4):
+    if val == 4:
         return OUTCOME_LOSS
     raise ValueError(f"Invalid Syzygy outcome value: {val}; expected 0..4 or 255")
 

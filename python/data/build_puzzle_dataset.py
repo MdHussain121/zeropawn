@@ -252,7 +252,18 @@ def build_puzzle_dataset(
         "val_samples": len(val_samples),
         "skipped_rows": rows_seen - count,
         "min_rating": min_rating,
+        # Audit S2-03.1: the builder writes a BuildRecord but no validation
+        # receipt, and the training consumers' fail-closed receipt gate
+        # (require_validated_dataset) refuses uncertified data. Tell the
+        # operator how to certify before gated training consumes this build.
+        "certification_hint": (
+            "Fresh build is NOT certified: run "
+            f"'zeropawn data validate --dir {output_dir} --scan-planes full --write-receipt' "
+            "before gated training (train_supervised / train_opening_policy / replay buffer) "
+            "can consume it."
+        ),
     }
+    logger.info("%s", summary["certification_hint"])
     BuildRecord(
         builder="python.data.build_puzzle_dataset.build_puzzle_dataset",
         source={"path": str(csv_path), "sha256": sha256_file(csv_path)},
@@ -269,7 +280,9 @@ def build_puzzle_dataset(
             "outcome_encoding": "255=masked (policy-only example)",
             "wdl_supervised": False,
         },
-        counts={k: v for k, v in summary.items() if k != "output_dir"},
+        counts={
+            k: v for k, v in summary.items() if k not in ("output_dir", "certification_hint")
+        },
         git_commit=detect_git_commit(),
     ).write(output_dir)
     logger.info("Built tactical puzzle dataset: %s", summary)

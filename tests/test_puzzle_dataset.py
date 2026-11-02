@@ -113,6 +113,30 @@ def test_build_puzzle_dataset(dummy_puzzle_csv: Path, tmp_path: Path):
     assert sample["value_target"].shape == (3,)
 
 
+def _certify_for_gate(root: Path) -> None:
+    """Certify a builder-produced dataset the way production does (audit S2-03.1):
+    exhaustive validate_split per split + a validation receipt at the dataset
+    root, so the P2-8 fail-closed consumption gate inside train_opening_policy
+    certifies the bytes. ``check_build_record=False`` because the puzzle
+    builder's BuildRecord carries no per-split output hashes (provenance
+    agreement is exercised on the real rebuilt dataset); the full plane scan
+    is required because a bounded scan reports BOUNDED => overall='incomplete'
+    (P2-5), which is not certifiable."""
+    from python.data.dataset_validation import validate_split, write_receipt
+
+    reports = {}
+    for split in ("train", "val"):
+        split_dir = root / split
+        if split_dir.is_dir():
+            report = validate_split(split_dir, scan_planes="full", check_build_record=False)
+            assert report.overall == "pass", (
+                f"{split_dir} fixture must validate exhaustively: {report.summary_line()}"
+            )
+            reports[split] = report
+    assert set(reports) == {"train", "val"}, "puzzle builder must produce train and val splits"
+    write_receipt(root, reports, overall="pass")
+
+
 def test_multi_dataset_training_with_puzzles(dummy_puzzle_csv: Path, tmp_path: Path):
     # 1. Build a dummy opening dataset
     op_dir = tmp_path / "op_ds"
@@ -122,7 +146,13 @@ def test_multi_dataset_training_with_puzzles(dummy_puzzle_csv: Path, tmp_path: P
     puz_dir = tmp_path / "puz_ds"
     build_puzzle_dataset(dummy_puzzle_csv, puz_dir, min_rating=2000, val_ratio=0.5)
 
-    # 3. Create dummy checkpoint
+    # 3. Certify both builds the way production would (audit S2-03.1): the
+    #    builder writes a BuildRecord but no receipt, and train_opening_policy's
+    #    P2-8 gate fails closed on uncertified data.
+    _certify_for_gate(op_dir)
+    _certify_for_gate(puz_dir)
+
+    # 4. Create dummy checkpoint
     dummy_model = ChessNet(num_blocks=2, num_filters=32)
     ckpt_path = tmp_path / "dummy_base.pt"
     torch.save({"model": dummy_model.state_dict(), "step": 1}, ckpt_path)

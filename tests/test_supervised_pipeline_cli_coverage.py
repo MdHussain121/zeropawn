@@ -172,10 +172,11 @@ def test_synthetic_end_to_end_pipeline(tmp_path):
     assert (ds_dir / "train" / "stm.bin").is_file()
 
     # 3. Certify the dataset: genuine validation receipt binding the bytes.
+    #    scan_planes="full": since P2-5 a bounded plane scan reports BOUNDED,
+    #    making overall "incomplete" and the receipt uncertifiable (audit
+    #    S2-03.2 class); the synthetic split is tiny so exhaustive is cheap.
     reports = {
-        split: validate_split(
-            ds_dir / split, scan_planes="bounded", plane_scan_rows=100, check_build_record=False
-        )
+        split: validate_split(ds_dir / split, scan_planes="full", check_build_record=False)
         for split in ("train", "val")
     }
     for split, report in reports.items():

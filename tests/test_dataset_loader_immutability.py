@@ -174,14 +174,16 @@ def test_tactics_concat_preserves_master_labels_and_masks_tactics(dataset_pair):
 
 
 def test_syzygy_five_class_labels_map_to_three_class_targets(tmp_path):
-    """5-class Syzygy outcomes map 0/1->W, 2->D, 3/4->L; 255 stays masked."""
+    """5-class Syzygy outcomes map 0->W, 1/2/3->D, 4->L (SY-02: cursed wins and
+    blessed losses are draws under FIDE rule 50); 255 stays masked. This is the
+    same convention the RL-side remap_syzygy_outcomes implements (audit S2-02)."""
     outcomes = [0, 1, 2, 3, 4, OUTCOME_UNAVAILABLE]
     shard = _write_dataset(tmp_path / "tb", outcomes, kind="endgame_syzygy")
     expected = [
         [1.0, 0.0, 0.0],
-        [1.0, 0.0, 0.0],
         [0.0, 1.0, 0.0],
-        [0.0, 0.0, 1.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0],
         [0.0, 0.0, 1.0],
         [0.0, 0.0, 0.0],
     ]

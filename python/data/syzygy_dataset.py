@@ -6,12 +6,18 @@ supervised training datasets in the canonical memory-mapped binary format.
 
 Perspective and Value Target Invariants:
 - All labels are strictly relative to the player whose turn it is to move.
-- 5-class outcome labels kept separate (not collapsed to Draw):
+- The 5-class outcome label is preserved as auxiliary metadata
+  (``outcome_class``); the 3-class WDL value target follows the SY-02
+  convention (FIDE rule 50: cursed wins and blessed losses are theoretical
+  draws — commit c3cc6cc, 2026-11-01):
   0 = Win (+2 raw_wdl)        -> WDL target [1.0, 0.0, 0.0]
-  1 = Cursed Win (+1)           -> WDL target [1.0, 0.0, 0.0]
+  1 = Cursed Win (+1)           -> WDL target [0.0, 1.0, 0.0]
   2 = Draw (0)                  -> WDL target [0.0, 1.0, 0.0]
-  3 = Blessed Loss (-1)         -> WDL target [0.0, 0.0, 1.0]
+  3 = Blessed Loss (-1)         -> WDL target [0.0, 1.0, 0.0]
   4 = Loss (-2 raw_wdl)        -> WDL target [0.0, 0.0, 1.0]
+  This is the same table the dataset loaders apply via
+  ``_outcome_to_value_target(..., is_syzygy=True)`` and the RL-side
+  ``remap_syzygy_outcomes`` (audit S2-02 unification).
 
 Tablebase Policy Targets:
 - From eligible position P (mover M), enumerate legal candidate moves m -> P'.

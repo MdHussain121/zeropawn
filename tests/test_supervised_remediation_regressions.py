@@ -85,9 +85,11 @@ def _write_certified_dataset(root: Path, n_train=64, n_val=16, n_test=8):
     for split in ("train", "val", "test"):
         # check_build_record=False: the synthetic fixture has no build record;
         # build-record agreement is exercised on the real rebuilt dataset.
-        report = validate_split(
-            root / split, scan_planes="bounded", plane_scan_rows=100, check_build_record=False
-        )
+        # scan_planes="full": the synthetic splits are tiny, so exhaustive is
+        # cheap — and since P2-5 a bounded plane scan reports BOUNDED, which
+        # makes report.overall "incomplete", never certifiable "pass"
+        # (audit S2-03.2).
+        report = validate_split(root / split, scan_planes="full", check_build_record=False)
         reports[split] = report
         overall_ok = overall_ok and report.overall == "pass"
     assert overall_ok, "synthetic fixture must pass validation"
