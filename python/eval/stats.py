@@ -5,7 +5,7 @@ Provides canonical, statistically rigorous implementations of:
 - Agresti-Caffo, Wald, and Delta-method Elo confidence intervals
 - Paired-observation (cluster-robust) variance and confidence intervals
 - Proportional Wilson score intervals
-- Normalized GSPRT / Fishtest-family Sequential Probability Ratio Test (SPRT)
+- Fixed-variance (sigma^2 = 0.25) GSPRT / Fishtest-family Sequential Probability Ratio Test (SPRT)
 - Backward-compatible adapters for existing evaluators
 
 Addresses Audit Findings:
@@ -17,7 +17,7 @@ Addresses Audit Findings:
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Optional
 
 
 def score_to_elo(score: float) -> Optional[float]:
@@ -241,7 +241,6 @@ def paired_score_and_ci(
         hi_elo = elo_diff + z * se_elo
     else:
         # Fall back to Agresti-Caffo if extreme or single pair
-        w_int = int(round(sum(w_scores) + sum(b_scores)))
         # Map pair totals to pseudo W/D/L for fallback
         lo_elo, hi_elo = agresti_caffo_elo_ci(
             int(round(sum(1 for s in w_scores + b_scores if s > 0.75))),
@@ -289,15 +288,32 @@ def compute_sprt_llr(
     alpha: float = 0.05,
     beta: float = 0.05,
 ) -> dict[str, Any]:
-    """Normalized GSPRT log-likelihood ratio matching Fishtest and ZeroPawn conventions.
+    """Fixed-variance GSPRT log-likelihood ratio (Fishtest-family SPRT).
 
     LLR = (Delta_s / sigma^2) * sum(x_i - mu_bar)
     where:
       s0 = elo_to_score(elo0), s1 = elo_to_score(elo1)
       Delta_s = s1 - s0
       mu_bar = (s0 + s1) / 2
-      sigma^2 = outcome variance (floored at 0.25)
+      x_i in {1.0, 0.5, 0.0} are the per-game scores
+      sigma^2 = 0.25 (fixed; see below)
       Wald bounds: lower = ln(beta / (1 - alpha)), upper = ln((1 - beta) / alpha)
+
+    Audit S5-06: sigma^2 = 0.25 is a DELIBERATE conservative choice, not an
+    empirical estimate. Game scores take values in {1, 1/2, 0}, so by the
+    Bhatia-Davis inequality the empirical outcome variance about the mean is
+    at most s(1-s) <= 0.25 for ANY W/D/L mix; the previously implemented
+    ``max(var_empirical, 0.25)`` floor could therefore never activate above
+    the constant and the "empirical variance" branch was mathematically dead.
+    Fishtest's normalized GSPRT instead divides by s_bar(1-s_bar) <= 0.25,
+    which yields LLRs at least as large in magnitude and would stop earlier
+    (higher per-game power). This implementation intentionally keeps the
+    shipped, test-pinned fixed sigma^2 = 0.25 convention, under which the
+    returned LLR is numerically exactly
+
+        4 * (s1 - s0) * sum(x_i - mu_bar)
+
+    (delta_s / 0.25 == 4 * delta_s exactly, since 0.25 is a power of two).
 
     Decisions:
       LLR >= upper -> 'ACCEPT_H1' (candidate confirmed stronger)
@@ -330,11 +346,11 @@ def compute_sprt_llr(
     mu_bar = (s0 + s1) / 2.0
 
     score = (wins + 0.5 * draws) / n
-    # Empirical variance across games x in {1.0, 0.5, 0.0}
-    var_empirical = (
-        wins * (1.0 - score) ** 2 + draws * (0.5 - score) ** 2 + losses * (0.0 - score) ** 2
-    ) / n
-    sigma_sq = max(var_empirical, 0.25)
+    # Audit S5-06: fixed conservative variance. The empirical variance is
+    # provably <= 0.25 (Bhatia-Davis), so the historical max(var, 0.25) floor
+    # was always active; sigma^2 is therefore the constant 0.25 and the LLR
+    # reduces exactly to 4 * delta_s * sum_centered.
+    sigma_sq = 0.25
 
     sum_centered = wins * (1.0 - mu_bar) + draws * (0.5 - mu_bar) + losses * (0.0 - mu_bar)
     llr = (delta_s / sigma_sq) * sum_centered

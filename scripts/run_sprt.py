@@ -13,6 +13,21 @@ Protocol defaults: H0 = +0 Elo, H1 = +30 Elo, alpha = beta = 0.05 (bounds
 ±2.944), engine-vs-engine at equal simulation budgets, colors alternated per
 pair, resumable state, PGNs and JSON summary persisted. INCONCLUSIVE is a
 valid outcome and never promotes anything.
+
+Cap semantics (Audit S5-05, porting the MatchRunner F-01 contract): a game
+that reaches the 150-ply cap without a decisive or rule-based outcome is
+recorded with board result "*" and outcome_class "capped" (default
+``cap_policy="exclude"``) and is EXCLUDED from the SPRT score — it is never
+counted as a candidate draw. Capped games are counted per candidate color
+and in total in the state/summary output so the bias is visible, and the
+summary carries capped-as-draw / capped-as-loss / capped-by-material
+sensitivity decisions that are reported alongside — never instead of — the
+primary (exclude) decision. Resume compatibility: state files written by
+the pre-S5-05 schema (records without ``outcome_class`` /
+``termination_reason`` / ``plies``) load unchanged; such legacy records are
+treated as UNCAPPED and keep their recorded result (the historical
+cap-as-draw residue in a legacy state is visible via its
+``adjudication_reason == "max_plies_cap"`` but is not reinterpreted).
 """
 from __future__ import annotations
 
@@ -38,6 +53,120 @@ import zeropawn_cpp
 from python.cli.common import get_default_checkpoint_path
 from python.eval.sprt import compute_sprt_llr, wilson_interval
 from python.model.chess_net import ChessNet
+# Shared F-01/S5-05 classification contract: ONE implementation of the
+# capped-game (cap != draw) semantics for MatchRunner and this SPRT harness.
+from python.eval.match_runner import (
+    _compute_material_balance,
+    classify_game_record,
+    classify_game_records,
+    is_capped_game_record,
+)
+
+VALID_CAP_POLICIES = ("exclude", "draw")
+
+# Fine-grained shared-classifier outcomes -> candidate-relative SPRT outcome.
+_RECORD_OUTCOME_TO_SPRT = {
+    "decisive_win": "win",
+    "forfeit_win": "win",
+    "decisive_loss": "loss",
+    "forfeit_loss": "loss",
+    "genuine_draw": "draw",
+    "capped": "capped",
+    "uncounted": "uncounted",
+}
+
+
+def classify_sprt_record(record: dict) -> str:
+    """Candidate-relative outcome of one SPRT game record (shared contract).
+
+    Uses MatchRunner's F-01 classifier: a ply-cap termination is "capped"
+    (never "draw"), forfeits count as win/loss, and incomplete/invalid
+    records are "uncounted" (reported, never scored).
+    """
+    return _RECORD_OUTCOME_TO_SPRT[classify_game_record(record)]
+
+
+def sprt_tally(games: list) -> dict:
+    """Tally SPRT game records through the shared F-01 classifier (S5-05).
+
+    Returns the shared outcome-class counters plus convenience keys:
+      wins/draws/losses  — the SPRT score inputs (capped games EXCLUDED)
+      capped_games       — total capped (ply-cap) games
+      capped_candidate_white / capped_candidate_black — per-color cap counts
+      uncounted_games    — incomplete/invalid records (never scored)
+    """
+    counts = classify_game_records(games)
+    counts["wins"] = counts["decisive_wins"] + counts["forfeit_wins"]
+    counts["draws"] = counts["genuine_draws"]
+    counts["losses"] = counts["decisive_losses"] + counts["forfeit_losses"]
+    capped_white = sum(
+        1
+        for g in games
+        if is_capped_game_record(g)
+        and bool(g.get("cand_white", g.get("engine_is_white")))
+    )
+    counts["capped_candidate_white"] = capped_white
+    counts["capped_candidate_black"] = counts["capped_games"] - capped_white
+    return counts
+
+
+def capped_sensitivity(
+    games: list,
+    elo0: float = 0.0,
+    elo1: float = 30.0,
+    alpha: float = 0.05,
+    beta: float = 0.05,
+) -> dict:
+    """Sensitivity of the SPRT decision to the capped-game scoring policy (S5-05).
+
+    The PRIMARY decision (produced by ``SprtMatchRunner.run_sprt``) always
+    EXCLUDES capped games. This reports what the decision would have been if
+    capped games were scored as draws (the legacy pre-F-01 bias), as losses
+    (worst case), or adjudicated by material balance (>= +2 pawns win,
+    <= -2 pawns loss, else draw — capped records without a recorded material
+    balance count as draws there). Sensitivity entries never replace the
+    primary decision.
+    """
+    counts = sprt_tally(games)
+    wins = counts["wins"]
+    draws = counts["draws"]
+    losses = counts["losses"]
+    capped = counts["capped_games"]
+
+    primary = compute_sprt_llr(wins, draws, losses, elo0=elo0, elo1=elo1, alpha=alpha, beta=beta)
+    as_draw = compute_sprt_llr(
+        wins, draws + capped, losses, elo0=elo0, elo1=elo1, alpha=alpha, beta=beta
+    )
+    as_loss = compute_sprt_llr(
+        wins, draws, losses + capped, elo0=elo0, elo1=elo1, alpha=alpha, beta=beta
+    )
+
+    cm_wins, cm_draws, cm_losses = wins, draws, losses
+    for g in games:
+        if is_capped_game_record(g):
+            mat = int(g.get("final_material_balance", 0) or 0)
+            if mat >= 2:
+                cm_wins += 1
+            elif mat <= -2:
+                cm_losses += 1
+            else:
+                cm_draws += 1
+    by_material = compute_sprt_llr(
+        cm_wins, cm_draws, cm_losses, elo0=elo0, elo1=elo1, alpha=alpha, beta=beta
+    )
+
+    return {
+        "primary": {"llr": primary["llr"], "decision": primary["decision"]},
+        "capped_games": capped,
+        "capped_candidate_white": counts["capped_candidate_white"],
+        "capped_candidate_black": counts["capped_candidate_black"],
+        "capped_as_draw": {"llr": as_draw["llr"], "decision": as_draw["decision"]},
+        "capped_as_loss": {"llr": as_loss["llr"], "decision": as_loss["decision"]},
+        "capped_by_material": {
+            "llr": by_material["llr"],
+            "decision": by_material["decision"],
+        },
+    }
 
 
 def _file_sha256(path: Path | str) -> str:
@@ -106,10 +235,16 @@ class SprtMatchRunner:
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
         sims: int = 200,
         workers: int = 8,
+        cap_policy: str = "exclude",
     ):
+        if cap_policy not in VALID_CAP_POLICIES:
+            raise ValueError(
+                f"Unknown cap_policy {cap_policy!r}; expected one of {VALID_CAP_POLICIES}."
+            )
         self.device = device
         self.sims = sims
         self.workers = workers
+        self.cap_policy = cap_policy
         self.candidate_checkpoint = candidate_checkpoint
         self.base_checkpoint = base_checkpoint
 
@@ -193,15 +328,44 @@ class SprtMatchRunner:
         plies = 0
         consecutive_hopeless = 0
         consecutive_winning = 0
-        # Audit RL-20: record adjudicated endings so SPRT evidence can be
-        # audited for value-cutoff-decided games (symmetric between arms, but
-        # still value-head-dependent).
+        # Audit RL-20 & F-01/S5-05: record every terminated ending with explicit
+        # outcome classifications, reasons, and material balance — mirroring
+        # MatchRunner._play_game_worker's provenance contract so both harnesses
+        # classify endings identically.
         adj: dict[str, object] = {"adjudicated": False, "adjudication_reason": None}
 
-        def _done(result: str, reason: Optional[str] = None) -> tuple[str, list[str]]:
+        def _finish(
+            result: str, reason: Optional[str] = None, outcome_class: Optional[str] = None
+        ) -> tuple[str, list[str]]:
             if reason is not None:
-                adj["adjudicated"] = True
+                adj["termination_reason"] = reason
+            if outcome_class is not None:
+                adj["outcome_class"] = outcome_class
+            else:
+                if result in ("1-0", "0-1"):
+                    adj["outcome_class"] = "decisive"
+                elif result == "1/2-1/2":
+                    adj["outcome_class"] = "genuine_draw"
+                else:
+                    adj["outcome_class"] = "capped"
+            # "Adjudicated" = ended by a proactive adjudication or the ply cap
+            # rather than by natural completion (MatchRunner's RL-20 semantics:
+            # value cutoffs, the 50-move countdown, and the ply cap — NOT
+            # checkmate/stalemate/rule draws).
+            is_adjudicated = reason in (
+                "value_cutoff_loss",
+                "value_cutoff_win",
+                "fifty_move_countdown",
+                "max_plies_cap",
+            )
+            adj["adjudicated"] = is_adjudicated
+            if is_adjudicated:
                 adj["adjudication_reason"] = reason
+            adj["plies"] = plies
+            adj["final_fen"] = game.get_fen()
+            adj["final_material_balance"] = _compute_material_balance(
+                opening_fen, moves, cand_white
+            )
             if info is not None:
                 info.update(adj)
             return result, moves
@@ -210,7 +374,9 @@ class SprtMatchRunner:
             if game.is_game_over():
                 break
             if game.half_move_clock() >= 60:
-                return _done("1/2-1/2", reason="fifty_move_countdown")
+                return _finish(
+                    "1/2-1/2", reason="fifty_move_countdown", outcome_class="genuine_draw"
+                )
 
             white_to_move = bool(game.side_to_move())
             cand_turn = white_to_move == cand_white
@@ -223,7 +389,11 @@ class SprtMatchRunner:
 
             if not move_uci or not game.is_legal(move_uci):
                 loser_is_white = white_to_move
-                return _done("0-1" if loser_is_white else "1-0")
+                return _finish(
+                    "0-1" if loser_is_white else "1-0",
+                    reason="forfeit_illegal_move",
+                    outcome_class="forfeit",
+                )
 
             # Root-value adjudication: 4 consecutive plies beyond ±0.92 ends the
             # game (both sides see the same evidence; symmetric between arms).
@@ -231,8 +401,10 @@ class SprtMatchRunner:
                 consecutive_hopeless += 1
                 if consecutive_hopeless >= 4:
                     loser_is_white = white_to_move
-                    return _done(
-                        "0-1" if loser_is_white else "1-0", reason="value_cutoff_loss"
+                    return _finish(
+                        "0-1" if loser_is_white else "1-0",
+                        reason="value_cutoff_loss",
+                        outcome_class="decisive",
                     )
             else:
                 consecutive_hopeless = 0
@@ -241,7 +413,11 @@ class SprtMatchRunner:
                 consecutive_winning += 1
                 if consecutive_winning >= 4:
                     winner_is_white = white_to_move
-                    return _done("1-0" if winner_is_white else "0-1", reason="value_cutoff_win")
+                    return _finish(
+                        "1-0" if winner_is_white else "0-1",
+                        reason="value_cutoff_win",
+                        outcome_class="decisive",
+                    )
             else:
                 consecutive_winning = 0
 
@@ -251,8 +427,25 @@ class SprtMatchRunner:
 
         if game.is_checkmate():
             loser_is_white = bool(game.side_to_move())
-            return _done("0-1" if loser_is_white else "1-0", reason="checkmate")
-        return _done("1/2-1/2", reason="max_plies_cap")
+            return _finish(
+                "0-1" if loser_is_white else "1-0", reason="checkmate", outcome_class="decisive"
+            )
+        if plies >= max_plies:
+            # Audit F-01 / S5-05: the ply cap reached without a decisive or
+            # rule-based outcome must NOT be treated as a genuine chess draw.
+            # Default policy "exclude": board result "*" -> classified "capped"
+            # and excluded from the SPRT score. cap_policy="draw" keeps the
+            # legacy "1/2-1/2" board string but STILL records outcome_class
+            # "capped", so the classification (and any resumed tally) is
+            # policy-independent.
+            cap_pol = getattr(self, "cap_policy", "exclude")
+            if cap_pol == "draw":
+                return _finish("1/2-1/2", reason="max_plies_cap", outcome_class="capped")
+            return _finish("*", reason="max_plies_cap", outcome_class="capped")
+        # Natural game-over without checkmate (stalemate, insufficient material,
+        # repetition, ...): a genuine rule draw. (The pre-S5-05 harness labeled
+        # this ending "max_plies_cap"; that mislabel is corrected here.)
+        return _finish("1/2-1/2", reason="rule_draw", outcome_class="genuine_draw")
 
     def run_sprt(
         self,
@@ -267,6 +460,7 @@ class SprtMatchRunner:
         outdir.mkdir(parents=True, exist_ok=True)
         state_file = outdir / f"{name}_state.json"
         pgn_file = outdir / f"{name}.pgn"
+        cap_policy = getattr(self, "cap_policy", "exclude")
 
         games_played: list[dict[str, Any]] = []
         if state_file.exists():
@@ -278,14 +472,16 @@ class SprtMatchRunner:
             except Exception as e:
                 print(f"Warning: could not load state file {state_file}: {e}")
 
-        def _tally() -> tuple[int, int, int]:
-            return (
-                sum(1 for g in games_played if g["cand_outcome"] == "win"),
-                sum(1 for g in games_played if g["cand_outcome"] == "draw"),
-                sum(1 for g in games_played if g["cand_outcome"] == "loss"),
-            )
+        def _tally() -> dict[str, Any]:
+            # Audit S5-05: reclassify EVERY record through the shared F-01
+            # classifier on each call (never trust the stored cand_outcome).
+            # Capped games are EXCLUDED from the SPRT score; legacy pre-S5-05
+            # records (no outcome_class/termination_reason) classify from
+            # their board result alone and default to uncapped.
+            return sprt_tally(games_played)
 
-        cand_wins, cand_draws, cand_losses = _tally()
+        counts = _tally()
+        cand_wins, cand_draws, cand_losses = counts["wins"], counts["draws"], counts["losses"]
         sprt = compute_sprt_llr(cand_wins, cand_draws, cand_losses, elo0=elo0, elo1=elo1)
 
         if len(games_played) >= max_games or sprt["decision"] != "CONTINUE":
@@ -294,9 +490,15 @@ class SprtMatchRunner:
             return {
                 "name": name,
                 "cand_cfg": cand_cfg,
+                "cap_policy": cap_policy,
                 "sprt": sprt,
                 "final_status": final_status,
                 "games_count": len(games_played),
+                "capped_games": counts["capped_games"],
+                "capped_candidate_white": counts["capped_candidate_white"],
+                "capped_candidate_black": counts["capped_candidate_black"],
+                "uncounted_games": counts["uncounted_games"],
+                "capped_sensitivity": capped_sensitivity(games_played, elo0=elo0, elo1=elo1),
                 "pgn_path": str(pgn_file),
             }
 
@@ -344,27 +546,31 @@ class SprtMatchRunner:
                 for fut in concurrent.futures.as_completed(futures):
                     p_idx, opening_idx, fen, cand_white, seed, game_info = futures[fut]
                     board_res, moves = fut.result()
-                    if board_res == "1/2-1/2":
-                        cand_outcome = "draw"
-                    elif (board_res == "1-0" and cand_white) or (board_res == "0-1" and not cand_white):
-                        cand_outcome = "win"
-                    else:
-                        cand_outcome = "loss"
-                    batch_results.append(
-                        {
-                            "game_idx": len(games_played) + len(batch_results) + 1,
-                            "pair_idx": p_idx,
-                            "opening_idx": opening_idx,
-                            "opening_fen": fen,
-                            "cand_white": cand_white,
-                            "board_result": board_res,
-                            "cand_outcome": cand_outcome,
-                            "moves": moves,
-                            "seed": seed,
-                            "adjudicated": bool(game_info.get("adjudicated", False)),
-                            "adjudication_reason": game_info.get("adjudication_reason"),
-                        }
-                    )
+                    record = {
+                        "game_idx": len(games_played) + len(batch_results) + 1,
+                        "pair_idx": p_idx,
+                        "opening_idx": opening_idx,
+                        "opening_fen": fen,
+                        "cand_white": cand_white,
+                        "board_result": board_res,
+                        "moves": moves,
+                        "seed": seed,
+                        "adjudicated": bool(game_info.get("adjudicated", False)),
+                        "adjudication_reason": game_info.get("adjudication_reason"),
+                        # Audit F-01/S5-05: full termination provenance so an
+                        # interrupted SPRT can resume and reclassify
+                        # consistently (capped flag via outcome_class /
+                        # termination_reason, plus plies and material balance
+                        # for the sensitivity analyses).
+                        "termination_reason": game_info.get("termination_reason"),
+                        "outcome_class": game_info.get("outcome_class"),
+                        "plies": int(game_info.get("plies", len(moves))),
+                        "final_material_balance": game_info.get("final_material_balance", 0),
+                    }
+                    # Shared F-01 classification: a ply cap is "capped",
+                    # never "draw" (cap_policy="exclude" default).
+                    record["cand_outcome"] = classify_sprt_record(record)
+                    batch_results.append(record)
 
             batch_results.sort(key=lambda r: r["game_idx"])
             games_played.extend(batch_results)
@@ -382,14 +588,17 @@ class SprtMatchRunner:
                     pf.write(f'[CandidateWhite "{gr["cand_white"]}"]\n\n')
                     pf.write(" ".join(gr["moves"]) + f' {gr["board_result"]}\n\n')
 
-            cand_wins, cand_draws, cand_losses = _tally()
+            counts = _tally()
+            cand_wins, cand_draws, cand_losses = counts["wins"], counts["draws"], counts["losses"]
             sprt = compute_sprt_llr(cand_wins, cand_draws, cand_losses, elo0=elo0, elo1=elo1)
             elo_str = f"{sprt['elo_diff']:+.1f}" if sprt["elo_diff"] is not None else "N/A"
             lo_str = f"{sprt['elo_lo']:+.1f}" if sprt["elo_lo"] is not None else "N/A"
             hi_str = f"{sprt['elo_hi']:+.1f}" if sprt["elo_hi"] is not None else "N/A"
             print(
                 f"[{name}] Games: {sprt['n']:3d}/{max_games} | W: {sprt['wins']:2d} D: {sprt['draws']:2d} "
-                f"L: {sprt['losses']:2d} | Score: {sprt['score']:.3f} | Elo: {elo_str} [{lo_str}, {hi_str}] | "
+                f"L: {sprt['losses']:2d} | Capped(excluded): {counts['capped_games']} "
+                f"(cand-W: {counts['capped_candidate_white']}, cand-B: {counts['capped_candidate_black']}) | "
+                f"Score: {sprt['score']:.3f} | Elo: {elo_str} [{lo_str}, {hi_str}] | "
                 f"LLR: {sprt['llr']:+.2f} (bounds: [{sprt['lower_bound']:.2f}, {sprt['upper_bound']:.2f}]) | "
                 f"Batch {len(batch_results)} games took {dt:.1f}s",
                 flush=True,
@@ -403,6 +612,7 @@ class SprtMatchRunner:
                         "git_commit": _git_commit(),
                         "cand_cfg": cand_cfg,
                         "base_cfg": base_cfg,
+                        "cap_policy": cap_policy,
                         "candidate_checkpoint": self.candidate_checkpoint,
                         "candidate_checkpoint_sha256": _file_sha256(self.candidate_checkpoint),
                         "base_checkpoint": self.base_checkpoint,
@@ -412,6 +622,12 @@ class SprtMatchRunner:
                         "openings_file": "data/openings/eval_openings_50.epd",
                         "openings_sha256": _file_sha256("data/openings/eval_openings_50.epd"),
                         "sprt": sprt,
+                        # Audit S5-05: explicit cap accounting so the
+                        # capped-excluded share of the sample is visible.
+                        "capped_games": counts["capped_games"],
+                        "capped_candidate_white": counts["capped_candidate_white"],
+                        "capped_candidate_black": counts["capped_candidate_black"],
+                        "uncounted_games": counts["uncounted_games"],
                         "games": games_played,
                     },
                     sf,
@@ -433,6 +649,7 @@ class SprtMatchRunner:
             "base_checkpoint_sha256": _file_sha256(self.base_checkpoint),
             "cand_cfg": cand_cfg,
             "base_cfg": base_cfg,
+            "cap_policy": cap_policy,
             "device": str(self.device),
             "sims": self.sims,
             "openings_file": "data/openings/eval_openings_50.epd",
@@ -441,12 +658,28 @@ class SprtMatchRunner:
             "final_status": final_status,
             "games_count": len(games_played),
             "pgn_path": str(pgn_file),
-            # Audit RL-20: adjudication provenance for the SPRT evidence.
+            # Audit S5-05: explicit cap accounting (per candidate color and
+            # total) plus capped-as-draw/loss/by-material sensitivity
+            # decisions — reported alongside, never replacing, the primary
+            # exclude-based decision.
+            "capped_games": counts["capped_games"],
+            "capped_candidate_white": counts["capped_candidate_white"],
+            "capped_candidate_black": counts["capped_candidate_black"],
+            "uncounted_games": counts["uncounted_games"],
+            "capped_sensitivity": capped_sensitivity(games_played, elo0=elo0, elo1=elo1),
+            # Audit RL-20: adjudication provenance for the SPRT evidence
+            # (value-cutoff counts keyed on the recorded reason, matching
+            # MatchRunner's summary accounting).
             "adjudicated_games": sum(1 for g in games_played if g.get("adjudicated")),
             "adjudicated_value_cutoff_wins": sum(
                 1
                 for g in games_played
-                if g.get("adjudicated") and g.get("cand_outcome") == "win"
+                if g.get("adjudication_reason") == "value_cutoff_win"
+            ),
+            "adjudicated_value_cutoff_losses": sum(
+                1
+                for g in games_played
+                if g.get("adjudication_reason") == "value_cutoff_loss"
             ),
         }
 
@@ -465,6 +698,16 @@ def main() -> int:
     parser.add_argument("--max-games", type=int, default=200)
     parser.add_argument("--sims", type=int, default=200)
     parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument(
+        "--cap-policy",
+        choices=list(VALID_CAP_POLICIES),
+        default="exclude",
+        help="Scoring of games that reach the 150-ply cap without a decisive "
+        "or rule-based outcome (Audit F-01/S5-05): 'exclude' (default) "
+        "records them as capped and EXCLUDES them from the SPRT score; "
+        "'draw' keeps the legacy draw board string but still classifies "
+        "them as capped. The cap count is always reported separately.",
+    )
     parser.add_argument("--outdir", default="runs/sprt")
     parser.add_argument("--elo0", type=float, default=0.0)
     parser.add_argument("--elo1", type=float, default=30.0)
@@ -484,6 +727,7 @@ def main() -> int:
         base_checkpoint=base_ckpt,
         sims=args.sims,
         workers=args.workers,
+        cap_policy=args.cap_policy,
     )
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -525,9 +769,18 @@ def main() -> int:
         s = r["sprt"]
         wdl = f"{s['wins']}/{s['draws']}/{s['losses']}"
         elo_str = f"{s['elo_diff']:+.1f} [{s['elo_lo']:+.1f}, {s['elo_hi']:+.1f}]" if s["elo_diff"] is not None else "N/A"
+        capped = r.get("capped_games", 0)
+        sens = r.get("capped_sensitivity") or {}
+        sens_str = ""
+        if sens.get("capped_games"):
+            sens_str = (
+                f" | sens: as-draw={sens['capped_as_draw']['decision']},"
+                f" as-loss={sens['capped_as_loss']['decision']}"
+            )
         print(
             f"{r['name']:<24} | {wdl:<12} | {s['score']:.3f} | {elo_str:<22} | "
-            f"LLR {s['llr']:+.2f} | {r['final_status']}"
+            f"LLR {s['llr']:+.2f} | capped(excluded): {capped:<4} | {r['final_status']}"
+            f"{sens_str}"
         )
     print("=" * 90)
 

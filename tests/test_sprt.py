@@ -74,6 +74,44 @@ def test_sprt_monotone_in_score():
     assert strong["llr"] > weak["llr"]
 
 
+def test_sprt_llr_closed_form_fixed_sigma():
+    """S5-06: sigma^2 is the FIXED conservative 0.25, so the LLR is exactly
+    4 * (s1 - s0) * sum(x_i - mu_bar) for any W/D/L mix (tolerance 1e-9).
+
+    The historical "empirical variance" branch was mathematically dead (the
+    Bhatia-Davis bound caps the outcome variance at s(1-s) <= 0.25, so the
+    max(var, 0.25) floor was always active)."""
+    for elo0, elo1 in [(0.0, 30.0), (-10.0, 20.0), (0.0, 5.0)]:
+        s0 = elo_to_score(elo0)
+        s1 = elo_to_score(elo1)
+        mu_bar = (s0 + s1) / 2.0
+        for w, d, l in [
+            (10, 0, 0),
+            (0, 0, 10),
+            (3, 4, 3),
+            (0, 100, 0),
+            (70, 20, 10),
+            (500, 100, 200),
+            (1, 1, 1),
+            (13, 0, 87),
+        ]:
+            r = compute_sprt_llr(w, d, l, elo0=elo0, elo1=elo1)
+            sum_centered = w * (1.0 - mu_bar) + d * (0.5 - mu_bar) + l * (0.0 - mu_bar)
+            expected = 4.0 * (s1 - s0) * sum_centered
+            assert abs(r["llr"] - expected) <= 1e-9, (elo0, elo1, w, d, l, r["llr"], expected)
+
+
+def test_sprt_llr_fixed_variance_ignores_outcome_spread():
+    """S5-06: with fixed sigma^2 = 0.25 the LLR depends only on n and the mean
+    score (sum(x_i - mu_bar) = n * (score - mu_bar)), NOT on the W/D/L spread —
+    a (25, 50, 25) split and a (50, 0, 50) split (same score, same n) produce
+    identical LLRs."""
+    a = compute_sprt_llr(25, 50, 25, elo0=0.0, elo1=30.0)
+    b = compute_sprt_llr(50, 0, 50, elo0=0.0, elo1=30.0)
+    assert a["score"] == b["score"] == 0.5
+    assert abs(a["llr"] - b["llr"]) <= 1e-9
+
+
 def test_sprt_zero_games_continues():
     r = compute_sprt_llr(0, 0, 0)
     assert r["decision"] == "CONTINUE"

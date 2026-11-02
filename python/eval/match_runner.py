@@ -34,10 +34,8 @@ import torch
 import zeropawn_cpp
 from python.model.chess_net import ChessNet
 from python.eval.stats import (
-    agresti_caffo_elo_ci,
     elo_confidence_interval,
     paired_score_and_ci,
-    score_to_elo,
 )
 
 logger = logging.getLogger("match_runner")
@@ -134,6 +132,101 @@ def engine_outcome(board_result: str, engine_is_white: bool) -> str:
         return "capped"
     white_won = board_result == "1-0"
     return "win" if white_won == engine_is_white else "loss"
+
+
+# Board-relative result strings recognized by the shared game classifier.
+# "*"/"inconclusive"/"capped" all mean "no genuine chess result" (ply cap).
+_CAP_RESULT_STRINGS = ("*", "inconclusive", "capped")
+_GENUINE_RESULT_STRINGS = ("1-0", "0-1", "1/2-1/2")
+
+_RECORD_OUTCOME_COUNTERS = {
+    "decisive_win": "decisive_wins",
+    "decisive_loss": "decisive_losses",
+    "forfeit_win": "forfeit_wins",
+    "forfeit_loss": "forfeit_losses",
+    "genuine_draw": "genuine_draws",
+    "capped": "capped_games",
+    "uncounted": "uncounted_games",
+}
+
+
+def classify_game_record(record: dict) -> str:
+    """Classify ONE completed game record into a fine-grained engine-relative outcome.
+
+    Shared classification contract (Audit F-01, S5-05): this is the single
+    implementation used by BOTH ``MatchRunner.run_match`` and
+    ``scripts/run_sprt.py`` so that a game reaching the ply cap classifies as
+    "capped" — never as a genuine draw — in every match/SPRT harness.
+
+    Accepts MatchRunner-style records (``result`` / ``engine_is_white``) and
+    SPRT-style records (``board_result`` / ``cand_white``), plus the common
+    provenance fields ``outcome_class`` ("decisive"|"genuine_draw"|"capped"|
+    "forfeit"|...) and ``termination_reason`` (e.g. "checkmate"|
+    "max_plies_cap"|"rule_draw").
+
+    Returns one of:
+      "decisive_win", "decisive_loss", "forfeit_win", "forfeit_loss",
+      "genuine_draw", "capped", "uncounted".
+
+    Semantics:
+      - A ply-cap termination ("*"-family result, outcome_class "capped", or
+        termination_reason "max_plies_cap") is "capped" and must NOT be
+        scored as a genuine draw (cap_policy="exclude" default).
+      - Forfeits (illegal move / timeout) count as wins/losses for the
+        engine, tracked separately from decisive results.
+      - Records with a missing or unrecognized result, or without a color,
+        are "uncounted": they are reported but never scored.
+    """
+    res = record.get("result", record.get("board_result"))
+    outcome_class = record.get("outcome_class")
+    term_reason = record.get("termination_reason") or ""
+    eng_white = record.get("engine_is_white", record.get("cand_white"))
+
+    if res is None or eng_white is None:
+        return "uncounted"
+    if res in _CAP_RESULT_STRINGS:
+        return "capped"
+    if res not in _GENUINE_RESULT_STRINGS:
+        return "uncounted"
+    if outcome_class == "capped" or term_reason == "max_plies_cap":
+        # e.g. cap_policy="draw" produced a "1/2-1/2" board string for a cap.
+        return "capped"
+    if res == "1/2-1/2":
+        return "genuine_draw"
+    engine_won = (res == "1-0") == bool(eng_white)
+    if outcome_class == "forfeit":
+        return "forfeit_win" if engine_won else "forfeit_loss"
+    return "decisive_win" if engine_won else "decisive_loss"
+
+
+def is_capped_game_record(record: dict) -> bool:
+    """True when the record is a ply-cap termination (Audit F-01 / S5-05).
+
+    Convenience predicate over the same shared classification used for the
+    score; used for per-color capped accounting in SPRT summaries.
+    """
+    return classify_game_record(record) == "capped"
+
+
+def classify_game_records(games: list) -> dict[str, int]:
+    """Tally completed game records into outcome-class counters (shared contract).
+
+    Single implementation backing ``MatchRunner.run_match`` and
+    ``scripts/run_sprt.py`` — see :func:`classify_game_record` for the record
+    contract and the capped-game semantics (Audit F-01 / S5-05).
+    """
+    counts = {
+        "decisive_wins": 0,
+        "decisive_losses": 0,
+        "genuine_draws": 0,
+        "capped_games": 0,
+        "forfeit_wins": 0,
+        "forfeit_losses": 0,
+        "uncounted_games": 0,
+    }
+    for g in games:
+        counts[_RECORD_OUTCOME_COUNTERS[classify_game_record(g)]] += 1
+    return counts
 
 
 def score_board_results(results_white: list[str], results_black: list[str]) -> dict[str, int]:
@@ -1129,48 +1222,15 @@ class MatchRunner:
                 ctx.close()
 
         # Outcome classification & statistical integrity (Audit F-01, F-03, F-16)
-        decisive_wins = 0
-        decisive_losses = 0
-        genuine_draws = 0
-        capped_games = 0
-        forfeit_wins = 0
-        forfeit_losses = 0
-
-        for g in games:
-            res = g["result"]
-            eng_white = g["engine_is_white"]
-            outcome_class = g.get("outcome_class")
-            term_reason = g.get("termination_reason", "")
-
-            if res == "*":
-                capped_games += 1
-            elif res == "1/2-1/2":
-                if outcome_class == "capped" or term_reason == "max_plies_cap":
-                    capped_games += 1
-                else:
-                    genuine_draws += 1
-            elif res == "1-0":
-                if eng_white:
-                    if outcome_class == "forfeit":
-                        forfeit_wins += 1
-                    else:
-                        decisive_wins += 1
-                else:
-                    if outcome_class == "forfeit":
-                        forfeit_losses += 1
-                    else:
-                        decisive_losses += 1
-            elif res == "0-1":
-                if eng_white:
-                    if outcome_class == "forfeit":
-                        forfeit_losses += 1
-                    else:
-                        decisive_losses += 1
-                else:
-                    if outcome_class == "forfeit":
-                        forfeit_wins += 1
-                    else:
-                        decisive_wins += 1
+        # Shared record classifier (S5-05): one implementation for the match
+        # runner and the SPRT harness (scripts/run_sprt.py).
+        counts = classify_game_records(games)
+        decisive_wins = counts["decisive_wins"]
+        decisive_losses = counts["decisive_losses"]
+        genuine_draws = counts["genuine_draws"]
+        capped_games = counts["capped_games"]
+        forfeit_wins = counts["forfeit_wins"]
+        forfeit_losses = counts["forfeit_losses"]
 
         engine_wins = decisive_wins + forfeit_wins
         engine_losses = decisive_losses + forfeit_losses
@@ -1220,14 +1280,10 @@ class MatchRunner:
         # Sensitivity analyses (Audit F-01):
         # 1. Capped scored as draw (legacy comparison)
         cd_draws = engine_draws + capped_games
-        cd_total = engine_wins + cd_draws + engine_losses
-        cd_score = (engine_wins + 0.5 * cd_draws) / cd_total if cd_total > 0 else 0.0
         cd_elo = elo_confidence_interval(engine_wins, cd_draws, engine_losses)
 
         # 2. Capped scored as loss (worst-case sensitivity)
         cl_losses = engine_losses + capped_games
-        cl_total = engine_wins + engine_draws + cl_losses
-        cl_score = (engine_wins + 0.5 * engine_draws) / cl_total if cl_total > 0 else 0.0
         cl_elo = elo_confidence_interval(engine_wins, engine_draws, cl_losses)
 
         # 3. Capped adjudicated by material balance (>= +2 pawns win, <= -2 pawns loss, else draw)
@@ -1247,8 +1303,6 @@ class MatchRunner:
                     cm_losses += 1
                 else:
                     cm_draws += 1
-        cm_total = cm_wins + cm_draws + cm_losses
-        cm_score = (cm_wins + 0.5 * cm_draws) / cm_total if cm_total > 0 else 0.0
         cm_elo = elo_confidence_interval(cm_wins, cm_draws, cm_losses)
 
         games.sort(key=lambda g: (g["opening_idx"], not g["engine_is_white"]))

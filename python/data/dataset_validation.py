@@ -304,7 +304,6 @@ def validate_split(
     outcomes = np.fromfile(split_dir / "outcomes.bin", dtype=np.uint8)
     moves = np.fromfile(split_dir / "moves.bin", dtype=np.int16)
     plies = np.fromfile(split_dir / "plies.bin", dtype=np.int16)
-    game_ids = np.fromfile(split_dir / "game_ids.bin", dtype=np.uint64)
 
     valid_outcomes = resolved_role.valid_outcomes if resolved_role else tuple(range(0, 256))
     bad_outcomes = np.sort(np.unique(outcomes[~np.isin(outcomes, valid_outcomes)]))
