@@ -2,33 +2,33 @@
   "version": 3,
   "cmakeMinimumRequired": {
     "major": 3,
-    "minor": 20,
+    "minor": 21,
     "patch": 0
   },
   "configurePresets": [
     {
       "name": "default",
       "displayName": "Default Release",
-      "description": "Standard Release build in build/cmake",
-      "binaryDir": "${sourceDir}/build/cmake",
+      "description": "Standard Release build in build/cmake-default",
+      "binaryDir": "${sourceDir}/build/cmake-default",
       "generator": "Ninja",
       "configurationTypes": ["Release"],
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "CHESSRL_BUILD_PYTHON": "ON",
-        "CHESSRL_BUILD_TESTS": "ON"
+        "ZEROPAWN_BUILD_PYTHON": "ON",
+        "ZEROPAWN_BUILD_TESTS": "ON"
       }
     },
     {
       "name": "windows-mingw",
       "displayName": "Windows MinGW Release",
-      "description": "Windows build using MinGW/GCC and Ninja",
-      "binaryDir": "${sourceDir}/build/cmake",
+      "description": "Windows build using MinGW/GCC and Ninja in build/cmake-windows-mingw",
+      "binaryDir": "${sourceDir}/build/cmake-windows-mingw",
       "generator": "Ninja",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "CHESSRL_BUILD_PYTHON": "ON",
-        "CHESSRL_BUILD_TESTS": "ON"
+        "ZEROPAWN_BUILD_PYTHON": "ON",
+        "ZEROPAWN_BUILD_TESTS": "ON"
       },
       "condition": {
         "type": "equals",
@@ -39,13 +39,13 @@
     {
       "name": "linux-gcc",
       "displayName": "Linux GCC Release",
-      "description": "Linux build using GCC and Ninja",
-      "binaryDir": "${sourceDir}/build/cmake",
+      "description": "Linux build using GCC and Ninja in build/cmake-linux-gcc",
+      "binaryDir": "${sourceDir}/build/cmake-linux-gcc",
       "generator": "Ninja",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "CHESSRL_BUILD_PYTHON": "ON",
-        "CHESSRL_BUILD_TESTS": "ON"
+        "ZEROPAWN_BUILD_PYTHON": "ON",
+        "ZEROPAWN_BUILD_TESTS": "ON"
       },
       "condition": {
         "type": "equals",
@@ -56,13 +56,13 @@
     {
       "name": "macos-clang",
       "displayName": "macOS Clang Release",
-      "description": "macOS build using Apple Clang and Ninja",
-      "binaryDir": "${sourceDir}/build/cmake",
+      "description": "macOS build using Apple Clang and Ninja in build/cmake-macos-clang",
+      "binaryDir": "${sourceDir}/build/cmake-macos-clang",
       "generator": "Ninja",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "CHESSRL_BUILD_PYTHON": "ON",
-        "CHESSRL_BUILD_TESTS": "ON"
+        "ZEROPAWN_BUILD_PYTHON": "ON",
+        "ZEROPAWN_BUILD_TESTS": "ON"
       },
       "condition": {
         "type": "equals",

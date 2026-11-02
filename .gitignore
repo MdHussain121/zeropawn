@@ -35,6 +35,12 @@ dist/
 build/
 *.whl
 .installed.cfg
+# S6-01: staged native extension (copied from build/cpp/ by
+# scripts/build_wheel.py) is a build artifact, never source. (*.pyd/*.dll are
+# already globally ignored; these entries document the directory's status.)
+/python/_native/
+# Remediation scratch space (test basetemps, venvs, probes)
+/tmp_remediation/
 
 # ── Virtual Environments ────────────────────────────────────────────────────
 .venv/

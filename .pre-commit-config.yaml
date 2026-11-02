@@ -10,7 +10,9 @@ repos:
         args: ['--maxkb=5000']
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.4.4
+    # S6-05: pinned to the same ruff version as CI (.github/workflows/ci.yml
+    # installs ruff==0.15.10) so the hook and CI judge identical rule sets.
+    rev: v0.15.10
     hooks:
       - id: ruff
         args: [--fix]

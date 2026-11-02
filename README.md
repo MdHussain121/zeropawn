@@ -57,7 +57,7 @@ ZeroPawn pairs an optimized C++17 bitboard chess engine and Monte Carlo Tree Sea
   - **Windows:** MinGW-W64 GCC 11+ (recommended: WinLibs UCRT via `winget install BrechtSanders.WinLibs.POSIX.UCRT`) or MSVC 2019+
   - **Linux:** GCC 10+ or Clang 12+ (`sudo apt install build-essential ninja-build cmake`)
   - **macOS:** Xcode Command Line Tools (`xcode-select --install`)
-- **CMake & Ninja:** CMake 3.20+ and Ninja build system
+- **CMake & Ninja:** CMake 3.21+ and Ninja build system (3.21 is the floor for CMakePresets v3)
 - **Stockfish (Optional):** Recommended for evaluation benchmarks and calibration (placed in `tools/` or on system PATH)
 
 ### 1. Clone & Set Up Python Environment
@@ -107,7 +107,7 @@ Once installed, verify the entire hardware and software stack with built-in tele
 # 3. Python <-> C++ binding compatibility test:
 python cli.py build compat
 
-# 4. Native C++ engine tests (11 test suites):
+# 4. Native C++ engine tests (18 test functions in one native test binary):
 .\zeropawn.cmd build test
 
 # 5. Supervised learning 10-step smoke test:
@@ -131,18 +131,14 @@ We provide two pre-trained model checkpoints:
 
 | Model | Path | Val Loss | Size | Status & Relative Strength |
 | :--- | :--- | :---: | :---: | :--- |
-| **Fine-Tuned Model** *(Recommended)* | `models/checkpoints_finetune/best_model.pt` | **1.7975** | 96.8 MB | **Strongest model.** Significantly outperforms the scaled baseline in tactical puzzle accuracy, blunder avoidance, and tournament win rate. Recommended for general play and UCI engine matches. |
-| **Scaled Baseline Model** | `models/checkpoints_scaled/best_model.pt` | **3.1355** | 98.9 MB | Certified supervised warm-start baseline (19,460 steps). Maintained for reference benchmarking, research ablation, and training reproduction. |
+| **Fine-Tuned Model** | `models/checkpoints_finetune/best_model.pt` | **1.7975** | 96.8 MB | More recent supervised artifact with lower validation loss (1.7975 vs 3.1355 per `models/manifest.json`). Recorded `status: missing` and non-designated in `docs/checkpoint_registry.json`. |
+| **Scaled Baseline Model** | `models/checkpoints_scaled/best_model.pt` | **3.1355** | 98.9 MB | Certified supervised warm-start baseline (19,460 steps). Maintained for reference benchmarking, research ablation, and training reproduction. Also recorded `status: missing` and non-designated. |
 
-> [!TIP]
-> **Model Strength:** The **Fine-Tuned Model** is substantially stronger than the **Scaled Model**. If you want the highest playing strength and sharpest tactical calculation, use the fine-tuned model.
+> [!NOTE]
+> **Model Lineage (unverified strength):** Validation loss is a training metric, not a playing-strength measurement. **No head-to-head strength comparison between any two checkpoints has been run** — comparative strength claims in older notes are unverified. The **designated** baseline (the only registry-verified, hash-checked warm-start artifact) is `models/checkpoints_baseline_20261031/best_model.pt` (ckpt-10).
 
-### Checkpoint Discovery Hierarchy
-When launching the engine without an explicit `--checkpoint` flag, ZeroPawn automatically selects the strongest available checkpoint in this order:
-1. `models/checkpoints_finetune/best_model.pt` *(Fine-tuned model — strongest)*
-2. `models/checkpoints_scaled/best_model.pt` *(Scaled supervised baseline)*
-3. `models/checkpoints_rl/best_eval.pt` *(RL self-play checkpoint, when a run has promoted one)*
-4. Any `.pt` path explicitly passed via `--checkpoint <path>`
+### Checkpoint Resolution
+When launching the engine without an explicit `--checkpoint` flag, ZeroPawn resolves the default through the **fail-closed registry resolver** (`docs/checkpoint_registry.json`): the highest-id entry whose `status` is `verified` AND `designated_warm_start` is true, re-hashed before use. If no designated artifact is present (or its hash mismatches), resolution **fails with a clear error naming the expected artifact** — there is no "newest file on disk" fallback. Currently that is `models/checkpoints_baseline_20261031/best_model.pt` (ckpt-10). Explicit paths passed via `--checkpoint <path>` are honored directly (explicit empty string `''` requests an explicit model-less run where the command supports it).
 
 > [!IMPORTANT]
 > **No RL-trained checkpoint lineage exists yet.** The 2026-10-26 RL campaign applied

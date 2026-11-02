@@ -56,6 +56,24 @@ from python.cli.ui import COLOR_BORDER, console, print_app_banner, render_hardwa
 from python.cli.wizard import enter_custom_arguments_mode, run_configuration_wizard
 
 
+def _cli_version() -> str:
+    """Package version, single-sourced from installed metadata (audit S6-08).
+
+    ``importlib.metadata`` is authoritative for an installed wheel; the
+    fallback covers a repo checkout whose package is not installed into the
+    active environment. The historical hardcoded "1.0.0" disagreed with
+    pyproject.toml (0.1.0) and CITATION.cff (0.1.0).
+    """
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+
+        return version("zeropawn")
+    except PackageNotFoundError:
+        return "0.1.0"
+    except Exception:  # pragma: no cover - defensive (metadata backend failure)
+        return "0.1.0"
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Construct unified ArgumentParser with all operations, subcommands, and aliases."""
     parser = argparse.ArgumentParser(
@@ -96,7 +114,7 @@ Examples:
         "--version",
         "-V",
         action="version",
-        version="ZeroPawn 1.0.0 (Deep ZeroPawn Chess Engine)",
+        version=f"ZeroPawn {_cli_version()} (Deep ZeroPawn Chess Engine)",
         help="Show version information and exit.",
     )
     parser.add_argument(

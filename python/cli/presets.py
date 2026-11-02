@@ -16,8 +16,22 @@ from rich.table import Table
 
 from python.cli.common import REPO_ROOT
 from python.cli.ui import COLOR_BORDER, console
+from python.common.resource_paths import resolve_data_file
 
+# Write target stays repository-anchored: user presets are created in the
+# checkout that owns them (site-packages is never written by this module).
 PRESETS_FILE = REPO_ROOT / "configs" / "presets.json"
+
+
+def _presets_read_file() -> Path:
+    """Read path for user presets: repo checkout first, packaged copy fallback.
+
+    S6-01: an installed wheel ships ``python/_data/presets.json`` so preset
+    listing works outside a checkout. Resolved at call time so tests that
+    monkeypatch ``PRESETS_FILE`` keep working (an existing patched path wins).
+    """
+    return resolve_data_file(PRESETS_FILE, "_data", "presets.json")
+
 
 # Built-in presets designed for real workloads with documented trade-offs
 BUILTIN_PRESETS: Dict[str, Dict[str, Any]] = {
@@ -257,10 +271,11 @@ BUILTIN_PRESETS: Dict[str, Dict[str, Any]] = {
 
 def load_user_presets() -> Dict[str, Dict[str, Any]]:
     """Load user presets from configs/presets.json. Returns empty dict on error/missing."""
-    if not PRESETS_FILE.is_file():
+    read_file = _presets_read_file()
+    if not read_file.is_file():
         return {}
     try:
-        with open(PRESETS_FILE, "r", encoding="utf-8") as f:
+        with open(read_file, "r", encoding="utf-8") as f:
             data = json.load(f)
             if isinstance(data, dict) and "presets" in data and isinstance(data["presets"], dict):
                 return data["presets"]

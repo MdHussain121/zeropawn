@@ -97,10 +97,14 @@ def test_models_download_verify_both(tmp_path: Path):
 def test_models_download_network_error_cleanup(tmp_path: Path):
     """Network failure cleans up temporary download file and returns 1."""
     dest_path = tmp_path / "failed_model.pt"
+    # S6-02: --allow-superseded confirms the superseded-lineage acquisition so
+    # this test exercises the network path (without it the download is refused
+    # before any request is made).
     args = argparse.Namespace(
         output=str(dest_path),
         verify_only=False,
         url="https://mock.invalid.example/weights.pt",
+        allow_superseded=True,
     )
     import urllib.error
 
@@ -129,6 +133,7 @@ def test_models_download_mocked_success(tmp_path: Path):
         output=str(dest_path),
         verify_only=False,
         url="https://mock.example.com/best_model.pt",
+        allow_superseded=True,
     )
 
     with (

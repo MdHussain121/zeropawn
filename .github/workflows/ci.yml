@@ -23,9 +23,10 @@ jobs:
           python-version: "3.12"
 
       - name: Install Ruff
-        # The version is pinned to the one of .pre-commit-config.yaml, so
-        # the hook and CI judge the same files with the same rules
-        # (PUZ-REL-006).
+        # Pinned equal to .pre-commit-config.yaml (ruff-pre-commit rev
+        # v0.15.10) so the hook and CI judge the same files with the same
+        # rules (PUZ-REL-006). S6-05: these had drifted (v0.4.4 vs 0.15.10);
+        # bump BOTH together or update this comment.
         run: pip install "ruff==0.15.10"
 
       - name: Check Formatting & Lints

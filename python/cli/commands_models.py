@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import logging
 from pathlib import Path
 
 import torch
@@ -19,6 +20,8 @@ from python.cli.models import (
 )
 from python.cli.ui import COLOR_BORDER, console
 from python.model.checkpoint_registry import DefaultCheckpointError
+
+logger = logging.getLogger(__name__)
 
 
 def register_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -103,9 +106,13 @@ def register_parser(subparsers: argparse._SubParsersAction) -> None:
         "--model",
         "-m",
         type=str,
-        choices=["finetuned", "scaled", "both"],
+        choices=["finetuned", "scaled", "both", "baseline"],
         default="finetuned",
-        help="Which model to download/verify: 'finetuned' (stronger, recommended), 'scaled' (baseline), or 'both' (default: finetuned)",
+        help=(
+            "Which model to download/verify: 'baseline' (designated, local-only), "
+            "'finetuned' or 'scaled' (superseded pre-remediation lineage), or "
+            "'both' (default: finetuned)"
+        ),
     )
     p_dl.add_argument(
         "--url",
@@ -124,6 +131,15 @@ def register_parser(subparsers: argparse._SubParsersAction) -> None:
         "--verify-only",
         action="store_true",
         help="Only verify SHA-256 of existing local checkpoint(s) without downloading",
+    )
+    p_dl.add_argument(
+        "--allow-superseded",
+        action="store_true",
+        help=(
+            "Confirm downloading artifacts the checkpoint registry does NOT designate "
+            "(superseded pre-remediation lineage; the default-checkpoint resolver will "
+            "still refuse them). Required for finetuned/scaled/both."
+        ),
     )
     p_dl.set_defaults(func=run_models_download)
 
@@ -373,7 +389,9 @@ def run_models_check_compat(args: argparse.Namespace) -> int:
         table.add_column("Weights Inference", style="green")
         table.add_column("Engine Expectation", style="dim")
 
-        table.add_row("Residual Blocks", str(header_blocks), str(inferred_blocks), str(args.expected_blocks))
+        table.add_row(
+            "Residual Blocks", str(header_blocks), str(inferred_blocks), str(args.expected_blocks)
+        )
         table.add_row(
             "Filter Channels", str(header_filters), str(stem_filters), str(args.expected_filters)
         )
@@ -416,48 +434,150 @@ def run_models_check_compat(args: argparse.Namespace) -> int:
         return 1
 
 
-def run_models_download(args: argparse.Namespace) -> int:
-    """Download or verify pre-trained ZeroPawn neural network checkpoints with atomic write & SHA-256 validation.
+RELEASE_BASE_URL = "https://github.com/MdHussain121/zeropawn/releases/download/v0.1.0"
 
-    Supports both the fine-tuned model (strongest, recommended for play) and the scaled baseline model.
+#: Release assets published with v0.1.0. The DESIGNATED baseline (ckpt-10,
+#: models/checkpoints_baseline_20261031/best_model.pt) is deliberately NOT
+#: here — it has no release asset and no download URL may be invented for it.
+_RELEASE_ASSETS = {
+    "finetuned_best_model.pt",
+    "best_model.pt",
+}
+
+
+def _registry_entries_by_sha() -> dict[str, dict]:
+    """Map registry SHA-256 (lowercase) -> registry entry (audit S6-02).
+
+    Read live from docs/checkpoint_registry.json (repo checkout first, staged
+    package copy fallback). Returns {} when no registry is loadable — catalog
+    entries then report registry_status "unregistered" instead of crashing.
     """
-    import hashlib
-    import os
-    import urllib.error
-    import urllib.request
+    from python.model.checkpoint_registry import load_registry
 
-    VALID_SHAS = {
-        "7E326883D61BB59B9D706BCB556858F2879E713729F59ABCF046E302C8252685",  # Fine-tuned best model (val loss 1.7975)
-        "79A72EF746F4BFDA2555FE7D0EC04970BE7CCD4A39E282E16A05594ED15BC36B",  # Scaled baseline best model (val loss 3.1355)
-        "54D462823837F77C60621FB72E1A1474ECA3DC9DBB2A2969D87CED18ADA2B7DF",  # Step 42k warm-start
-        "5AC334C8DC2E36A2577473514641929EDABFDB73D9B09FF19B455C36DDC0A038",  # Tactical fine-tune
-    }
+    try:
+        registry = load_registry(REPO_ROOT)
+    except (FileNotFoundError, ValueError) as e:
+        logger.warning("Checkpoint registry unavailable for model catalog: %s", e)
+        return {}
+    by_sha: dict[str, dict] = {}
+    for entry in registry.get("checkpoints", []):
+        sha = entry.get("sha256")
+        if sha:
+            by_sha[str(sha).lower()] = entry
+    return by_sha
 
-    MODEL_CATALOG = {
+
+def _designated_entry(entries: dict[str, dict]) -> dict | None:
+    """The single designated, verified registry entry (ckpt-10 today)."""
+    for entry in entries.values():
+        if entry.get("status") == "verified" and entry.get("designated_warm_start"):
+            return entry
+    return None
+
+
+def build_model_catalog() -> dict[str, dict]:
+    """Downloadable-checkpoint catalog annotated with registry lineage (S6-02).
+
+    The historical catalog hardcoded availability notes that contradicted the
+    checkpoint registry: its two entries map to registry records that are
+    ``status: missing`` and NOT designated, while the single designated
+    baseline (ckpt-10) is a local artifact with no release asset. Every entry
+    now carries ``registry_id`` / ``registry_status`` / ``designated`` /
+    ``lineage_note`` derived from the registry at call time, and the
+    designated baseline is listed explicitly as LOCAL-ONLY.
+    """
+    entries = _registry_entries_by_sha()
+    designated = _designated_entry(entries)
+    designated_id = str(designated.get("id")) if designated else None
+
+    catalog: dict[str, dict] = {
         "finetuned": {
             "key": "finetuned",
-            "name": "Fine-Tuned Model (Strongest / Recommended)",
+            "name": "Fine-Tuned Model (v0.1.0 release asset)",
             "dest": REPO_ROOT / "models" / "checkpoints_finetune" / "best_model.pt",
             "sha256": "7E326883D61BB59B9D706BCB556858F2879E713729F59ABCF046E302C8252685",
             "val_loss": 1.7975,
             "filename": "finetuned_best_model.pt",
-            "note": "Substantially stronger in match play and tactical calculation (val loss 1.7975 vs 3.1355).",
         },
         "scaled": {
             "key": "scaled",
-            "name": "Scaled Baseline Model",
+            "name": "Scaled Baseline Model (v0.1.0 release asset)",
             "dest": REPO_ROOT / "models" / "checkpoints_scaled" / "best_model.pt",
             "sha256": "79A72EF746F4BFDA2555FE7D0EC04970BE7CCD4A39E282E16A05594ED15BC36B",
             "val_loss": 3.1355,
             "filename": "best_model.pt",
-            "note": "Supervised warm-start baseline certified for reference benchmarks.",
         },
     }
+
+    for spec in catalog.values():
+        spec["available"] = spec["filename"] in _RELEASE_ASSETS
+        entry = entries.get(spec["sha256"].lower())
+        spec["registry_id"] = str(entry.get("id")) if entry else None
+        spec["registry_status"] = str(entry.get("status")) if entry else "unregistered"
+        spec["designated"] = bool(entry and entry.get("designated_warm_start"))
+        provenance = str((entry or {}).get("provenance", "")).strip()
+        spec["lineage_note"] = (
+            "Superseded pre-remediation lineage (value-head corruption audit SLQ-01 era): "
+            f"{provenance} "
+            f"Designated successor: {designated_id or 'none designated'}. "
+            "Downloading it does NOT make it the default — the fail-closed resolver "
+            "still refuses non-designated artifacts."
+        )
+
+    if designated is not None:
+        rel_file = str(designated.get("file") or designated.get("path") or "")
+        catalog["baseline"] = {
+            "key": "baseline",
+            "name": f"Designated Baseline ({designated_id})",
+            "dest": REPO_ROOT / rel_file,
+            "sha256": str(designated.get("sha256") or "").upper(),
+            "available": False,
+            "local_artifact": True,
+            "registry_id": designated_id,
+            "registry_status": str(designated.get("status")),
+            "designated": True,
+            "lineage_note": (
+                "LOCAL artifact only — ships in the operator's model deployment "
+                f"({rel_file}). Not published as a release asset; no download URL "
+                "exists. Restore it from the deployment, or designate a verified "
+                "checkpoint in docs/checkpoint_registry.json."
+            ),
+        }
+
+    return catalog
+
+
+def run_models_download(args: argparse.Namespace) -> int:
+    """Download or verify pre-trained ZeroPawn neural network checkpoints.
+
+    Atomic write (tmp + os.replace) with SHA-256 validation; catalog entries
+    are annotated with their checkpoint-registry lineage (S6-02). Downloading
+    a superseded-lineage artifact requires ``--allow-superseded`` so a fresh
+    clone never silently restores non-designated checkpoints. The designated
+    baseline is a LOCAL artifact and is never downloadable.
+    """
+    import os
+    import urllib.error
+    import urllib.request
+
+    def sha256_of(path: Path) -> str:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            while chunk := f.read(1024 * 1024):
+                h.update(chunk)
+        return h.hexdigest().upper()
+
+    MODEL_CATALOG = build_model_catalog()
+    # Accepted checksums = every catalog entry's recorded SHA-256 (the two
+    # orphan "Step 42k warm-start" / "Tactical fine-tune" hashes of the old
+    # VALID_SHAS mapped to no catalog entry and no registry record — removed).
+    VALID_SHAS = {spec["sha256"].upper() for spec in MODEL_CATALOG.values() if spec.get("sha256")}
 
     model_choice = getattr(args, "model", "finetuned")
     verify_only = getattr(args, "verify_only", False)
     custom_output = getattr(args, "output", None)
     custom_url = getattr(args, "url", None)
+    allow_superseded = getattr(args, "allow_superseded", False)
 
     # Determine which model targets to process
     if custom_output:
@@ -474,7 +594,9 @@ def run_models_download(args: argparse.Namespace) -> int:
         targets = [(spec, spec["dest"])]
 
     console.print(
-        "\n[bold cyan]ZeroPawn Model Manager[/bold cyan] — [italic]Fine-tuned model is stronger than scaled model[/italic]"
+        "\n[bold cyan]ZeroPawn Model Manager[/bold cyan] — [italic]registry "
+        "lineage shown per entry; the designated baseline is a local artifact "
+        "and is not downloadable[/italic]"
     )
 
     all_ok = True
@@ -482,8 +604,25 @@ def run_models_download(args: argparse.Namespace) -> int:
     for spec, dest_path in targets:
         console.print(f"\n[bold bright_white]{spec['name']}[/bold bright_white]")
         console.print(f"  Target Path: [dim]{dest_path}[/dim]")
-        console.print(f"  Strength Note: [green]{spec['note']}[/green]")
+        if spec.get("local_artifact"):
+            console.print(
+                "  Availability: [bold red]LOCAL ONLY — not available for "
+                "download[/bold red] (no release asset exists)"
+            )
+        else:
+            console.print("  Availability: [green]v0.1.0 release asset[/green]")
         console.print(f"  Expected SHA-256: [cyan]{spec['sha256']}[/cyan]")
+        console.print(
+            f"  Registry: {spec.get('registry_id') or 'no registry entry'} "
+            f"[{spec.get('registry_status', 'unregistered')}, "
+            f"{'designated' if spec.get('designated') else 'NOT designated'}]"
+        )
+        console.print(f"  Lineage: [yellow]{spec['lineage_note']}[/yellow]")
+        if spec.get("val_loss") is not None:
+            console.print(
+                f"  Recorded val loss: {spec['val_loss']} (training metric; "
+                "no head-to-head strength comparison exists)"
+            )
 
         if verify_only:
             if not dest_path.is_file():
@@ -493,11 +632,7 @@ def run_models_download(args: argparse.Namespace) -> int:
                 all_ok = False
                 continue
             console.print("  Verifying SHA-256 ...")
-            h = hashlib.sha256()
-            with open(dest_path, "rb") as f:
-                while chunk := f.read(1024 * 1024):
-                    h.update(chunk)
-            digest = h.hexdigest().upper()
+            digest = sha256_of(dest_path)
             if digest in VALID_SHAS:
                 console.print(f"  [bold green]✓ Checksum Verified:[/bold green] {digest}")
             else:
@@ -506,13 +641,10 @@ def run_models_download(args: argparse.Namespace) -> int:
                 all_ok = False
             continue
 
-        # Check if already present and valid
+        # Check if already present and valid (verification of an existing
+        # artifact is not acquisition — the gate below only guards downloads)
         if dest_path.is_file():
-            h = hashlib.sha256()
-            with open(dest_path, "rb") as f:
-                while chunk := f.read(1024 * 1024):
-                    h.update(chunk)
-            digest = h.hexdigest().upper()
+            digest = sha256_of(dest_path)
             if digest in VALID_SHAS:
                 console.print(
                     f"  [bold green]✓ Checkpoint already exists and verified:[/bold green] {dest_path}"
@@ -520,10 +652,35 @@ def run_models_download(args: argparse.Namespace) -> int:
                 console.print(f"    SHA-256: {digest}")
                 continue
 
+        if spec.get("local_artifact"):
+            console.print(
+                "  [bold red]✗ Not available for download:[/bold red] the designated "
+                "baseline is a local artifact; it ships in the operator's model "
+                f"deployment ({spec['dest']}) and has no release asset. Restore it "
+                "from the deployment or pass an explicit --checkpoint."
+            )
+            all_ok = False
+            continue
+
+        superseded = not spec.get("designated") or spec.get("registry_status") != "verified"
+        if superseded and not allow_superseded:
+            console.print(
+                f"  [bold red]✗ Refusing to download superseded-lineage artifact[/bold red] "
+                f"(registry {spec.get('registry_id') or 'unregistered'}: "
+                f"status={spec.get('registry_status', 'unregistered')}, "
+                f"designated={spec.get('designated')})."
+            )
+            console.print(
+                "    The default-checkpoint resolver will not use it; a fresh clone "
+                "restoring it silently would run non-designated weights. Re-run with "
+                "[cyan]--allow-superseded[/cyan] to confirm, or restore the designated "
+                "baseline from the operator model deployment."
+            )
+            all_ok = False
+            continue
+
         # Download needed
-        default_release_url = (
-            f"https://github.com/MdHussain121/zeropawn/releases/download/v0.1.0/{spec['filename']}"
-        )
+        default_release_url = f"{RELEASE_BASE_URL}/{spec['filename']}"
         download_url = (
             (custom_url if len(targets) == 1 else None)
             or os.environ.get("ZEROPAWN_MODEL_URL")
@@ -574,6 +731,11 @@ def run_models_download(args: argparse.Namespace) -> int:
                 f"\n  [bold green]✓ Download and verification complete:[/bold green] {dest_path}"
             )
             console.print(f"    SHA-256: {digest}")
+            console.print(
+                "    [yellow]Note:[/yellow] this artifact remains non-designated in "
+                "docs/checkpoint_registry.json — the default-checkpoint resolver "
+                "still requires the designated baseline."
+            )
 
         except urllib.error.URLError as e:
             tmp_path.unlink(missing_ok=True)

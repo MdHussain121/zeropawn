@@ -136,3 +136,45 @@ disk for archaeology only.
   and `Reference - ZeroPawn Retired Experiment Branch Archive`: "8x8x19"
   plane-order phrasing — the actual tensor is `(B, 19, 8, 8)` (planes
   first), written here as "19x8x8" or "(19, 8, 8)".
+
+## 6. Native game/MCTS API contract (folded from the removed `zeropawn_cpp.pyi` stub)
+
+Audit S6-11 (2026-11-02): `python/zeropawn_cpp.pyi` was documentation-only —
+no type checker was configured, it was not shipped, and it sat beside no
+importable module. Its contract notes are preserved here; the stub is
+removed. The API signatures remain discoverable in the pybind11 bindings
+(`cpp/src/bindings.cpp`).
+
+- **En-passant FEN policy:** `ChessGame.get_fen()` records the EP square
+  after every double pawn push (classic FEN). This differs from
+  python-chess's default `en_passant="legal"`; compare FENs across the
+  boundary with `en_passant="fen"`. (Distinct from plane 16 above, which is
+  written only when an EP capture is actually legal.)
+- **Zobrist hashing:** the raw EP square is hashed even when no legal EP
+  capture exists (phantom EP). Internally consistent; do not use native
+  hashes as cross-library (polyglot-style) position identity.
+- **Repetition / draws:** `is_repetition(count)` counts *prior* occurrences
+  of the current position, so the threefold rule is `is_repetition(2)`.
+  `is_game_over()` auto-draws at threefold repetition, the 50-move clock
+  reaching 100, and insufficient material — a deliberate RL-efficiency
+  policy, stricter than python-chess's fivefold/75-move auto-draws.
+- **perft:** depth must satisfy `0 <= depth <= 32` (`perft(0) == 1`);
+  negative or excessive depths raise `ValueError`.
+- **Connect4:** `cell(r, c)` raises `ValueError` outside
+  `[0,6) x [0,7)`; `apply_action(col)` raises `ValueError` on out-of-range
+  columns, full columns, and finished games; only a single column digit
+  `"0".."6"` is decodable by `string_to_action`.
+- **MCTSConfig:** validated when `MCTS` is constructed — `c_puct >= 0`,
+  `dirichlet_alpha > 0`, `dirichlet_weight >= 0`, `fpu_reduction >= 0`,
+  `virtual_loss >= 0`, `batch_size >= 1`, `max_nodes >= 1`; violations raise
+  `ValueError`. `seed` is a uint64 (values >= 2**64 overflow).
+- **apply_action (ChessGame):** the action index must decode to a *legal*
+  move; illegal or undecodable indices raise `ValueError` and leave the
+  game state untouched.
+- **Evaluator callbacks:** receive a non-owning `Game` wrapper that is valid
+  only for the duration of the callback — never store it. Callbacks must not
+  re-enter the owning `MCTS` (search/clear/advance_root). Evaluator output is
+  validated exactly: a wrong-shaped policy or value is rejected with
+  `RuntimeError`, never truncated.
+- **Threading:** `cache_size()` / `live_node_count()` must be called from the
+  thread that owns the MCTS while no search is in flight on it.

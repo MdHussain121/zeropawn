@@ -25,6 +25,21 @@ for _b in reversed(_build_candidates):
             sys.path.remove(str(_b))
         sys.path.insert(0, str(_b))
 
+# S6-01: in an installed wheel the native extension is staged as package data
+# under python/_native/ (scripts/build_wheel.py copies it from build/cpp/ at
+# build time; the directory does not exist in a repo checkout, so this is a
+# no-op for developers). Make it importable as zeropawn_cpp and register the
+# directory for Windows dependent-DLL resolution (libwinpthread-1.dll).
+_native_candidate = Path(__file__).resolve().parent / "_native"
+if _native_candidate.is_dir():
+    if str(_native_candidate) not in sys.path:
+        sys.path.insert(0, str(_native_candidate))
+    if sys.platform == "win32":
+        try:
+            os.add_dll_directory(str(_native_candidate))
+        except OSError:
+            pass
+
 # On Windows with MinGW, ensure libwinpthread-1.dll and runtime can be found
 if sys.platform == "win32":
     _local_app = os.environ.get("LOCALAPPDATA", "")

@@ -34,6 +34,14 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
+*Erratum (audit S1-01, 2026-11-02):* the vendored `chess.hpp` is **not**
+byte-identical to upstream — it carries exactly one local functional patch
+(`Square::is_valid()` also rejecting negative squares, which the encoder's
+en-passant plane guard depends on). The vendored file's "AUTO GENERATED" banner
+is therefore not literally true. See
+`cpp/vendor/chess-library/LOCAL_PATCHES.md` for the exact hunk, the vendored
+base commit (`61e0a694`, 0.9.4), and upgrade guidance.
+
 ---
 
 ## 2. python-chess (Niklas Fiekas)

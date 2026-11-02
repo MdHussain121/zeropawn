@@ -145,11 +145,22 @@ def inspect_checkpoint(path: str | Path) -> CheckpointInfo:
 
 
 def load_registry(repo_root: str | Path = ".") -> Dict[str, Any]:
-    """Load ``docs/checkpoint_registry.json``; raise if absent."""
-    reg_path = Path(repo_root) / REGISTRY_REL_PATH
+    """Load ``docs/checkpoint_registry.json``; raise if absent.
+
+    Resolution order (audit S6-01): the repository-checkout path first —
+    byte-identical behavior for developers — then the copy staged into the
+    installed package (``python/_data/checkpoint_registry.json``, see
+    ``scripts/build_wheel.py``) so a wheel install outside a checkout can
+    still load the registry instead of dying with ``FileNotFoundError``. When
+    neither exists, the error names the canonical repository location.
+    """
+    from python.common.resource_paths import resolve_data_file
+
+    repo_reg_path = Path(repo_root) / REGISTRY_REL_PATH
+    reg_path = resolve_data_file(repo_reg_path, "_data", "checkpoint_registry.json")
     if not reg_path.is_file():
         raise FileNotFoundError(
-            f"Checkpoint registry not found at {reg_path}. Run "
+            f"Checkpoint registry not found at {repo_reg_path}. Run "
             "scripts/validate_checkpoints.py --write to create it from the "
             "current artifacts."
         )
@@ -607,7 +618,9 @@ def _entry_status_line(entry: Dict[str, Any]) -> str:
     return line
 
 
-def _default_entry_path(entry: Dict[str, Any], repo_root: Path, models_root: Optional[Path]) -> Path:
+def _default_entry_path(
+    entry: Dict[str, Any], repo_root: Path, models_root: Optional[Path]
+) -> Path:
     # Registry entries record the artifact path under ``file`` (the canonical
     # key used by verify_checkpoint_identity and the tracked registry JSON);
     # ``path`` is the legacy alias some entries carry. Read both — an entry
@@ -668,24 +681,19 @@ def resolve_default_checkpoint(
         raise DefaultCheckpointError(
             "No checkpoint registry found; cannot resolve a trustworthy default "
             f"checkpoint ({e})\n"
-            f"Registry path expected: {registry_path}\n"
-            + _recovery_hint(repo_root)
+            f"Registry path expected: {registry_path}\n" + _recovery_hint(repo_root)
         ) from e
 
     entries = list(registry.get("checkpoints", []))
     eligible = [
         e
         for e in entries
-        if e.get("status") == "verified"
-        and e.get("designated_warm_start")
-        and e.get("sha256")
+        if e.get("status") == "verified" and e.get("designated_warm_start") and e.get("sha256")
     ]
     designated_but_shapeless = [
         e
         for e in entries
-        if e.get("status") == "verified"
-        and e.get("designated_warm_start")
-        and not e.get("sha256")
+        if e.get("status") == "verified" and e.get("designated_warm_start") and not e.get("sha256")
     ]
 
     if not eligible:
@@ -700,8 +708,7 @@ def resolve_default_checkpoint(
             "No designated, verified default checkpoint is available.\n"
             f"Registry: {registry_path}\n"
             f"Registry contents:\n{_explain_registry(registry, registry_path)}"
-            f"{detail}\n"
-            + _recovery_hint(repo_root)
+            f"{detail}\n" + _recovery_hint(repo_root)
         )
 
     eligible.sort(key=lambda e: str(e.get("id", "")), reverse=True)
@@ -722,8 +729,7 @@ def resolve_default_checkpoint(
             f"the file is MISSING on disk.\n"
             f"  Expected artifact: {path}\n"
             f"  Registry entry:    {entry.get('id')} (status=verified, designated)\n"
-            f"  Registry path:     {registry_path}\n"
-            + _recovery_hint(repo_root)
+            f"  Registry path:     {registry_path}\n" + _recovery_hint(repo_root)
         )
 
     size_bytes = entry.get("size_bytes")
@@ -736,8 +742,7 @@ def resolve_default_checkpoint(
                 f"  Artifact:        {path}\n"
                 f"  Size on disk:    {actual_size}\n"
                 f"  Registry size:   {size_bytes}\n"
-                f"  Registry entry:  {entry.get('id')}\n"
-                + _recovery_hint(repo_root)
+                f"  Registry entry:  {entry.get('id')}\n" + _recovery_hint(repo_root)
             )
 
     sha256 = str(entry.get("sha256"))
@@ -750,8 +755,7 @@ def resolve_default_checkpoint(
                 f"  Artifact:        {path}\n"
                 f"  SHA-256 on disk: {actual_sha}\n"
                 f"  Registry SHA-256:{sha256}\n"
-                f"  Registry entry:  {entry.get('id')}\n"
-                + _recovery_hint(repo_root)
+                f"  Registry entry:  {entry.get('id')}\n" + _recovery_hint(repo_root)
             )
 
     resolution = DefaultCheckpointResolution(

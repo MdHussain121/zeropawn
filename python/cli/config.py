@@ -32,8 +32,16 @@ from rich.table import Table
 from python.cli.common import REPO_ROOT
 from python.cli.ui import COLOR_BORDER
 from python.common.env import get_env
+from python.common.resource_paths import resolve_data_file
 
-DEFAULT_CONFIG_FILE = REPO_ROOT / "configs" / "config.json"
+# The config file the operator maintains lives in the repository checkout.
+# S6-01: resolution goes through the shared repo-first/package-data fallback
+# (configs/config.json is not shipped today, so this is byte-identical for
+# every current context — but installed wheels now resolve consistently with
+# the registry and presets instead of pointing at site-packages).
+DEFAULT_CONFIG_FILE = resolve_data_file(
+    REPO_ROOT / "configs" / "config.json", "_data", "config.json"
+)
 
 
 def emit_config_warning(message: str) -> None:

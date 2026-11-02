@@ -1,0 +1,214 @@
+{
+  "version": 1,
+  "updated": "2026-10-31",
+  "updated_by": "checkpoint-artifact-lifecycle remediation (CKP-08 registry decision)",
+  "verification_method": "Full SHA-256 recomputed from files on disk 2026-10-29 (never copied from reports); architecture and step metadata read from checkpoint headers via python.model.checkpoint_registry.inspect_checkpoint.",
+  "authority": "models/manifest.json (reconciliation 2026-10-26) for lineage; this registry for verifiable on-disk status.",
+  "architecture_required": {
+    "num_blocks": 12,
+    "num_filters": 128,
+    "in_channels": 19,
+    "num_actions": 4672
+  },
+  "warm_start_designation": "models/checkpoints_baseline_20261031/best_model.pt (ckpt-10-supervised_baseline_20261031)",
+  "designation_note": "The 2026-10-31 remediation baseline is the only designated warm start. It is a single-epoch seed-42 run on the rebuilt, receipt-certified dataset_training with a verified value head (P(loss|loss)=0.44, WDL CE 0.85); no strength/Elo claim is attached. The two 2026-10-20 checkpoints remain DISQUALIFIED (superseded_value_head).",
+  "designation_procedure": "Edit the chosen verified entry: set designated_warm_start=true and add designation_evidence (comparison run, date, who/what approved). Then scripts/validate_checkpoints.py must pass.",
+  "checkpoints": [
+    {
+      "path": "models/checkpoints_scaled/latest_checkpoint.pt",
+      "sha256": "36e92cae05791c39ab4d5f34e5b2a4603916d8d581bc8897808531f36bf141a9",
+      "size_bytes": 103673607,
+      "status": "disqualified",
+      "role": "supervised_scaled_continuation",
+      "step": 24325,
+      "optimizer_state": "AdamW (supervised trainer; NOT resumable by the SGD RL trainer)",
+      "checkpoint_kind": "supervised full trainer state",
+      "num_blocks": 12,
+      "num_filters": 128,
+      "provenance": "Same run as manifest 'active_baseline' (identical best_val_loss); later continuation. Manifest current_verified_artifacts 2026-10-26; hash recomputed and matched 2026-10-29.",
+      "designated_warm_start": false,
+      "verified_at": "2026-10-29",
+      "id": "ckpt-01-supervised_scaled_continuation",
+      "file": "models/checkpoints_scaled/latest_checkpoint.pt",
+      "disqualified_at": "2026-10-31",
+      "disqualification": {
+        "reason": "superseded_value_head",
+        "finding": "SLQ-01 (Critical, A-02 supervised-learning audit)",
+        "detail": "Value head trained on corrupted value targets (masked rows decoded to a non-loss class by never-committed 2026-10-20 run-time code). Never valid as a value prior (MCTS init or RL warm start); policy-head measurements from these artifacts remain documented but no strength claim is attached.",
+        "evidence": "A-02 supervised-learning audit (audit/supervised-learning-quality-20261030 @ 4d7fe4f), remediated 2026-10-31 on fix/supervised-learning-remediation-20261031. Forensic chain: (1) scaled checkpoint's AdamW state carries step=24,325 with non-zero first/second moments for all 7 value-head tensors while the current dataset train split is 100% masked (255) and current code yields exactly zero value gradient on those bytes; (2) finetune checkpoint carries optimizer state for exactly all except the 7 value tensors, and its value weights are bit-identical to the scaled checkpoint's; (3) held-out probes: P(predict loss)=0.0000, per-class CE on loss rows = 18.1, WDL CE 6.8-7.0 vs uniform 1.099. Both value heads were trained on corrupted targets produced by the never-committed 2026-10-20 run-time code.",
+        "successor": "New baseline to be produced by the 2026-10-31 remediation: rebuilt dataset_training (schema-2, genuine WDL labels, receipts) + seeded controlled retraining. Files on disk are preserved unmodified for archaeology."
+      },
+      "prior_status": "verified"
+    },
+    {
+      "path": "models/checkpoints_finetune/latest_checkpoint.pt",
+      "sha256": "7e7fd868554867368d0e47d3d68d1b9a683edb11cc101c40416716728bea09ef",
+      "size_bytes": 101532896,
+      "status": "disqualified",
+      "role": "supervised_finetune_continuation",
+      "step": 6000,
+      "optimizer_state": "AdamW (supervised trainer; NOT resumable by the SGD RL trainer)",
+      "checkpoint_kind": "supervised full trainer state",
+      "num_blocks": 12,
+      "num_filters": 128,
+      "provenance": "Same run as manifest 'active_finetuned' (identical best_val_loss); later save. Manifest current_verified_artifacts 2026-10-26; hash recomputed and matched 2026-10-29.",
+      "designated_warm_start": false,
+      "verified_at": "2026-10-29",
+      "id": "ckpt-02-supervised_finetune_continuation",
+      "file": "models/checkpoints_finetune/latest_checkpoint.pt",
+      "disqualified_at": "2026-10-31",
+      "disqualification": {
+        "reason": "superseded_value_head",
+        "finding": "SLQ-01 (Critical, A-02 supervised-learning audit)",
+        "detail": "Value head trained on corrupted value targets (masked rows decoded to a non-loss class by never-committed 2026-10-20 run-time code). Never valid as a value prior (MCTS init or RL warm start); policy-head measurements from these artifacts remain documented but no strength claim is attached.",
+        "evidence": "A-02 supervised-learning audit (audit/supervised-learning-quality-20261030 @ 4d7fe4f), remediated 2026-10-31 on fix/supervised-learning-remediation-20261031. Forensic chain: (1) scaled checkpoint's AdamW state carries step=24,325 with non-zero first/second moments for all 7 value-head tensors while the current dataset train split is 100% masked (255) and current code yields exactly zero value gradient on those bytes; (2) finetune checkpoint carries optimizer state for exactly all except the 7 value tensors, and its value weights are bit-identical to the scaled checkpoint's; (3) held-out probes: P(predict loss)=0.0000, per-class CE on loss rows = 18.1, WDL CE 6.8-7.0 vs uniform 1.099. Both value heads were trained on corrupted targets produced by the never-committed 2026-10-20 run-time code.",
+        "successor": "New baseline to be produced by the 2026-10-31 remediation: rebuilt dataset_training (schema-2, genuine WDL labels, receipts) + seeded controlled retraining. Files on disk are preserved unmodified for archaeology."
+      },
+      "prior_status": "verified"
+    },
+    {
+      "path": "models/checkpoints_rl/phase4_ckpt_v5_step997.pt",
+      "sha256": "d8223ca150ee96c626e82bcea91f8f3fa37ea9b0502a2a3e0d2dd0c803dde547",
+      "size_bytes": 69124715,
+      "status": "verified",
+      "role": "rl_training_checkpoint",
+      "step": 997,
+      "model_version": 5,
+      "optimizer_state": "SGD momentum 0.9 (RL trainer; resumable)",
+      "checkpoint_kind": "rl full trainer state",
+      "num_blocks": 12,
+      "num_filters": 128,
+      "provenance": "Healthy RL checkpoint from the 2026-10-22/23 session, retained as 'retained_resumable' by the 2026-10-27 quarantine action (QUARANTINE.json). Hash recomputed 2026-10-29.",
+      "designated_warm_start": false,
+      "verified_at": "2026-10-29",
+      "id": "ckpt-03-rl_training_checkpoint",
+      "file": "models/checkpoints_rl/phase4_ckpt_v5_step997.pt"
+    },
+    {
+      "path": "models/checkpoints_rl/phase4_final_checkpoint.pt",
+      "sha256": null,
+      "status": "missing",
+      "role": "rl_training_checkpoint_former",
+      "provenance": "Listed in manifest current_verified_artifacts (sha256 2f4f8799d0d675ffc699416a874afb9d2f7a2afe55cd726c9ff14d41ad0ed7c6, step 6000) but the file no longer exists at this path: it was moved to models/checkpoints_rl/quarantined/ on 2026-10-27 (see the quarantined entry). A missing artifact is never presented as recovered.",
+      "designated_warm_start": false,
+      "id": "ckpt-04-rl_training_checkpoint_former",
+      "file": "models/checkpoints_rl/phase4_final_checkpoint.pt"
+    },
+    {
+      "path": "models/checkpoints_rl/quarantined/phase4_final_checkpoint.pt",
+      "sha256": "2f4f8799d0d675ffc699416a874afb9d2f7a2afe55cd726c9ff14d41ad0ed7c6",
+      "size_bytes": 101535578,
+      "status": "quarantined",
+      "role": "contaminated_rl_snapshot",
+      "reason": "Optimizer state is supervised AdamW saved by a failed RL run's exception cleanup; not resumable by the SGD RL trainer (phase4-rl-momentum-keyerror-root-cause). Quarantined 2026-10-27 per models/checkpoints_rl/quarantined/QUARANTINE.json; hash recomputed and matched 2026-10-29.",
+      "designated_warm_start": false,
+      "recovery_path": "Explicit, documented recovery only (e.g. weights-only copy re-registered as a new verified entry); quarantined artifacts are never production warm starts.",
+      "id": "ckpt-05-contaminated_rl_snapshot",
+      "file": "models/checkpoints_rl/quarantined/phase4_final_checkpoint.pt"
+    },
+    {
+      "path": "models/checkpoints_rl/quarantined/latest_checkpoint.pt",
+      "sha256": "2f4f8799d0d675ffc699416a874afb9d2f7a2afe55cd726c9ff14d41ad0ed7c6",
+      "size_bytes": 101535578,
+      "status": "quarantined",
+      "role": "contaminated_rl_snapshot",
+      "reason": "Byte-identical copy of the contaminated phase4_final_checkpoint.pt; quarantined 2026-10-27.",
+      "designated_warm_start": false,
+      "id": "ckpt-06-contaminated_rl_snapshot",
+      "file": "models/checkpoints_rl/quarantined/latest_checkpoint.pt"
+    },
+    {
+      "path": "models/checkpoints_rl/quarantined/phase4_ckpt_v1_step6000.pt",
+      "sha256": "5c3ecc9e8c8aef1b3c7d7a2096384a2351c29db068e6b24a4f1279981302d61e",
+      "size_bytes": 101535578,
+      "status": "quarantined",
+      "role": "contaminated_rl_snapshot",
+      "reason": "Supervised-AdamW optimizer state from the failed RL run; quarantined 2026-10-27; hash recomputed and matched 2026-10-29.",
+      "designated_warm_start": false,
+      "id": "ckpt-07-contaminated_rl_snapshot",
+      "file": "models/checkpoints_rl/quarantined/phase4_ckpt_v1_step6000.pt"
+    },
+    {
+      "path": "models/checkpoints_scaled/best_model.pt",
+      "sha256": "79a72ef746f4bfda2555fe7d0ec04970be7ccd4a39e282e16a05594ed15bc36b",
+      "status": "missing",
+      "role": "historical_certified_active_baseline",
+      "provenance": "Historical claim 2026-10-22 (CERTIFIED_ACTIVE_BASELINE, step 19460). File does not exist on disk (SHA-256 attempt 2026-10-26 and again 2026-10-29); manifest demoted the claim 2026-10-26. Never reconstructed; never a warm start.",
+      "designated_warm_start": false,
+      "id": "ckpt-08-historical_certified_active_baseline",
+      "file": "models/checkpoints_scaled/best_model.pt"
+    },
+    {
+      "path": "models/checkpoints_finetune/best_model.pt",
+      "sha256": "7e326883d61bb59b9d706bcb556858f2879e713729f59abcf046e302c8252685",
+      "status": "missing",
+      "role": "historical_certified_strongest_model",
+      "provenance": "Historical claim 2026-10-22 (CERTIFIED_STRONGEST_MODEL, step 5916). File does not exist on disk (verified 2026-10-26 and 2026-10-29); manifest demoted the claim 2026-10-26. Never reconstructed; never a warm start.",
+      "designated_warm_start": false,
+      "id": "ckpt-09-historical_certified_strongest_model",
+      "file": "models/checkpoints_finetune/best_model.pt"
+    },
+    {
+      "id": "ckpt-10-supervised_baseline_20261031",
+      "path": "models/checkpoints_baseline_20261031/best_model.pt",
+      "file": "models/checkpoints_baseline_20261031/best_model.pt",
+      "sha256": "01cead16a445f5a228e78ec85da6f1e68bcf1e6de15c1f3219edda3b544b74ef",
+      "size_bytes": 103672539,
+      "status": "verified",
+      "role": "supervised_baseline",
+      "step": 4802,
+      "epoch": 1,
+      "best_val_loss": 3.295785920309608,
+      "optimizer_state": "AdamW (supervised trainer; NOT resumable by the SGD RL trainer)",
+      "checkpoint_kind": "supervised full trainer state",
+      "num_blocks": 12,
+      "num_filters": 128,
+      "designated_warm_start": true,
+      "verified_at": "2026-10-31",
+      "provenance": {
+        "run_id": "20261031-125838-b8868fd6",
+        "git_commit": "101bff6c73e5045ff56a4bc0505e0b24a41fcc03",
+        "seed": 42,
+        "dataset_build_dir": "data/dataset_training (2026-10-31 rebuild from filtered.pgn sha256 2d28cfa0...)",
+        "dataset_receipt_id": "sha256:156d528959dd463c",
+        "training": "1 epoch, 4801 optimizer steps, batch 512 (32x16), AdamW lr 2e-4 -> cosine, warmup 500; duration 1858 s; telemetry: models/checkpoints_baseline_20261031/telemetry.jsonl (4802 step records)",
+        "dataset_lineage_note_20261103": "The bound dataset (generation 2, receipt sha256:156d528959dd463c, 2,458,622/36,767/19,374 from filtered.pgn) was quarantined 2026-11-01 as data/QUARANTINE_dataset_training_unfiltered_bot_source_20261031 (DI-08). The current live data/dataset_training is generation 3 (2026-11-01 rebuild from filtered_elite_human_2500.pgn, BOT-purged, 384,587/6,120/3,266); no checkpoint has been trained on it. ckpt-10 remains a generation-2 artifact. Authoritative record: docs/dataset_lineage.md; disposition addendum: models/checkpoints_baseline_20261031/run_manifest.addendum_20261103.json."
+      },
+      "designation_evidence": {
+        "procedure": "remediation roadmap P0-2 (audit/supervised-learning-quality-20261030) acceptance criteria, executed 2026-10-31",
+        "dataset_acceptance": "certified games_wdl receipt; train masked_fraction 0.0000; 0 cross-split encoded states (exhaustive train/val, train/test, val/test); build record binds source sha256 2d28cfa0...",
+        "value_head_health": "held-out WDL CE 0.851 (game val) / 0.730 (independent test split) vs uniform 1.099; P(predict loss | true loss) = 0.442 (val) / 0.515 (test) vs 0.0000 on both disqualified predecessors; Brier 0.51/0.43",
+        "value_grad_flow": "telemetry value_grad_norm 0.24-0.48 throughout the run; window WDL-valid samples ~468/512",
+        "limits": "Single-epoch run: policy top-1 22.2% game-val / 23.2% game-test / 26.6% tactics-val \u2014 weaker than the disqualified 5-epoch predecessors' policy heads. This designation certifies PROVENANCE and VALUE-HEAD HEALTH ONLY. No strength, Elo, or superiority claim is attached (SLQ-04/SLQ-20 discipline)."
+      }
+    },
+    {
+      "id": "ckpt-11-unattributed_warm_start_weights",
+      "file": "runs/phase4_rl/warm_start_ckpts/phase4_weights_only.pt",
+      "status": "disqualified",
+      "role": "unattributed_weights_only_container",
+      "step": null,
+      "sha256": "56cee5143e543e2a4a98ee3561feacc09004f903625fd26855f8d9dbbaab6e73",
+      "num_params": 8631454,
+      "checkpoint_kind": "weights_only_container",
+      "no_in_repo_producer": true,
+      "registered_at": "2026-10-31",
+      "registered_by": "checkpoint-artifact-lifecycle remediation (CKP-08)",
+      "disqualification": {
+        "reason": "unattributed_weights_only_container",
+        "detail": "Found by the 2026-10-30/31 checkpoint & artifact lifecycle audit (finding CKP-08): a weights-only container ({model, num_blocks 12, num_filters 128, checkpoint_format 1}) written 2026-10-29 01:07 with no in-repo producer and no run identity, whose stem-conv checksum is identical to the quarantined AdamW snapshots. It cannot be reproduced, cannot be attributed to a run, and carries no optimizer/scheduler state. It is weights-only by construction and therefore can never be a resume point; it must not become a warm start either, because its lineage is the same one this project disqualified (value-head contamination) and its producing run is unknown. Copying or renaming it does not change this: registry matching is by path and the trainer/tools refuse weights-only containers on resume paths (is_resumable_candidate)."
+      },
+      "designated_warm_start": false
+    }
+  ],
+  "excluded_from_registry": [
+    {
+      "path": "models/checkpoints_rl/live_weights.pt",
+      "why": "Runtime learner-to-actor sync artifact (weights-only, overwritten on every push_freq interval). Not a checkpoint; its hash is meaningful only at an instant. HISTORY: hash fda3d967... (step 6001) observed 2026-10-29; the file at this path was replaced 2026-10-31 23:46 by the contaminated test-scale payload 7909aada1996b537... (ChessNet 2x32, 5,096,170 params, step=1), which would hard-block the next RL campaign's first weight push (audit S3-01). REMEDIATED 2026-11-03 (fix/post-merge-production-readiness-20261103): the contaminated artifact was quarantined byte-identical to models/checkpoints_rl/quarantined/live_weights_contaminated_2x32_20261031.pt (see that directory's QUARANTINE.json); the active sync path is now free, so the next campaign's first push_weights creates a fresh 12x128 live_weights.pt. The quarantine directory is excluded from checkpoint discovery."
+    },
+    {
+      "path": "models/checkpoints_opening_pilot/",
+      "why": "Empty directory; no artifacts to register."
+    }
+  ]
+}
