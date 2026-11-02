@@ -1,10 +1,14 @@
-"""Universal Configuration Management, Schema Registry, and 4-Tier Resolution Engine for ZeroPawn.
+"""Universal Configuration Management, Schema Registry, and 5-Tier Resolution Engine for ZeroPawn.
 
-Precedence Rules:
-  1. Explicit CLI arguments (passed via command-line flags)
-  2. Selected preset (from configs/presets.json or built-in presets)
-  3. Configuration file values (configs/config.json or custom --config file)
-  4. Built-in defaults
+Precedence Rules (highest wins):
+  1. Explicit CLI arguments (passed via command-line flags) — ALWAYS win over
+     every lower tier, for every command (an explicitly-passed flag is never
+     demoted by a field's applicable_workflows list; that list only governs
+     whether the resolved-config display shows the row)
+  2. Environment variables (ZEROPAWN_* with legacy CHESSRL_* fallback)
+  3. Selected preset (from configs/presets.json or built-in presets)
+  4. Configuration file values (configs/config.json or custom --config file)
+  5. Built-in defaults
 
 Every configuration field records its type, allowed values, description,
 applicable workflows, runtime destination, and tracks provenance.
@@ -16,6 +20,7 @@ import argparse
 import json
 import os
 import shutil
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -29,6 +34,17 @@ from python.cli.ui import COLOR_BORDER
 from python.common.env import get_env
 
 DEFAULT_CONFIG_FILE = REPO_ROOT / "configs" / "config.json"
+
+
+def emit_config_warning(message: str) -> None:
+    """Emit a loud, plain-text configuration warning on stderr.
+
+    stderr (not the Rich console on stdout) so the warning stays visible even
+    when stdout is consumed by protocol/JSON output (CFG-01/CFG-02).  All
+    configuration diagnostics are non-fatal by design: operators must always
+    be able to run their command.
+    """
+    print(f"WARNING: {message}", file=sys.stderr)
 
 
 @dataclass
@@ -152,27 +168,13 @@ CONFIG_REGISTRY: Dict[str, ConfigField] = {
         cli_flags=["--infer-device"],
         runtime_dest="InferenceServer.device",
     ),
-    "system.precision": ConfigField(
-        key="system.precision",
-        alias="precision",
-        type_name="choice",
-        default="bfloat16",
-        choices=["bfloat16", "float32"],
-        description="Inference and training numeric precision (bfloat16 requires Ampere+ CUDA)",
-        applicable_workflows=["train", "supervised", "bench", "eval"],
-        cli_flags=["--precision"],
-        runtime_dest="InferenceServer.use_bfloat16 / RLTrainer.use_bfloat16",
-    ),
-    "system.channels_last": ConfigField(
-        key="system.channels_last",
-        alias="channels_last",
-        type_name="bool",
-        default=True,
-        description="Enable PyTorch channels-last memory format for Tensor Core optimization",
-        applicable_workflows=["train", "bench", "eval"],
-        cli_flags=["--channels-last", "--no-channels-last"],
-        runtime_dest="InferenceServer.channels_last",
-    ),
+    # NOTE (S3-03 remediation): the previously declared fields system.precision
+    # and system.channels_last were removed — they were consumed nowhere (no
+    # parser flag, no args consumer) and setting them was a silent no-op.
+    # Their effective behavior is hardcoded: bf16 autocast iff device=="cuda"
+    # at scripts/run_phase4_rl.py:831,928 (and every eval/UCI/search path),
+    # channels_last applied on CUDA in eval_callbacks/commands_search and
+    # defaulted True inside InferenceServer.
     "system.seed": ConfigField(
         key="system.seed",
         alias="seed",
@@ -327,18 +329,11 @@ CONFIG_REGISTRY: Dict[str, ConfigField] = {
         cli_flags=["--eval-interval-sec"],
         runtime_dest="Phase4Orchestrator.eval_interval_sec",
     ),
-    "training.push_freq": ConfigField(
-        key="training.push_freq",
-        alias="push_freq",
-        type_name="int",
-        default=200,
-        min_val=1,
-        max_val=10000,
-        description="Number of training steps between model weight pushes to self-play inference",
-        applicable_workflows=["train"],
-        cli_flags=["--push-freq"],
-        runtime_dest="RLTrainer.push_freq",
-    ),
+    # NOTE (S3-03 remediation): the previously declared field
+    # training.push_freq was removed — it was consumed nowhere (no parser
+    # flag, no args consumer).  Its effective value is hardcoded as the
+    # RLTrainer.push_freq constructor default (200) at
+    # python/train/train_rl.py:272 and scripts/bench_selfplay.py:357.
     "training.keep_checkpoints": ConfigField(
         key="training.keep_checkpoints",
         alias="keep_checkpoints",
@@ -498,54 +493,18 @@ CONFIG_REGISTRY: Dict[str, ConfigField] = {
         cli_flags=["--c-puct"],
         runtime_dest="zeropawn_cpp.MCTSConfig.c_puct",
     ),
-    "mcts.dirichlet_alpha": ConfigField(
-        key="mcts.dirichlet_alpha",
-        alias="dirichlet_alpha",
-        type_name="float",
-        default=0.3,
-        min_val=0.01,
-        max_val=2.0,
-        description="Dirichlet noise concentration parameter for root move exploration",
-        applicable_workflows=["train"],
-        cli_flags=["--dirichlet-alpha"],
-        runtime_dest="zeropawn_cpp.MCTSConfig.dirichlet_alpha",
-    ),
-    "mcts.dirichlet_weight": ConfigField(
-        key="mcts.dirichlet_weight",
-        alias="dirichlet_weight",
-        type_name="float",
-        default=0.25,
-        min_val=0.0,
-        max_val=1.0,
-        description="Dirichlet noise mixture fraction applied to root policy",
-        applicable_workflows=["train"],
-        cli_flags=["--dirichlet-weight"],
-        runtime_dest="zeropawn_cpp.MCTSConfig.dirichlet_weight",
-    ),
-    "mcts.fpu_reduction": ConfigField(
-        key="mcts.fpu_reduction",
-        alias="fpu_reduction",
-        type_name="float",
-        default=0.2,
-        min_val=0.0,
-        max_val=2.0,
-        description="First Play Urgency (FPU) reduction below parent Q value for unvisited moves",
-        applicable_workflows=["train", "match", "uci"],
-        cli_flags=["--fpu-reduction"],
-        runtime_dest="zeropawn_cpp.MCTSConfig.fpu_reduction",
-    ),
-    "mcts.virtual_loss": ConfigField(
-        key="mcts.virtual_loss",
-        alias="virtual_loss",
-        type_name="int",
-        default=1,
-        min_val=0,
-        max_val=10,
-        description="Virtual loss count applied during parallel search descent",
-        applicable_workflows=["train", "match", "uci"],
-        cli_flags=["--virtual-loss"],
-        runtime_dest="zeropawn_cpp.MCTSConfig.virtual_loss",
-    ),
+    # NOTE (S3-03 remediation): the previously declared fields
+    # mcts.dirichlet_alpha, mcts.dirichlet_weight, mcts.virtual_loss and
+    # mcts.fpu_reduction were removed — they were consumed nowhere (no parser
+    # flag, no args consumer) and setting them was a silent no-op.  Their
+    # effective values are hardcoded at the call sites that build MCTSConfig:
+    #   dirichlet_alpha 0.3 / dirichlet_weight 0.25 ->
+    #       python/selfplay/worker.py:665-666,1180-1181 (constructor defaults)
+    #   virtual_loss 1 -> python/cli/commands_search.py:150 and
+    #       python/cli/commands_match.py:894
+    #   fpu_reduction 0.2 -> python/cli/commands_search.py:149 and
+    #       python/eval/match_runner.py:515 (plus UCI FPU via setoption only,
+    #       python/uci/uci_engine.py:682-684)
     "mcts.search_mode": ConfigField(
         key="mcts.search_mode",
         alias="search_mode",
@@ -588,7 +547,7 @@ CONFIG_REGISTRY: Dict[str, ConfigField] = {
         description="Total games played in match evaluations (paired across openings)",
         applicable_workflows=["match", "eval"],
         cli_flags=["--games", "-n"],
-        runtime_dest="MatchRunner.num_games",
+        runtime_dest="commands_match: args.games//2 -> MatchRunner.run_match(num_openings=...)",
     ),
     "eval.mcts_sims": ConfigField(
         key="eval.mcts_sims",
@@ -888,10 +847,22 @@ class ResolvedConfiguration:
 # ── Configuration File I/O ──
 
 
-def load_config_file(config_path: Optional[Union[str, Path]] = None) -> Dict[str, Any]:
-    """Load JSON configuration file or return empty dict if not found."""
+def load_config_file(
+    config_path: Optional[Union[str, Path]] = None, warn_missing: bool = False
+) -> Dict[str, Any]:
+    """Load JSON configuration file or return empty dict if not found.
+
+    A missing file is normal (the default configs/config.json need not exist),
+    so it stays silent unless ``warn_missing`` is set.  A file that exists but
+    cannot be read or parsed is ALWAYS reported loudly on stderr (CFG-02) and
+    treated as empty — never fatal.
+    """
     p = Path(config_path) if config_path else DEFAULT_CONFIG_FILE
     if not p.is_file():
+        if warn_missing:
+            emit_config_warning(
+                f"Configuration file not found: {p} — continuing with built-in defaults."
+            )
         return {}
     try:
         with open(p, "r", encoding="utf-8") as f:
@@ -901,8 +872,28 @@ def load_config_file(config_path: Optional[Union[str, Path]] = None) -> Dict[str
                 if isinstance(data, dict) and "settings" in data
                 else (data if isinstance(data, dict) else {})
             )
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError) as e:
+        emit_config_warning(
+            f"Configuration file {p} could not be read ({e.__class__.__name__}: {e}) — "
+            f"ignoring it and continuing with lower-precedence tiers."
+        )
         return {}
+
+
+def _coerce_tier_value(cf: ConfigField, raw: Any, origin: str) -> Any:
+    """Validate and coerce a non-CLI tier value (env / config file / preset).
+
+    On validation failure the field's default is returned and a loud warning
+    naming the field is emitted on stderr (CFG-01); never fatal.
+    """
+    is_valid, err = cf.validate(raw)
+    if not is_valid:
+        emit_config_warning(
+            f"Ignoring invalid {origin} value for '{cf.key}': {raw!r} ({err}) — "
+            f"falling back to the field default {cf.default!r}."
+        )
+        return cf.default
+    return cf.coerce(raw)
 
 
 def save_config_file(
@@ -1078,21 +1069,21 @@ def resolve_configuration(
 
         # Check Tier 4: Config file
         if cf.key in file_settings:
-            effective_val = cf.coerce(file_settings[cf.key])
+            effective_val = _coerce_tier_value(cf, file_settings[cf.key], "config-file")
             source = "config_file"
             is_override = True
         elif cf.alias in file_settings:
-            effective_val = cf.coerce(file_settings[cf.alias])
+            effective_val = _coerce_tier_value(cf, file_settings[cf.alias], "config-file")
             source = "config_file"
             is_override = True
 
         # Check Tier 3: Preset parameter
         if cf.alias in preset_params:
-            effective_val = cf.coerce(preset_params[cf.alias])
+            effective_val = _coerce_tier_value(cf, preset_params[cf.alias], "preset")
             source = "preset"
             is_override = True
         elif cf.key in preset_params:
-            effective_val = cf.coerce(preset_params[cf.key])
+            effective_val = _coerce_tier_value(cf, preset_params[cf.key], "preset")
             source = "preset"
             is_override = True
 
@@ -1104,12 +1095,26 @@ def resolve_configuration(
         for env_name in env_names:
             env_val = get_env(env_name)
             if env_val is not None:
-                effective_val = cf.coerce(env_val)
+                effective_val = _coerce_tier_value(cf, env_val, f"environment variable {env_name}")
                 source = "env"
                 is_override = True
                 break
 
         # Check Tier 1: Explicit CLI arguments
+        #
+        # S5-01: an explicitly-passed CLI flag ALWAYS wins over the env /
+        # preset / config-file tiers, for every command.  A field's
+        # applicable_workflows list must never demote an explicit CLI value
+        # below those tiers (that demotion silently let env/file values
+        # overwrite the parsed argument during main.py's propagation); the
+        # list only governs whether the resolved-config display shows the row
+        # (see ResolvedConfiguration.summary_table).
+        #
+        # Detection is token-based on the raw argv: any ``--flag`` or
+        # ``--flag=value`` token (aliases, short forms, and the derived
+        # --alias / --key dash forms are all recognized).  Known residual
+        # limitation: argparse prefix abbreviations (e.g. ``--dev`` for
+        # ``--device``) are not detected and keep the historical behavior.
         if explicit_flags:
             matched = False
             for flag in cf.cli_flags:
@@ -1122,14 +1127,6 @@ def resolve_configuration(
                 if dash_alias in explicit_flags or dash_key in explicit_flags:
                     matched = True
 
-            if (
-                matched
-                and command_name
-                and cf.applicable_workflows
-                and command_name not in cf.applicable_workflows
-            ):
-                matched = False
-
             if matched:
                 for flag_key in [cf.alias, cf.key] + [
                     f.lstrip("-").replace("-", "_") for f in cf.cli_flags
@@ -1140,23 +1137,17 @@ def resolve_configuration(
                         is_override = True
                         break
         elif not is_cli_namespace and cli_dict:
-            # Explicit dictionary passed directly (e.g. in tests)
-            matched = True
-            if (
-                command_name
-                and cf.applicable_workflows
-                and command_name not in cf.applicable_workflows
-            ):
-                matched = False
-            if matched:
-                for flag_key in [cf.alias, cf.key] + [
-                    f.lstrip("-").replace("-", "_") for f in cf.cli_flags
-                ]:
-                    if flag_key in cli_dict and cli_dict[flag_key] is not None:
-                        effective_val = cf.coerce(cli_dict[flag_key])
-                        source = "cli"
-                        is_override = True
-                        break
+            # Explicit dictionary passed directly (e.g. in tests).  Every
+            # non-None entry is by construction an explicit value, so the same
+            # S5-01 rule applies: no applicable_workflows demotion.
+            for flag_key in [cf.alias, cf.key] + [
+                f.lstrip("-").replace("-", "_") for f in cf.cli_flags
+            ]:
+                if flag_key in cli_dict and cli_dict[flag_key] is not None:
+                    effective_val = cf.coerce(cli_dict[flag_key])
+                    source = "cli"
+                    is_override = True
+                    break
 
         records[canon_key] = ProvenanceRecord(
             key=canon_key,

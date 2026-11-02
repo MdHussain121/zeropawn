@@ -384,8 +384,15 @@ def execute_operation_from_interactive(
                     else:
                         tokens.extend([arg_def.flag, str(val)])
 
-    # Target subparser inspection for intelligent checkpoint appending
+    # Target subparser inspection for intelligent checkpoint appending (S5-04):
+    # the injection consults the real parser (via the operations/parser
+    # registry helper) so the model lands on the command's ACTUAL model flag —
+    # including `--checkpoint-path` (bench selfplay) — and the user is told
+    # when the selection cannot apply at all (test soak/guardrails, bench
+    # pipelined) instead of it being silently dropped.
     if model_path and op.requires_model != "none":
+        from python.cli.combinations import POSITIONAL_MODEL, find_op_model_target
+
         curr: argparse.ArgumentParser = parser
         for tok in tokens:
             subaction = next(
@@ -404,14 +411,27 @@ def execute_operation_from_interactive(
             elif action.dest != "help":
                 positional_dests.append(action.dest)
 
-        if "--checkpoint" in option_strings and "--checkpoint" not in tokens:
+        model_target = find_op_model_target(op)
+        if model_target == "--checkpoint" and "--checkpoint" not in tokens:
             tokens.extend(["--checkpoint", str(model_path)])
-        elif any(dest in ("checkpoint", "model_path", "model") for dest in positional_dests):
+        elif model_target == "--checkpoint-path" and "--checkpoint-path" not in tokens:
+            tokens.extend(["--checkpoint-path", str(model_path)])
+        elif model_target == POSITIONAL_MODEL and any(
+            dest in ("checkpoint", "model_path", "model") for dest in positional_dests
+        ):
             if not any(str(model_path) in t or ".pt" in t for t in tokens):
                 tokens.append(str(model_path))
-        elif "--resume" in option_strings and "--resume" not in tokens:
+        elif model_target == "--resume" and "--resume" not in tokens:
             tokens.extend(["--resume", str(model_path)])
-        # Otherwise: do not inject --checkpoint
+        else:
+            # No model flag on the target command: the selection genuinely
+            # cannot apply (e.g. `test soak`, `test guardrails`, `bench
+            # pipelined`).  Say so loudly instead of silently discarding it.
+            console.print(
+                f"[yellow]Note:[/] the selected model [cyan]{model_path.name}[/cyan] cannot be "
+                f"applied to '{op.id}' — this command exposes no model-checkpoint flag and will "
+                f"use its own default model resolution."
+            )
 
     console.print(f"[dim]Executing: zeropawn {' '.join(tokens)}[/dim]")
 
@@ -447,20 +467,17 @@ def execute_operation_from_interactive(
 
 def launch_preset_quick(preset_id: str) -> int:
     """Path A: Quick Run of a preset."""
+    from python.cli.presets import preset_launch_tokens
+
     p = get_preset_by_id(preset_id)
     if not p:
         console.print(f"[bold red]Preset '{preset_id}' not found.[/bold red]")
         return 1
 
     parser = build_parser()
-    tokens = [p["operation"]]
-    subcmd = p.get("subcommand")
-    args = list(p.get("args", []))
-    if subcmd:
-        tokens.append(subcmd)
-        if args and args[0] == subcmd:
-            args = args[1:]
-    tokens.extend(args)
+    # Single-source token builder (S5-03): identical to the tokens validated
+    # at save time and to the `presets run` path.
+    tokens = preset_launch_tokens(p)
 
     console.print(
         Panel(
@@ -594,7 +611,14 @@ def run_operation_selection_flow(op: OperationDef, active_model: Optional[Path])
                         elif val is not None:
                             cmd_tokens.extend([a.flag, str(val)])
             if active_model and op.requires_model != "none":
-                cmd_tokens.extend(["--checkpoint", str(active_model)])
+                from python.cli.combinations import POSITIONAL_MODEL, find_op_model_target
+
+                model_target = find_op_model_target(op)
+                if model_target and model_target != POSITIONAL_MODEL:
+                    cmd_tokens.extend([model_target, str(active_model)])
+                elif model_target == POSITIONAL_MODEL:
+                    cmd_tokens.append(str(active_model))
+                # else: command has no model flag; preview honestly omits it
 
             preview_str = f"zeropawn {' '.join(shlex.quote(t) for t in cmd_tokens)}"
             ok, err = SafeParserValidator.validate_tokens(cmd_tokens)
@@ -890,6 +914,18 @@ def main(argv: Optional[List[str]] = None) -> int:
             from python.cli.presets import get_preset_by_id
 
             preset_dict = get_preset_by_id(preset_id)
+
+        # CFG-02: an explicitly-passed --config file that does not exist is
+        # reported loudly (stderr) instead of being silently ignored.  The
+        # run stays non-fatal; lower tiers fill in.
+        explicit_config = getattr(args, "config", None)
+        if explicit_config and not Path(explicit_config).is_file():
+            from python.cli.config import emit_config_warning
+
+            emit_config_warning(
+                f"Configuration file not found: {explicit_config} — continuing with "
+                f"built-in defaults."
+            )
 
         resolved = resolve_configuration(
             command_name=getattr(args, "command", "") or (argv[0] if argv else ""),

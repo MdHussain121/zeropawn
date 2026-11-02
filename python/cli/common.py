@@ -106,6 +106,33 @@ def get_repo_root() -> Path:
 
 REPO_ROOT = get_repo_root()
 
+# The single canonical list of checkpoint directories scanned for LISTING
+# purposes (S3-05: previously two divergent scanners existed —
+# common.get_available_checkpoints knew 5 dirs, models.discover_checkpoints
+# knew 7).  Both scanners derive their absolute directories from these
+# REPO_ROOT-relative names at CALL time (so a patched REPO_ROOT — tests,
+# embedded runs — is honored); each keeps its own metadata shape and sort
+# order.  Ordered highest-priority tree first, the ``models`` root last so
+# its loose *.pt files are still found.
+# NOTE: listing only — the DEFAULT checkpoint is resolved solely through the
+# fail-closed registry resolver (get_default_checkpoint_path), never by
+# "whatever a scan ranks first".
+CHECKPOINT_SCAN_DIR_NAMES: Tuple[str, ...] = (
+    "models/checkpoints_baseline_20261031",
+    "models/checkpoints_scaled",
+    "models/checkpoints_supervised",
+    "models/checkpoints_rl",
+    "models/checkpoints_finetune",
+    "models/checkpoints",
+    "models",
+)
+
+
+def checkpoint_scan_dirs(repo_root: Optional[Path] = None) -> Tuple[Path, ...]:
+    """Absolute checkpoint scan directories from the shared S3-05 list."""
+    root = REPO_ROOT if repo_root is None else repo_root
+    return tuple(root / name for name in CHECKPOINT_SCAN_DIR_NAMES)
+
 
 def ensure_cpp_extension() -> bool:
     """Verify that the native C++ extension is compiled and importable."""
@@ -138,7 +165,14 @@ def setup_environment() -> None:
         REPO_ROOT / "build" / "branch" / "cpp",
         REPO_ROOT / "build" / "cmake" / "cpp",
     ]
-    for b_dir in build_candidates:
+    # S3-04: iterate in REVERSED order.  Inserting at position 0 in forward
+    # order left the stale-pyd dir build/cmake/cpp at highest sys.path
+    # priority; reversed() matches the bootstrap in conftest.py and
+    # python/__init__.py so build/cpp wins.  (After `import python` this loop
+    # is a no-op — python/__init__.py already inserted every existing dir —
+    # but it must stay correct for any path that reaches this module before
+    # that bootstrap.)
+    for b_dir in reversed(build_candidates):
         if b_dir.is_dir() and str(b_dir) not in sys.path:
             sys.path.insert(0, str(b_dir))
 
@@ -523,13 +557,9 @@ def get_available_checkpoints() -> list[dict[str, Any]]:
 
     checkpoints: list[dict[str, Any]] = []
 
-    dirs_to_check = [
-        REPO_ROOT / "models" / "checkpoints_baseline_20261031",
-        REPO_ROOT / "models" / "checkpoints_rl",
-        REPO_ROOT / "models" / "checkpoints_scaled",
-        REPO_ROOT / "models" / "checkpoints_finetune",
-        REPO_ROOT / "models" / "checkpoints",
-    ]
+    # S3-05: single shared directory list, resolved from the CURRENT
+    # REPO_ROOT (module global lookup — honors patched roots in tests).
+    dirs_to_check = checkpoint_scan_dirs(REPO_ROOT)
 
     # Deduplicate by resolved path, not by file name: several trees legitimately
     # contain artifacts with the same base name (`latest_checkpoint.pt` exists in

@@ -140,16 +140,20 @@ def run_presets_import(args: argparse.Namespace) -> int:
 
 def run_preset_exec(args: argparse.Namespace) -> int:
     from python.cli.main import build_parser
+    from python.cli.presets import preset_launch_tokens
 
     p = get_preset_by_id(args.preset_id)
     if not p:
         console.print(f"[bold red]Preset '{args.preset_id}' not found.[/bold red]")
         return 1
 
-    cmd_tokens = [p["operation"]]
-    if p.get("subcommand"):
-        cmd_tokens.append(p["subcommand"])
-    cmd_tokens.extend(p.get("args", []))
+    # Single-source token builder (S5-03): identical to the tokens validated
+    # at save time and to the Path A quick-launch.  Built-in presets carry a
+    # legacy ``args`` shape that repeats the subcommand token; the shared
+    # builder strips that duplicate (previously this path emitted
+    # e.g. `match run run -n 10` and failed argparse for 10 of the 16
+    # built-ins).
+    cmd_tokens = preset_launch_tokens(p)
     if getattr(args, "extra_args", None):
         cmd_tokens.extend(args.extra_args)
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import shlex
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from rich import box
 from rich.panel import Panel
@@ -20,6 +20,84 @@ from python.cli.common import wait_for_enter
 
 _WIZARD_SESSION_STATE: Dict[str, Dict[str, Any]] = {}
 _WIZARD_SELECTED_MODELS: Dict[str, Optional[Path]] = {}
+
+
+def build_preset_tokens(
+    op: OperationDef,
+    effective_params: Dict[str, Any],
+    selected_model: Optional[Path],
+) -> Tuple[List[str], Optional[str]]:
+    """Build the CLI token list for saving ``op`` as a preset (S5-03 / S5-04).
+
+    The stored preset must be launchable verbatim by the CLI parser, so the
+    token list is built from the op's direct command tokens (never ``op.id``,
+    which is not a CLI command), the changed/required parameters, and the
+    selected model injected into the op's ACTUAL model flag.
+
+    Returns ``(tokens, note)``: ``tokens`` is the full argv after the
+    program name; ``note`` is an optional human-readable warning (set when
+    the selected model cannot apply because the command has no model flag).
+    """
+    from python.cli.combinations import POSITIONAL_MODEL, find_op_model_target
+
+    # Leading command tokens + genuinely fixed flags from the operations
+    # registry's direct_command.  Placeholders (and the value-carrying flags
+    # that precede them, e.g. "--epochs <N>") are skipped: the parameter loop
+    # below re-emits those flags with the actual values.
+    cmd_parts = op.direct_command.split()
+    if cmd_parts and cmd_parts[0] in ("chess", "zeropawn"):
+        cmd_parts = cmd_parts[1:]
+    arg_flags = {a.flag for a in op.arguments}
+    command_toks: List[str] = []
+    fixed_flag_toks: List[str] = []
+    i = 0
+    while i < len(cmd_parts):
+        part = cmd_parts[i]
+        if part.startswith(("<", "[")):
+            i += 1
+            continue
+        if part.startswith("-"):
+            nxt = cmd_parts[i + 1] if i + 1 < len(cmd_parts) else None
+            value_placeholder = nxt is not None and nxt.startswith(("<", "["))
+            if part not in arg_flags and not value_placeholder:
+                fixed_flag_toks.append(part)
+            i += 2 if value_placeholder else 1
+        else:
+            command_toks.append(part)
+            i += 1
+
+    # Changed parameters -> flags (same rule as the [V] preview, including
+    # required arguments).
+    arg_list: List[str] = []
+    for a in op.arguments:
+        val = effective_params.get(a.name, a.default)
+        if getattr(a, "is_positional", False):
+            if val is not None and str(val).strip() != "":
+                arg_list.append(str(val))
+        elif val != a.default or a.required:
+            if a.type == "bool":
+                if val:
+                    arg_list.append(a.flag)
+            elif val is not None:
+                arg_list.extend([a.flag, str(val)])
+
+    # Model selection -> the op's ACTUAL model flag (S5-04), not a blind
+    # --checkpoint.
+    model_toks: List[str] = []
+    note: Optional[str] = None
+    if selected_model and op.requires_model != "none":
+        model_target = find_op_model_target(op)
+        if model_target == POSITIONAL_MODEL:
+            model_toks = [str(selected_model)]
+        elif model_target:
+            model_toks = [model_target, str(selected_model)]
+        else:
+            note = (
+                f"The selected model cannot apply to '{op.id}' "
+                f"(no model-checkpoint flag on this command); saving without it."
+            )
+
+    return command_toks + fixed_flag_toks + arg_list + model_toks, note
 
 
 def run_configuration_wizard(
@@ -207,7 +285,15 @@ def run_configuration_wizard(
                     elif val is not None:
                         cmd_tokens.extend([a.flag, str(val)])
             if selected_model and op.requires_model != "none":
-                cmd_tokens.extend(["--checkpoint", str(selected_model)])
+                from python.cli.combinations import POSITIONAL_MODEL, find_op_model_target
+
+                model_target = find_op_model_target(op)
+                if model_target == POSITIONAL_MODEL:
+                    cmd_tokens.append(str(selected_model))
+                elif model_target:
+                    cmd_tokens.extend([model_target, str(selected_model)])
+                # else: the command exposes no model flag; preview honestly
+                # omits the selection instead of showing an invalid flag.
 
             preview_str = f"zeropawn {' '.join(shlex.quote(t) for t in cmd_tokens)}"
             ok, err = SafeParserValidator.validate_tokens(cmd_tokens)
@@ -241,31 +327,48 @@ def run_configuration_wizard(
                 effective_params = updated
 
         elif choice == "S":
-            # Save as preset
+            # Save as preset (S5-03): store the op's direct COMMAND tokens —
+            # never op.id, which is not a CLI command token — dry-parse the
+            # full token list against the real parser, and refuse to persist
+            # an unlaunchable preset.
+            from python.cli.combinations import SafeParserValidator
+            from python.cli.presets import split_preset_tokens
+
             p_name = console.input("[bold cyan]Enter preset name: [/bold cyan]").strip()
             if p_name:
                 p_id = p_name.lower().replace(" ", "-")
-                arg_list = []
-                for k, v in effective_params.items():
-                    for a in op.arguments:
-                        if a.name == k and v != a.default:
-                            if a.type == "bool" and v:
-                                arg_list.append(a.flag)
-                            else:
-                                arg_list.extend([a.flag, str(v)])
-                if selected_model:
-                    arg_list.extend(["--checkpoint", str(selected_model)])
-                ok = save_preset(
-                    preset_id=p_id,
-                    name=p_name,
-                    description=f"User preset for {op.name}",
-                    operation=op.id,
-                    args=arg_list,
-                    parameters=effective_params,
-                    model=str(selected_model) if selected_model else None,
-                )
-                if ok:
-                    console.print(f"[bold green]Preset '{p_name}' saved successfully![/bold green]")
+                full_tokens, note = build_preset_tokens(op, effective_params, selected_model)
+                if note:
+                    console.print(f"[yellow]{note}[/yellow]")
+                ok, err = SafeParserValidator.validate_tokens(full_tokens)
+                if not ok:
+                    console.print(
+                        f"[bold red]Refusing to save preset '{p_name}': the generated command "
+                        f"is not launchable.[/bold red]\n"
+                        f"[red]Command:[/] zeropawn {' '.join(full_tokens)}\n"
+                        f"[red]Parser error:[/] {err}"
+                    )
+                elif not full_tokens:
+                    console.print("[bold red]Refusing to save an empty command.[/bold red]")
+                else:
+                    # Storage shape consumed by both launch paths
+                    # (launch_preset_quick / presets run) — split so that
+                    # preset_launch_tokens reproduces full_tokens verbatim.
+                    operation, subcommand, args = split_preset_tokens(full_tokens)
+                    ok = save_preset(
+                        preset_id=p_id,
+                        name=p_name,
+                        description=f"User preset for {op.name}",
+                        operation=operation,
+                        args=args,
+                        parameters=effective_params,
+                        model=str(selected_model) if selected_model else None,
+                        subcommand=subcommand,
+                    )
+                    if ok:
+                        console.print(
+                            f"[bold green]Preset '{p_name}' saved successfully![/bold green]"
+                        )
                 wait_for_enter("Press [Enter] to continue...")
 
         elif choice == "R":

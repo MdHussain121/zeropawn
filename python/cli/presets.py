@@ -314,6 +314,56 @@ def get_preset_by_id(preset_id: str) -> Optional[Dict[str, Any]]:
     return get_all_presets().get(preset_id)
 
 
+def preset_launch_tokens(p: Dict[str, Any]) -> List[str]:
+    """Build the CLI token list that launches a preset (single source of truth).
+
+    Both launch paths (``main.launch_preset_quick`` / Path A and
+    ``commands_presets.run_preset_exec``) MUST build their tokens through this
+    helper so a preset validated at save time is exactly the preset executed
+    at launch time (S5-03).  A preset's ``args`` list may redundantly repeat
+    the ``subcommand`` token (a legacy shape several built-in presets use);
+    the duplicate is stripped here.
+    """
+    tokens = [p["operation"]]
+    subcmd = p.get("subcommand")
+    args = list(p.get("args", []))
+    if subcmd:
+        tokens.append(subcmd)
+        if args and args[0] == subcmd:
+            args = args[1:]
+    tokens.extend(args)
+    return tokens
+
+
+def split_preset_tokens(tokens: List[str]) -> Tuple[str, Optional[str], List[str]]:
+    """Split a full launch token list into the preset storage shape.
+
+    Returns ``(operation, subcommand, args)`` such that
+    ``preset_launch_tokens({'operation': operation, 'subcommand': subcommand,
+    'args': args})`` reproduces ``tokens`` verbatim.  The second token is only
+    stored as ``subcommand`` when it is a command token (not a flag); flag
+    tokens stay in ``args``.
+    """
+    if not tokens:
+        raise ValueError("cannot split an empty token list")
+    operation = tokens[0]
+    if len(tokens) > 1 and not tokens[1].startswith("-"):
+        return operation, tokens[1], list(tokens[2:])
+    return operation, None, list(tokens[1:])
+
+
+def validate_preset_launchable(p: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+    """Dry-parse a preset's launch tokens against the real CLI parser (S5-03).
+
+    Returns (ok, error).  A preset that the parser rejects would fail at every
+    launch path with argparse exit 2; refusing to persist such a preset keeps
+    every saved preset launchable.
+    """
+    from python.cli.combinations import SafeParserValidator
+
+    return SafeParserValidator.validate_tokens(preset_launch_tokens(p))
+
+
 def save_preset(
     preset_id: str,
     name: str,
@@ -324,24 +374,42 @@ def save_preset(
     model: Optional[str] = None,
     subcommand: Optional[str] = None,
 ) -> bool:
-    """Create or update a user-defined preset."""
+    """Create or update a user-defined preset.
+
+    The preset is dry-parsed against the real CLI parser before it is written;
+    an unlaunchable preset (e.g. an ``operation`` token that is not a CLI
+    command, or an unknown flag) is refused with a clear error (S5-03).
+    """
     if preset_id in BUILTIN_PRESETS:
         console.print(
             f"[bold red]Cannot overwrite built-in preset '{preset_id}'. Use duplicate instead.[/bold red]"
         )
         return False
 
-    user_presets = load_user_presets()
-    user_presets[preset_id] = {
+    candidate = {
         "id": preset_id,
         "name": name,
         "description": description,
         "operation": operation,
         "subcommand": subcommand,
-        "args": args,
+        "args": list(args),
         "parameters": parameters or {},
         "model": model,
         "is_builtin": False,
+    }
+    ok, err = validate_preset_launchable(candidate)
+    if not ok:
+        console.print(
+            f"[bold red]Refusing to save preset '{preset_id}': the stored command is not "
+            f"launchable by the CLI parser.[/bold red]\n"
+            f"[red]Command:[/] zeropawn {' '.join(preset_launch_tokens(candidate))}\n"
+            f"[red]Parser error:[/] {err}"
+        )
+        return False
+
+    user_presets = load_user_presets()
+    user_presets[preset_id] = {
+        **candidate,
         "created_at": user_presets.get(preset_id, {}).get("created_at", datetime.now().isoformat()),
         "updated_at": datetime.now().isoformat(),
     }

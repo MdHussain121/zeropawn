@@ -12,6 +12,7 @@ from rich import box
 from rich.panel import Panel
 from rich.table import Table
 
+import python.cli.common as _cli_common
 from python.cli.common import REPO_ROOT
 from python.cli.ui import COLOR_BORDER, console
 
@@ -23,17 +24,13 @@ def get_checkpoint_directories() -> List[Path]:
 
     Listing only (``models``/``status`` commands and interactive selection).  The
     default model is resolved through the registry, not by scanning these.
+
+    S3-05: derives from the single shared directory list
+    (:func:`python.cli.common.checkpoint_scan_dirs`) so this scanner and
+    ``common.get_available_checkpoints`` can never disagree on which
+    directories exist.
     """
-    dirs = [
-        REPO_ROOT / "models" / "checkpoints_baseline_20261031",
-        REPO_ROOT / "models" / "checkpoints_scaled",
-        REPO_ROOT / "models" / "checkpoints_supervised",
-        REPO_ROOT / "models" / "checkpoints_rl",
-        REPO_ROOT / "models" / "checkpoints_finetune",
-        REPO_ROOT / "models" / "checkpoints",
-        REPO_ROOT / "models",
-    ]
-    return [d for d in dirs if d.is_dir()]
+    return [d for d in _cli_common.checkpoint_scan_dirs(_cli_common.REPO_ROOT) if d.is_dir()]
 
 
 def discover_checkpoints() -> List[Dict[str, Any]]:

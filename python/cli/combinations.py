@@ -250,6 +250,66 @@ class SafeParserValidator:
             return False, str(e)
 
 
+# Marker returned by find_op_model_target when the operation's model argument
+# is a bare positional (e.g. `models validate <checkpoint>`).
+POSITIONAL_MODEL = "<positional>"
+
+
+def find_op_model_target(op: Any) -> Optional[str]:
+    """Return how a model checkpoint is passed to ``op``'s parsed command (S5-04).
+
+    Returns an option string (``--checkpoint``, ``--checkpoint-path`` or
+    ``--resume``), :data:`POSITIONAL_MODEL` when the checkpoint is a bare
+    positional argument, or ``None`` when the target command has no model flag
+    at all (e.g. ``test soak``/``test guardrails``/``bench pipelined``).
+
+    The authoritative source is the registered CLI parser itself (walked the
+    same way :meth:`SafeParserValidator` walks it): the ``OperationDef``
+    schema does not carry each op's model flag (e.g. ``bench_selfplay``'s
+    argument list has no ``--checkpoint-path`` entry), so consulting the
+    declared ``arguments`` alone would miss it.  Priority matches the
+    historical injection order in ``main.execute_operation_from_interactive``:
+    ``--checkpoint`` first, then ``--checkpoint-path``, then positionals
+    (``checkpoint``/``model_path``/``model``), then ``--resume``.
+    """
+    from python.cli.main import build_parser  # deferred: main imports this module lazily
+
+    parser = build_parser()
+    cmd_parts = op.direct_command.split()
+    if cmd_parts and cmd_parts[0] in ("chess", "zeropawn"):
+        cmd_parts = cmd_parts[1:]
+
+    curr: argparse.ArgumentParser = parser
+    for part in cmd_parts:
+        if part.startswith(("<", "[", "-")):
+            continue  # placeholders and fixed flags do not navigate subparsers
+        subaction = next(
+            (a for a in curr._actions if isinstance(a, argparse._SubParsersAction)), None
+        )
+        if subaction and part in subaction.choices:
+            curr = subaction.choices[part]
+        else:
+            break
+
+    option_strings: set[str] = set()
+    positional_dests: list[str] = []
+    for action in curr._actions:
+        if action.option_strings:
+            option_strings.update(action.option_strings)
+        elif action.dest != "help":
+            positional_dests.append(action.dest)
+
+    if "--checkpoint" in option_strings:
+        return "--checkpoint"
+    if "--checkpoint-path" in option_strings:
+        return "--checkpoint-path"
+    if any(dest in ("checkpoint", "model_path", "model") for dest in positional_dests):
+        return POSITIONAL_MODEL
+    if "--resume" in option_strings:
+        return "--resume"
+    return None
+
+
 class CombinationEngine:
     """Deterministic, lazy combination generator and constraint validator."""
 
