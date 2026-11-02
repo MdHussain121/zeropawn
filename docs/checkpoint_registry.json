@@ -178,7 +178,7 @@
         "dataset_acceptance": "certified games_wdl receipt; train masked_fraction 0.0000; 0 cross-split encoded states (exhaustive train/val, train/test, val/test); build record binds source sha256 2d28cfa0...",
         "value_head_health": "held-out WDL CE 0.851 (game val) / 0.730 (independent test split) vs uniform 1.099; P(predict loss | true loss) = 0.442 (val) / 0.515 (test) vs 0.0000 on both disqualified predecessors; Brier 0.51/0.43",
         "value_grad_flow": "telemetry value_grad_norm 0.24-0.48 throughout the run; window WDL-valid samples ~468/512",
-        "limits": "Single-epoch run: policy top-1 22.2% game-val / 23.2% game-test / 26.6% tactics-val — weaker than the disqualified 5-epoch predecessors' policy heads. This designation certifies PROVENANCE and VALUE-HEAD HEALTH ONLY. No strength, Elo, or superiority claim is attached (SLQ-04/SLQ-20 discipline)."
+        "limits": "Single-epoch run: policy top-1 22.2% game-val / 23.2% game-test / 26.6% tactics-val \u2014 weaker than the disqualified 5-epoch predecessors' policy heads. This designation certifies PROVENANCE and VALUE-HEAD HEALTH ONLY. No strength, Elo, or superiority claim is attached (SLQ-04/SLQ-20 discipline)."
       }
     },
     {
@@ -203,7 +203,7 @@
   "excluded_from_registry": [
     {
       "path": "models/checkpoints_rl/live_weights.pt",
-      "why": "Runtime learner-to-actor sync artifact (weights-only, overwritten on every push_freq interval). Not a checkpoint; its hash is meaningful only at an instant. Hash observed 2026-10-29: fda3d9678b9081a3d4bfccf5bfae7f0e4c405ccb2a8f9b92d3369427f7269710 (step 6001)."
+      "why": "Runtime learner-to-actor sync artifact (weights-only, overwritten on every push_freq interval). Not a checkpoint; its hash is meaningful only at an instant. HISTORY: hash fda3d967... (step 6001) observed 2026-10-29; the file at this path was replaced 2026-10-31 23:46 by the contaminated test-scale payload 7909aada1996b537... (ChessNet 2x32, 5,096,170 params, step=1), which would hard-block the next RL campaign's first weight push (audit S3-01). REMEDIATED 2026-11-03 (fix/post-merge-production-readiness-20261103): the contaminated artifact was quarantined byte-identical to models/checkpoints_rl/quarantined/live_weights_contaminated_2x32_20261031.pt (see that directory's QUARANTINE.json); the active sync path is now free, so the next campaign's first push_weights creates a fresh 12x128 live_weights.pt. The quarantine directory is excluded from checkpoint discovery."
     },
     {
       "path": "models/checkpoints_opening_pilot/",
