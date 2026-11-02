@@ -86,10 +86,30 @@ class InferenceServer:
             self.model = model.to(self.device)
         elif checkpoint_path:
             # An empty-string path means "no checkpoint requested" (same as
-            # None); a REAL path that fails to load raises — see
-            # _create_model_from_checkpoint's fail-closed contract.
-            self.model = self._create_model_from_checkpoint(checkpoint_path).to(self.device)
-            self.load_checkpoint(checkpoint_path)
+            # None); a REAL path that fails to load raises — the fail-closed
+            # contract below. The file is read exactly ONCE (audit S3-09): the
+            # shapes for construction and the weights come from the same
+            # in-memory mapping, so no second deserialization and no window
+            # where construction and adoption could observe different file
+            # contents.
+            try:
+                ckpt = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
+            except Exception as e:
+                raise RuntimeError(
+                    f"Checkpoint '{checkpoint_path}' is unreadable or invalid: {e}. "
+                    "Refusing to construct a random-init model (fail-closed)."
+                ) from e
+            try:
+                self._adopt_checkpoint(checkpoint_path, ckpt)
+            except Exception as e:
+                # Fail-closed at construction time: unlike a hot reload (which
+                # keeps the active weights and records the failure), there are
+                # no active weights yet — raising beats silently serving a
+                # random-init model.
+                raise RuntimeError(
+                    f"Checkpoint '{checkpoint_path}' is invalid: {e}. "
+                    "Refusing to serve a random-init model (fail-closed)."
+                ) from e
         else:
             # Explicit no-weights construction: caller opted into an (untrained)
             # random-init ChessNet.
@@ -110,21 +130,27 @@ class InferenceServer:
         self._window_batches = 0
         self._window_time_sec = 0.0
 
-    def _create_model_from_checkpoint(self, path: str) -> nn.Module:
+    def _create_model_from_checkpoint(self, path: str, ckpt: Optional[Any] = None) -> nn.Module:
         """Inspect checkpoint and construct appropriate network.
+
+        When ``ckpt`` is given it is the ALREADY-LOADED checkpoint mapping for
+        ``path`` (audit S3-09: the caller reads the file once and passes the
+        mapping down instead of having this method re-read the same path);
+        when ``ckpt`` is None the file is loaded here (kept for direct callers).
 
         Fails closed (Stage A §5): an unreadable or structurally invalid
         checkpoint raises instead of silently constructing a random-init
         ChessNet — a silent fallback here previously let runs proceed with
         random weights while logging only an exception.
         """
-        try:
-            ckpt = torch.load(path, map_location="cpu", weights_only=True)
-        except Exception as e:
-            raise RuntimeError(
-                f"Checkpoint '{path}' is unreadable or invalid: {e}. "
-                "Refusing to construct a random-init model (fail-closed)."
-            ) from e
+        if ckpt is None:
+            try:
+                ckpt = torch.load(path, map_location="cpu", weights_only=True)
+            except Exception as e:
+                raise RuntimeError(
+                    f"Checkpoint '{path}' is unreadable or invalid: {e}. "
+                    "Refusing to construct a random-init model (fail-closed)."
+                ) from e
         state_dict = (
             ckpt.get("model", ckpt.get("state_dict", ckpt)) if isinstance(ckpt, dict) else ckpt
         )
@@ -173,7 +199,9 @@ class InferenceServer:
         off to the side, then published under the hot-reload lock by swapping
         the reference. In-flight forwards keep the old module alive by
         refcount and are never torn. Increments model_version monotonically
-        and tags all future responses.
+        and tags all future responses. The file is deserialized exactly once
+        (audit S3-09); shape inference and weight adoption share that mapping
+        (see :meth:`_adopt_checkpoint`).
 
         Failure contract (audit L-3): a missing, unreadable, structurally
         invalid, or architecture-incompatible candidate never touches the
@@ -194,7 +222,25 @@ class InferenceServer:
         except Exception as e:
             logger.exception("Failed to load checkpoint %s; keeping old weights", path)
             return self._record_reload_failure(path, "unreadable checkpoint", str(e))
+        return self._adopt_checkpoint(path, ckpt)
 
+    def _adopt_checkpoint(self, path: str, ckpt: Any) -> int:
+        """Publish an ALREADY-LOADED checkpoint mapping as the served weights.
+
+        Single-read contract (audit S3-09): ``load_checkpoint`` reads the file
+        once and hands the mapping here; shape inference
+        (``_create_model_from_checkpoint``) and the weight copy both consume
+        that same mapping, so the previous second ``torch.load`` of the same
+        path is gone. An inter-load file change can no longer occur by
+        construction — shapes and weights always come from one consistent
+        deserialization, so the swap fails closed on exactly the same inputs
+        as before (any file the old code would have accepted is accepted, any
+        input it would have rejected is rejected).
+
+        Failure contract: a structurally invalid candidate never touches the
+        active model — the version is unchanged and the failure is recorded
+        (same as :meth:`load_checkpoint`).
+        """
         # Determine state dict key
         if isinstance(ckpt, dict):
             if "model" in ckpt:
@@ -216,7 +262,7 @@ class InferenceServer:
         # submitted before this method was entered).
         copy_done_event = None
         try:
-            new_model = self._create_model_from_checkpoint(path).to(self.device)
+            new_model = self._create_model_from_checkpoint(path, ckpt=ckpt).to(self.device)
             new_model.load_state_dict(state_dict)
             new_model.eval()
             if self.channels_last and self.device.type == "cuda":

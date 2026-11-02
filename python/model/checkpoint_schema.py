@@ -33,11 +33,10 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Union
+from typing import Any, Dict, Mapping, Optional, Union
 
 logger = logging.getLogger(__name__)
 
@@ -422,6 +421,15 @@ def validate_run_metadata(ledger: Any, *, path: Union[str, Path], required: bool
     ``required=True`` demands a present, structurally valid ledger with a state
     from :data:`RUN_STATES` (the current-format contract). When ``required=False``
     an absent ledger yields a warning (legacy artifact) instead of an error.
+
+    Legacy tolerance covers *present* ledgers too (audit S3-02): a mapping that
+    carries no ``run_state`` key at all predates the run-status schema (e.g. the
+    supervised baseline ckpt-10) and is accepted with an explicit warning when
+    ``required=False``, mirroring the absent-ledger branch. A ledger that
+    *declares* a ``run_state`` is always validated strictly: an unknown/invalid
+    value raises regardless of ``required``, and under ``required=True`` even a
+    pre-schema ledger is refused because the current-format contract demands a
+    state from :data:`RUN_STATES`.
     """
     if ledger is None:
         if required:
@@ -432,7 +440,22 @@ def validate_run_metadata(ledger: Any, *, path: Union[str, Path], required: bool
             f"'{path}' run_metadata is not a mapping (got {type(ledger).__name__})."
         )
     warnings: list[str] = []
-    state = ledger.get("run_state")
+    if "run_state" not in ledger:
+        # Pre-schema legacy ledger: the ledger predates the run-status contract
+        # (no lifecycle state was recorded yet). Accepted exactly like an absent
+        # ledger — loudly — never reinterpreted as a current-schema ledger.
+        if required:
+            raise CheckpointSchemaError(
+                f"'{path}' run_metadata is a pre-schema legacy ledger (no 'run_state'); the "
+                "current-format contract requires a valid run-status ledger."
+            )
+        warnings.append(
+            f"pre-schema run_metadata ledger without 'run_state' inside '{Path(path).name}' "
+            "(legacy ledger, predates the run-status schema); accepted through the explicit "
+            "legacy path"
+        )
+        return warnings
+    state = ledger["run_state"]
     if state not in RUN_STATES:
         raise CheckpointSchemaError(
             f"'{path}' run_metadata.run_state={state!r} is not one of {sorted(RUN_STATES)}."
@@ -556,14 +579,6 @@ def compute_file_sha256(path: Union[str, Path], chunk_size: int = 1 << 20) -> st
     return sha.hexdigest()
 
 
-def merge_run_metadata_into_config(config: Mapping[str, Any], ledger: Mapping[str, Any]) -> Dict[str, Any]:
-    """Return ``config`` plus the ledger's identity keys, for provenance snapshots."""
-    merged = dict(config)
-    merged["run_id"] = ledger.get("run_id")
-    merged["run_type"] = ledger.get("run_type")
-    return merged
-
-
 def summarize_schema_support() -> Dict[str, Any]:
     """Machine-readable schema support matrix (used by docs and tests)."""
     return {
@@ -574,13 +589,3 @@ def summarize_schema_support() -> Dict[str, Any]:
         "terminal_run_states": sorted(TERMINAL_RUN_STATES),
         "run_metadata_version": RUN_METADATA_VERSION,
     }
-
-
-def iter_missing(ckpt: Mapping[str, Any], fields: Sequence[str]) -> Iterable[str]:
-    for f in fields:
-        if f not in ckpt:
-            yield f
-
-
-def is_absolute_artifact(path: Union[str, Path]) -> bool:
-    return os.path.isabs(str(path))

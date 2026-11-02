@@ -172,10 +172,13 @@ remains the lineage authority for release weights.
 * The registry is discovered from the artifact's own tree
   (`find_registry_root`), so checkpoints in a worktree are governed by that
   worktree's registry.
-* **Default model selection** (`get_default_checkpoint_path`) skips entries whose
-  registry status is `missing`/`quarantined`/`disqualified`/hash-mismatched, prefers
-  verified (and designated) entries, and deduplicates discovery by path — a
-  disqualified artifact can never be served as "the default model" again.
+* **Default model selection is fail-closed** (`resolve_default_checkpoint`,
+  the single resolver every consumer routes through): the default is the
+  registry entry that is `verified` AND `designated_warm_start`, re-hashed
+  against its registry record before use; anything else — no designated
+  entry, missing file, hash/size mismatch, missing registry — raises
+  `DefaultCheckpointError` naming the expected artifact and recovery actions.
+  There is no "newest file on disk" fallback (see `docs/model_io_contract.md` §4).
 * Weights-only containers are registered with an explicit status (see
   `ckpt-11-unattributed_warm_start_weights`, `disqualified`) or refused.
 
