@@ -32,6 +32,7 @@ import numpy as np
 import torch
 
 import zeropawn_cpp
+from python.constants import BOARD_SIZE, NUM_ACTIONS, NUM_PLANES
 from python.model.chess_net import ChessNet
 from python.eval.stats import (
     elo_confidence_interval,
@@ -85,6 +86,20 @@ def assert_search_mode_supported(search_mode: str, caller: str) -> None:
     backed by ``zeropawn_cpp.search_batched`` and accepted ``serial``
     unconditionally. Callers that need the mode to be supported (self-play,
     match, puzzle, UCI paths) now say so explicitly.
+
+    S1-11 (2026-11-03) — why the guard still targets ``MCTS.search_batched``:
+    this is deliberate, not binding drift. The raw-path consumers of
+    ``search_mode == "batched"`` genuinely execute that legacy entry point —
+    ``SelfPlayWorker``/``SelfPlayGame`` (``python/selfplay/worker.py``, the
+    ``search_mode == "batched" and hasattr(self.mcts, "search_batched")``
+    branch) and ``MatchRunner._play_game_worker`` (the
+    ``ctx.mcts.search_batched(...)`` branch) both call it directly. The UCI
+    engine is the exception: its batched mode runs the internal-batched
+    ``MCTS.search`` (config-driven ``MCTSConfig.batch_size > 1``) and never
+    touches ``search_batched``, so for UCI this check is a conservative
+    over-approximation of "batched is available in this build" — it can only
+    ever be satisfied jointly with the internal-batched capability, never
+    falsely rejected.
     """
     if search_mode == "batched":
         if not hasattr(zeropawn_cpp.MCTS, "search_batched"):
@@ -309,11 +324,6 @@ def eval_config_hash(
     if entropy_bonus is not None:
         canonical += f"|ent={entropy_bonus}"
     return hashlib.sha1(canonical.encode("utf-8")).hexdigest()[:12]
-
-
-def default_mcts_seed() -> int:
-    """MCTS seed actually used by eval match workers (config default; noise off)."""
-    return int(zeropawn_cpp.MCTSConfig().seed)
 
 
 def elo_interval(wins: int, draws: int, losses: int) -> dict[str, Optional[float]]:
@@ -748,9 +758,12 @@ class MatchRunner:
     def _batched_eval_callback(self, batch_planes: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         n = int(batch_planes.shape[0])
         if n == 0:
-            return (np.zeros((0, 4672), dtype=np.float32), np.zeros((0,), dtype=np.float32))
+            return (
+                np.zeros((0, NUM_ACTIONS), dtype=np.float32),
+                np.zeros((0,), dtype=np.float32),
+            )
         t = torch.from_numpy(np.ascontiguousarray(batch_planes, dtype=np.float32))
-        t = t.view(n, 19, 8, 8).to(self.device, non_blocking=True)
+        t = t.view(n, NUM_PLANES, BOARD_SIZE, BOARD_SIZE).to(self.device, non_blocking=True)
         if self.device == "cuda":
             t = t.to(memory_format=torch.channels_last)
 

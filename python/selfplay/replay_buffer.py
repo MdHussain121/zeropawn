@@ -46,12 +46,13 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union, TypedDict
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import psutil
 import torch
 
+from python.constants import BOARD_SIZE, NUM_ACTIONS, NUM_PLANES
 from python.selfplay.worker import SavedPosition
 
 try:
@@ -123,10 +124,10 @@ def validate_records_arrays(
     versions: np.ndarray,
     game_ids: np.ndarray,
     *,
-    in_channels: int = 19,
+    in_channels: int = NUM_PLANES,
     height: int = 8,
     width: int = 8,
-    num_actions: int = 4672,
+    num_actions: int = NUM_ACTIONS,
 ) -> None:
     """Vectorized insertion-time validation of one flush (audit SR-07).
 
@@ -214,10 +215,10 @@ def validate_records_arrays(
 def validate_position_record(
     pos: Any,
     *,
-    in_channels: int = 19,
+    in_channels: int = NUM_PLANES,
     height: int = 8,
     width: int = 8,
-    num_actions: int = 4672,
+    num_actions: int = NUM_ACTIONS,
 ) -> None:
     """:func:`validate_records_arrays` for a single :class:`SavedPosition`."""
     validate_records_arrays(
@@ -255,30 +256,6 @@ def _buffer_artifact_lock(target: Path, *, owner: str, timeout: float):
     return artifact_lock(target, timeout=timeout, owner=owner)
 
 
-class ReplayBatchDict(TypedDict):
-    planes: torch.Tensor
-    visits: torch.Tensor
-    outcomes: torch.Tensor
-    is_full_search: torch.Tensor
-
-
-class ReplayMetaDict(TypedDict):
-    capacity: int
-    in_channels: int
-    height: int
-    width: int
-    num_actions: int
-    write_head: int
-    size: int
-    total_added: int
-    # Identity of this buffer instance, written once at creation and preserved
-    # across flushes. A checkpoint carries the generation it was saved against
-    # so a resume can never splice two buffer generations together (audit
-    # CKP-05 restoration contract). ``None`` for legacy buffers written before
-    # the marker existed.
-    buffer_generation: Optional[str]
-
-
 class GpuResidentReplayCache:
     """High-throughput circular GPU tensor cache in VRAM for zero-PCIe sampling.
 
@@ -310,10 +287,10 @@ class GpuResidentReplayCache:
     def __init__(
         self,
         capacity: int,
-        in_channels: int = 19,
+        in_channels: int = NUM_PLANES,
         height: int = 8,
         width: int = 8,
-        num_actions: int = 4672,
+        num_actions: int = NUM_ACTIONS,
         device: Optional[Union[str, torch.device]] = None,
     ) -> None:
         self.capacity = capacity
@@ -590,7 +567,7 @@ def load_tactical_positions_from_csv(
     if not path.is_file():
         logger.warning("Tactical CSV not found at %s", path)
         return (
-            np.zeros((0, 19, 8, 8), dtype=np.float32),
+            np.zeros((0, NUM_PLANES, BOARD_SIZE, BOARD_SIZE), dtype=np.float32),
             np.zeros((0,), dtype=np.int64),
             np.zeros((0,), dtype=np.int64),
         )
@@ -606,7 +583,7 @@ def load_tactical_positions_from_csv(
         if header is None:
             logger.warning("Tactical CSV at %s is empty", path)
             return (
-                np.zeros((0, 19, 8, 8), dtype=np.float32),
+                np.zeros((0, NUM_PLANES, BOARD_SIZE, BOARD_SIZE), dtype=np.float32),
                 np.zeros((0,), dtype=np.int64),
                 np.zeros((0,), dtype=np.int64),
             )
@@ -665,7 +642,7 @@ def load_tactical_positions_from_csv(
                 illegal_count += 1
                 continue
 
-            if not (0 <= move_idx < 4672):
+            if not (0 <= move_idx < NUM_ACTIONS):
                 illegal_count += 1
                 continue
 
@@ -686,7 +663,7 @@ def load_tactical_positions_from_csv(
 
     if not moves_list:
         return (
-            np.zeros((0, 19, 8, 8), dtype=np.float32),
+            np.zeros((0, NUM_PLANES, BOARD_SIZE, BOARD_SIZE), dtype=np.float32),
             np.zeros((0,), dtype=np.int64),
             np.zeros((0,), dtype=np.int64),
         )
@@ -705,10 +682,10 @@ class ReplayBuffer:
         self,
         buffer_dir: Union[str, Path],
         capacity: int = 500_000,
-        in_channels: int = 19,
+        in_channels: int = NUM_PLANES,
         height: int = 8,
         width: int = 8,
-        num_actions: int = 4672,
+        num_actions: int = NUM_ACTIONS,
         initial_human_mix: float = 0.25,
         final_human_mix: float = 0.05,
         taper_steps: int = 50_000,
@@ -2389,7 +2366,8 @@ class ReplayBuffer:
         CROSS-BINDING (audit S2-08): this numpy path is PAIRED with
         :meth:`sample_batch_tensors` — the production trainer samples ONLY
         through the tensor path (``train_rl.py``); this numpy variant is kept
-        for ``scripts/profile_selfplay.py`` and the test suites. Known
+        for the test suites (its former script caller
+        ``scripts/profile_selfplay.py`` was retired 2026-11-03, S4-07). Known
         INTENTIONAL divergences between the pair:
           * Empty-buffer+human condition: here 100% human when ``size == 0``;
             the tensor path additionally requires the GPU cache to be empty.
@@ -2604,8 +2582,9 @@ class ReplayBuffer:
 
         CROSS-BINDING (audit S2-08): this is the PRODUCTION sampling path
         (``RLTrainer.train_step`` in ``train_rl.py``). It is PAIRED with the
-        numpy :meth:`sample_batch`, which survives for
-        ``scripts/profile_selfplay.py`` and the test suites. Known
+        numpy :meth:`sample_batch`, which survives for the test suites (its
+        former script caller ``scripts/profile_selfplay.py`` was retired
+        2026-11-03, S4-07). Known
         INTENTIONAL divergences between the pair:
           * Empty-buffer+human condition: here 100% human only when
             ``size == 0`` AND the GPU cache is empty; the numpy path checks

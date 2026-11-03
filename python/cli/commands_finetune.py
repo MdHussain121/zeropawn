@@ -24,6 +24,7 @@ from python.cli.common import (
     print_info,
     print_success,
 )
+from python.constants import NUM_ACTIONS, NUM_PLANES, BOARD_SIZE
 
 _BIN_FILES = ("planes.bin", "moves.bin", "outcomes.bin", "game_ids.bin", "plies.bin")
 
@@ -82,7 +83,7 @@ def merge_datasets(selection: list[dict], merge_dir: Path) -> tuple[Path, Path]:
         # and the side-to-move record (SLQ-13) from the merged artifact.
         schema2_files: dict[str, tuple[np.dtype, Any]] = {}
         for fname, dtype, shape_fn in (
-            ("masks.bin", np.uint8, lambda n: (n, (4672 + 7) // 8)),
+            ("masks.bin", np.uint8, lambda n: (n, (NUM_ACTIONS + 7) // 8)),
             ("stm.bin", np.uint8, lambda n: (n,)),
         ):
             inputs_with = [ds for ds in selection if (ds["dir"] / split / fname).is_file()]
@@ -112,7 +113,10 @@ def merge_datasets(selection: list[dict], merge_dir: Path) -> tuple[Path, Path]:
             dtype = dtypes[fname]
             if fname == "planes.bin":
                 out_mm = np.memmap(
-                    merge_dir / split / fname, dtype=dtype, mode="w+", shape=(total, 19, 8, 8)
+                    merge_dir / split / fname,
+                    dtype=dtype,
+                    mode="w+",
+                    shape=(total, NUM_PLANES, BOARD_SIZE, BOARD_SIZE),
                 )
             else:
                 shape = schema2_files[fname][1](total) if fname in schema2_files else (total,)
@@ -123,7 +127,9 @@ def merge_datasets(selection: list[dict], merge_dir: Path) -> tuple[Path, Path]:
                 meta = json.loads((ds["dir"] / split / "metadata.json").read_text(encoding="utf-8"))
                 n = int(meta.get("num_samples", 0))
                 if fname == "planes.bin":
-                    in_mm = np.memmap(src, dtype=dtype, mode="r", shape=(n, 19, 8, 8))
+                    in_mm = np.memmap(
+                        src, dtype=dtype, mode="r", shape=(n, NUM_PLANES, BOARD_SIZE, BOARD_SIZE)
+                    )
                 elif fname in schema2_files:
                     in_mm = np.memmap(src, dtype=dtype, mode="r", shape=schema2_files[fname][1](n))
                 else:

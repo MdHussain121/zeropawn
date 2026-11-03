@@ -20,6 +20,7 @@ from python.cli.models import (
 )
 from python.cli.ui import COLOR_BORDER, console
 from python.model.checkpoint_registry import DefaultCheckpointError
+from python.constants import NUM_ACTIONS, NUM_PLANES, BOARD_SIZE
 
 logger = logging.getLogger(__name__)
 
@@ -237,14 +238,16 @@ def run_models_validate(args: argparse.Namespace) -> int:
             return 1
 
         # Test forward pass with synthetic (1, 19, 8, 8) input
-        dummy_input = torch.zeros((1, 19, 8, 8), dtype=torch.float32, device=args.device)
+        dummy_input = torch.zeros(
+            (1, NUM_PLANES, BOARD_SIZE, BOARD_SIZE), dtype=torch.float32, device=args.device
+        )
         with torch.no_grad():
             policy_logits, value_logits = model(dummy_input)
 
         # Validate shapes
-        if policy_logits.shape != (1, 4672):
+        if policy_logits.shape != (1, NUM_ACTIONS):
             console.print(
-                f"[bold red]Invalid policy logits shape: {policy_logits.shape}, expected (1, 4672)[/bold red]"
+                f"[bold red]Invalid policy logits shape: {policy_logits.shape}, expected (1, {NUM_ACTIONS})[/bold red]"
             )
             return 1
         if value_logits.shape != (1, 3):

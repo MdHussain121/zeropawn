@@ -45,6 +45,7 @@ import numpy as np
 import python  # noqa: F401  (ensures zeropawn_cpp + DLL paths)
 import zeropawn_cpp
 from python.selfplay.tb_adjudicate import TablebaseAdjudicator
+from python.constants import NUM_ACTIONS, NUM_PLANES, BOARD_SIZE
 
 logger = logging.getLogger(__name__)
 
@@ -290,7 +291,7 @@ class SyzygySupervisionGenerator:
         for m in optimal_moves:
             try:
                 idx = zeropawn_cpp.move_to_index(cpp_game, m.uci())
-                if 0 <= idx < 4672:
+                if 0 <= idx < NUM_ACTIONS:
                     optimal_indices.append(idx)
             except Exception:
                 pass
@@ -310,7 +311,7 @@ class SyzygySupervisionGenerator:
         dtz_target = self.probe_dtz(board)
 
         # Build normalized optimal policy distribution target
-        policy_target = np.zeros(4672, dtype=np.float32)
+        policy_target = np.zeros(NUM_ACTIONS, dtype=np.float32)
         prob_per_move = 1.0 / len(optimal_indices)
         for idx in optimal_indices:
             policy_target[idx] = prob_per_move
@@ -561,14 +562,19 @@ class SyzygySupervisionGenerator:
         policy_targets_path = split_dir / "policy_targets.bin"
         meta_path = split_dir / "metadata.json"
 
-        planes_mm = np.memmap(planes_path, dtype=np.float32, mode="w+", shape=(num, 19, 8, 8))
+        planes_mm = np.memmap(
+            planes_path,
+            dtype=np.float32,
+            mode="w+",
+            shape=(num, NUM_PLANES, BOARD_SIZE, BOARD_SIZE),
+        )
         moves_mm = np.memmap(moves_path, dtype=np.int16, mode="w+", shape=(num,))
         outcomes_mm = np.memmap(outcomes_path, dtype=np.uint8, mode="w+", shape=(num,))
         game_ids_mm = np.memmap(game_ids_path, dtype=np.uint64, mode="w+", shape=(num,))
         plies_mm = np.memmap(plies_path, dtype=np.int16, mode="w+", shape=(num,))
         val_targets_mm = np.memmap(val_targets_path, dtype=np.float32, mode="w+", shape=(num, 3))
         policy_targets_mm = np.memmap(
-            policy_targets_path, dtype=np.float32, mode="w+", shape=(num, 4672)
+            policy_targets_path, dtype=np.float32, mode="w+", shape=(num, NUM_ACTIONS)
         )
 
         # SY-04: Only create dtz_targets.bin if genuine DTZ targets exist (never write all-NaN files)
@@ -588,7 +594,7 @@ class SyzygySupervisionGenerator:
             policy_targets_mm[i] = (
                 s.optimal_policy_target
                 if s.optimal_policy_target is not None
-                else np.zeros(4672, dtype=np.float32)
+                else np.zeros(NUM_ACTIONS, dtype=np.float32)
             )
             if dtz_mm is not None:
                 dtz_mm[i] = np.float32(s.dtz_target) if s.dtz_target is not None else np.nan

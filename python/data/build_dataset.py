@@ -35,6 +35,7 @@ if str(_repo_root) not in sys.path:
 import python  # noqa: F401  (ensures zeropawn_cpp + DLL paths)
 import zeropawn_cpp
 from python.cli.common import setup_logging
+from python.constants import BOARD_SIZE, NUM_ACTIONS, NUM_PLANES
 from python.data.dataset_contract import (
     SCHEMA_VERSION,
     BuildRecord,
@@ -117,9 +118,9 @@ class PositionData:
         "stm",
     )
 
-    # 4672 actions packed into bits: ceil(4672/8) bytes per position.
-    MASK_NUM_ACTIONS = 4672
-    MASK_PACKED_BYTES = (4672 + 7) // 8
+    # NUM_ACTIONS actions packed into bits: ceil(NUM_ACTIONS/8) bytes per position.
+    MASK_NUM_ACTIONS = NUM_ACTIONS
+    MASK_PACKED_BYTES = (NUM_ACTIONS + 7) // 8
 
     def __init__(
         self,
@@ -161,10 +162,10 @@ class PositionData:
 
 def compute_legal_mask(cpp_game) -> np.ndarray:
     """Packed bit mask of legal action indices from a live C++ ChessGame."""
-    legal = np.zeros(4672, dtype=np.bool_)
+    legal = np.zeros(NUM_ACTIONS, dtype=np.bool_)
     actions = cpp_game.legal_actions()
     idx = np.asarray(actions, dtype=np.int64)
-    if idx.size and (idx.min() < 0 or idx.max() >= 4672):
+    if idx.size and (idx.min() < 0 or idx.max() >= NUM_ACTIONS):
         raise ValueError(f"legal_actions returned out-of-range indices: {idx.min()}..{idx.max()}")
     legal[idx] = True
     return np.packbits(legal)  # uint8, 584 bytes
@@ -227,7 +228,7 @@ def process_pgn_game(
         planes = zeropawn_cpp.encode_state(cpp_game)
         move_idx = zeropawn_cpp.move_to_index(cpp_game, uci_move)
 
-        if move_idx < 0 or move_idx >= 4672:
+        if move_idx < 0 or move_idx >= NUM_ACTIONS:
             # Move could not be mapped (e.g. malformed), stop game replay (DI-19)
             if diag_out is not None:
                 diag_out["truncated_replay"] = True
@@ -298,7 +299,12 @@ def save_dataset_split(
     stm_path = data_dir / "stm.bin"
     has_masks = all(p.legal_mask is not None for p in positions)
 
-    planes_mm = np.memmap(planes_path, dtype=np.float32, mode="w+", shape=(num_samples, 19, 8, 8))
+    planes_mm = np.memmap(
+        planes_path,
+        dtype=np.float32,
+        mode="w+",
+        shape=(num_samples, NUM_PLANES, BOARD_SIZE, BOARD_SIZE),
+    )
     moves_mm = np.memmap(moves_path, dtype=np.int16, mode="w+", shape=(num_samples,))
     outcomes_mm = np.memmap(outcomes_path, dtype=np.uint8, mode="w+", shape=(num_samples,))
     game_ids_mm = np.memmap(game_ids_path, dtype=np.uint64, mode="w+", shape=(num_samples,))
@@ -346,7 +352,7 @@ def save_dataset_split(
     metadata = {
         "split": split_name,
         "num_samples": num_samples,
-        "planes_shape": [19, 8, 8],
+        "planes_shape": [NUM_PLANES, BOARD_SIZE, BOARD_SIZE],
         "dtype_planes": "float32",
         "dtype_moves": "int16",
         "dtype_outcomes": "uint8",
@@ -392,7 +398,7 @@ def _flush_positions_chunk(
     n = len(positions)
     if n == 0:
         return
-    planes_arr = np.empty((n, 19, 8, 8), dtype=np.float32)
+    planes_arr = np.empty((n, NUM_PLANES, BOARD_SIZE, BOARD_SIZE), dtype=np.float32)
     moves_arr = np.empty(n, dtype=np.int16)
     outcomes_arr = np.empty(n, dtype=np.uint8)
     game_ids_arr = np.empty(n, dtype=np.uint64)
@@ -620,7 +626,7 @@ def build_binary_dataset(
         train_metadata = {
             "split": "train",
             "num_samples": n_train,
-            "planes_shape": [19, 8, 8],
+            "planes_shape": [NUM_PLANES, BOARD_SIZE, BOARD_SIZE],
             "dtype_planes": "float32",
             "dtype_moves": "int16",
             "dtype_outcomes": "uint8",
@@ -722,7 +728,7 @@ def build_binary_dataset(
             metadata = {
                 "split": split_name,
                 "num_samples": len(positions),
-                "planes_shape": [19, 8, 8],
+                "planes_shape": [NUM_PLANES, BOARD_SIZE, BOARD_SIZE],
                 "dtype_planes": "float32",
                 "dtype_moves": "int16",
                 "dtype_outcomes": "uint8",

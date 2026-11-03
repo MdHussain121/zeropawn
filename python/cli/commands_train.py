@@ -465,12 +465,6 @@ def register_parser(subparsers: argparse._SubParsersAction) -> None:
         default=False,
         help="Run bounded hardware benchmark & latency calibration (<=30s) before training",
     )
-    parser.add_argument(
-        "--auto-hardware",
-        action="store_true",
-        default=False,
-        help="Auto-configure batch size, concurrency, and devices using hardware heuristics",
-    )
     # ── Task 5: Recommended launch parameters ───────────────────────────────
     parser.add_argument(
         "--tablebase-path",

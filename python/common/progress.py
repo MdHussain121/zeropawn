@@ -439,18 +439,6 @@ def emit_error(text: str, output_fn: Optional[Callable[[str], None]] = None) -> 
     return clean
 
 
-def print_error_block(
-    what: str,
-    likely: str,
-    try_: str,
-    log_path: str,
-    verbose: bool = False,
-    traceback_text: Optional[str] = None,
-) -> str:
-    """Format + emit the standard error block on stderr."""
-    return emit_error(error_block(what, likely, try_, log_path, verbose, traceback_text))
-
-
 class ProgressReporter:
     """Handles rate-limited time-based progress reporting (every 10s default).
 

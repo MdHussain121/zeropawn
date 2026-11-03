@@ -19,6 +19,8 @@ import logging
 from multiprocessing import shared_memory
 import numpy as np
 
+from python.constants import NUM_ACTIONS, NUM_PLANES
+
 logger = logging.getLogger(__name__)
 
 
@@ -29,10 +31,10 @@ class SharedMemoryPool:
         self,
         name_prefix: str,
         capacity: int = 4096,
-        in_channels: int = 19,
+        in_channels: int = NUM_PLANES,
         height: int = 8,
         width: int = 8,
-        num_actions: int = 4672,
+        num_actions: int = NUM_ACTIONS,
         create: bool = False,
     ) -> None:
         self.name_prefix = name_prefix

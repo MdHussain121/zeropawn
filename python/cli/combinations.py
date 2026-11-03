@@ -502,7 +502,11 @@ class CombinationEngine:
             ]
             verify_args = [a for a in command_args if a.name in ("verify", "checkpoint", "device")]
             hw_args = [
-                a for a in command_args if a.name in ("auto_hardware", "calibrate", "device")
+                # S7-06 (2026-11-03): the never-read --auto-hardware flag was
+                # retired; --calibrate is the real hardware-calibration path.
+                a
+                for a in command_args
+                if a.name in ("calibrate", "device")
             ]
 
             return [

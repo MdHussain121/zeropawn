@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -325,30 +324,6 @@ def handle_interactive_command(args: argparse.Namespace) -> int:
         return 0
 
     return run_interactive_menu()
-
-
-def get_downloaded_puzzles_info(
-    puzzles_dir: str | Path = "data/puzzles",
-) -> tuple[int, list[tuple[Path, int]]]:
-    """Scan puzzles directory, count total downloaded puzzles and return per-file counts."""
-    pdir = Path(puzzles_dir)
-    if not pdir.is_dir():
-        return 0, []
-
-    files_info: list[tuple[Path, int]] = []
-    total = 0
-    for f in sorted(pdir.glob("*.csv")):
-        try:
-            with open(f, "r", encoding="utf-8") as fp:
-                reader = csv.reader(fp)
-                next(reader, None)
-                count = sum(1 for row in reader if row and len(row) >= 4)
-                if count > 0:
-                    files_info.append((f, count))
-                    total += count
-        except (OSError, UnicodeDecodeError, csv.Error):
-            continue
-    return total, files_info
 
 
 def execute_operation_from_interactive(

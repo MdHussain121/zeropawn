@@ -16,6 +16,7 @@ from typing import Optional, Union
 import numpy as np
 import torch
 from python.model.chess_net import ChessNet
+from python.constants import NUM_ACTIONS, NUM_PLANES, BOARD_SIZE
 
 try:
     import zeropawn_cpp
@@ -154,7 +155,7 @@ class PuzzleEvaluator:
 
                 for m in legal_moves:
                     idx = zeropawn_cpp.move_to_index(g, m)
-                    if 0 <= idx < 4672:
+                    if 0 <= idx < NUM_ACTIONS:
                         prob = policy_probs[j, idx]
                         if prob > best_prob:
                             best_prob = prob
@@ -217,9 +218,12 @@ class PuzzleEvaluator:
         def batched_eval_fn(batch_planes: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
             n = int(batch_planes.shape[0])
             if n == 0:
-                return (np.zeros((0, 4672), dtype=np.float32), np.zeros((0,), dtype=np.float32))
+                return (
+                    np.zeros((0, NUM_ACTIONS), dtype=np.float32),
+                    np.zeros((0,), dtype=np.float32),
+                )
             t = torch.from_numpy(np.ascontiguousarray(batch_planes, dtype=np.float32))
-            t = t.view(n, 19, 8, 8).to(self.device, non_blocking=True)
+            t = t.view(n, NUM_PLANES, BOARD_SIZE, BOARD_SIZE).to(self.device, non_blocking=True)
             if self.device == "cuda":
                 t = t.to(memory_format=torch.channels_last)
             autocast_ctx = (

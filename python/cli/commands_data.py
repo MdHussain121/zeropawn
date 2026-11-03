@@ -15,6 +15,7 @@ from rich.table import Table
 from python.cli.common import REPO_ROOT
 from python.cli.runner import execute_script_with_monitoring
 from python.cli.ui import COLOR_BORDER, console
+from python.constants import NUM_PLANES, BOARD_SIZE
 
 _BIN_FILES = ("planes.bin", "moves.bin", "outcomes.bin", "game_ids.bin", "plies.bin")
 
@@ -863,7 +864,9 @@ def run_data_inspect(args: argparse.Namespace) -> int:
         if meta:
             table.add_row("Samples Count", f"{meta.get('num_samples', 'Unknown'):,}")
             table.add_row("Kind / Category", str(meta.get("kind", "games")))
-            table.add_row("Planes Shape", str(meta.get("planes_shape", [19, 8, 8])))
+            table.add_row(
+                "Planes Shape", str(meta.get("planes_shape", [NUM_PLANES, BOARD_SIZE, BOARD_SIZE]))
+            )
 
     # Files breakdown
     file_lines = []

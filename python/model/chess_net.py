@@ -15,6 +15,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from python.constants import NUM_ACTIONS, NUM_PLANES
+
 
 class ResBlock(nn.Module):
     """Basic 2-convolution residual block with Batch Normalization."""
@@ -39,10 +41,10 @@ class ChessNet(nn.Module):
 
     def __init__(
         self,
-        in_channels: int = 19,
+        in_channels: int = NUM_PLANES,
         num_filters: int = 128,
         num_blocks: int = 12,
-        num_actions: int = 4672,
+        num_actions: int = NUM_ACTIONS,
     ) -> None:
         super().__init__()
         self.num_actions = num_actions

@@ -4,26 +4,14 @@ from __future__ import annotations
 
 import os
 import sys
-import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Optional, Sequence, Tuple, Union
 
 import psutil
 from rich import box
-from rich.console import Console, Group
-from rich.live import Live
+from rich.console import Console
 from rich.panel import Panel
-from rich.progress import (
-    BarColumn,
-    MofNCompleteColumn,
-    Progress,
-    SpinnerColumn,
-    TaskProgressColumn,
-    TextColumn,
-    TimeElapsedColumn,
-    TimeRemainingColumn,
-)
 from rich.table import Table
 from rich.text import Text
 
@@ -32,14 +20,6 @@ console = Console(highlight=False)
 err_console = Console(stderr=True, highlight=False)
 
 # Theme color constants
-COLOR_PRIMARY = "bright_cyan"
-COLOR_SECONDARY = "cyan"
-COLOR_ACCENT = "magenta"
-COLOR_SUCCESS = "bold green"
-COLOR_WARNING = "bold yellow"
-COLOR_ERROR = "bold red"
-COLOR_MUTED = "dim white"
-COLOR_HIGHLIGHT = "bright_white"
 COLOR_BORDER = "bright_blue"
 
 
@@ -304,152 +284,3 @@ def render_operation_summary(
                 border_style="dim",
             )
         )
-
-
-class LiveMonitoringDashboard:
-    """Real-time monitoring dashboard supporting live metrics, progress, hardware, and logs."""
-
-    def __init__(
-        self,
-        title: str,
-        total_steps: Optional[int] = None,
-        step_unit: str = "steps",
-        refresh_per_second: float = 4.0,
-    ) -> None:
-        self.title = title
-        self.total_steps = total_steps
-        self.step_unit = step_unit
-        self.refresh_per_second = refresh_per_second
-        self.current_step = 0
-        self.start_time = time.time()
-        self.metrics: Dict[str, Any] = {}
-        self.recent_logs: List[str] = []
-        self._live: Optional[Live] = None
-        self._is_active = False
-
-        self.progress = Progress(
-            SpinnerColumn(spinner_name="dots"),
-            TextColumn("[bold cyan]{task.description}"),
-            BarColumn(bar_width=30, complete_style="bold green", finished_style="bold bright_cyan"),
-            TaskProgressColumn(),
-            MofNCompleteColumn(),
-            TimeElapsedColumn(),
-            TimeRemainingColumn(),
-            console=console,
-        )
-        self.task_id = self.progress.add_task(
-            f"[cyan]{title}",
-            total=total_steps if total_steps and total_steps > 0 else None,
-        )
-
-    def start(self) -> None:
-        if not is_interactive():
-            console.print(f"[bold cyan]Starting task:[/] {self.title}")
-            return
-        self._is_active = True
-        self._live = Live(
-            self._render_view(),
-            console=console,
-            refresh_per_second=self.refresh_per_second,
-            transient=False,
-        )
-        self._live.start()
-
-    def update(
-        self,
-        step: Optional[int] = None,
-        advance: int = 0,
-        metrics: Optional[Dict[str, Any]] = None,
-        log_message: Optional[str] = None,
-    ) -> None:
-        if step is not None:
-            self.current_step = step
-            self.progress.update(self.task_id, completed=step)
-        elif advance > 0:
-            self.current_step += advance
-            self.progress.advance(self.task_id, advance)
-
-        if metrics:
-            self.metrics.update(metrics)
-
-        if log_message:
-            ts = datetime.now().strftime("%H:%M:%S")
-            self.recent_logs.append(f"[{ts}] {log_message}")
-            if len(self.recent_logs) > 6:
-                self.recent_logs.pop(0)
-
-        if self._live and self._is_active:
-            self._live.update(self._render_view())
-        elif not is_interactive() and log_message:
-            console.print(f"[{datetime.now().strftime('%H:%M:%S')}] {log_message}")
-
-    def stop(self) -> None:
-        if self._live and self._is_active:
-            self._is_active = False
-            self._live.stop()
-            self._live = None
-
-    def __enter__(self) -> "LiveMonitoringDashboard":
-        self.start()
-        return self
-
-    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        self.stop()
-
-    def _render_view(self) -> Group:
-        elapsed = time.time() - self.start_time
-        hw = get_hardware_metrics()
-
-        # Metrics table
-        m_table = Table.grid(expand=True, padding=(0, 2))
-        m_table.add_column(style="bold bright_white", justify="left")
-        m_table.add_column(style="bold yellow", justify="left")
-        m_table.add_column(style="bold bright_white", justify="left")
-        m_table.add_column(style="bold yellow", justify="left")
-
-        metric_items = list(self.metrics.items())
-        for i in range(0, len(metric_items), 2):
-            k1, v1 = metric_items[i]
-            if i + 1 < len(metric_items):
-                k2, v2 = metric_items[i + 1]
-                m_table.add_row(f"{k1}:", str(v1), f"{k2}:", str(v2))
-            else:
-                m_table.add_row(f"{k1}:", str(v1), "", "")
-
-        # System info line
-        sys_info = (
-            f"[dim]CPU: [bold cyan]{hw['cpu_percent']}[/bold cyan] | "
-            f"RAM: [bold cyan]{hw['ram_used_gb']}/{hw['ram_total_gb']}[/bold cyan] | "
-            f"GPU: [bold cyan]{hw['gpu_name']}[/bold cyan] (VRAM: [bold cyan]{hw['vram_used_mb']}[/bold cyan]) | "
-            f"Elapsed: [bold cyan]{elapsed:.1f}s[/bold cyan][/dim]"
-        )
-
-        elements: List[Any] = [
-            Panel(
-                Group(
-                    self.progress,
-                    m_table if metric_items else Text("Running...", style="dim"),
-                    Text.from_markup(f"\n{sys_info}"),
-                ),
-                title=f"[bold bright_cyan]{self.title}[/bold bright_cyan]",
-                box=box.ROUNDED,
-                border_style=COLOR_BORDER,
-                padding=(0, 1),
-            )
-        ]
-
-        if self.recent_logs:
-            log_group = Group(
-                *[Text.from_markup(f"[dim]{line}[/dim]") for line in self.recent_logs]
-            )
-            elements.append(
-                Panel(
-                    log_group,
-                    title="[bold dim]Recent Output & Events[/bold dim]",
-                    box=box.ROUNDED,
-                    border_style="dim",
-                    padding=(0, 1),
-                )
-            )
-
-        return Group(*elements)

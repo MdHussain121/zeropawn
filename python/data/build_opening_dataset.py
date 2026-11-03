@@ -22,6 +22,7 @@ import numpy as np
 import python  # noqa: F401  (ensures zeropawn_cpp + DLL paths)
 import zeropawn_cpp
 from python.data.opening_corpus import OpeningCorpus
+from python.constants import NUM_ACTIONS, NUM_PLANES, BOARD_SIZE
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +72,7 @@ def build_opening_dataset(
         for ev in qual_moves:
             try:
                 idx = zeropawn_cpp.move_to_index(cpp_game, ev.uci)
-                if 0 <= idx < 4672:
+                if 0 <= idx < NUM_ACTIONS:
                     indices.append(idx)
                     # Weight by frequency (at least 1)
                     w = max(1.0, float(ev.frequency))
@@ -91,7 +92,7 @@ def build_opening_dataset(
         chosen_idx = rng.choice(indices, p=probs)
 
         # Policy distribution (4672,)
-        policy_dist = np.zeros(4672, dtype=np.float32)
+        policy_dist = np.zeros(NUM_ACTIONS, dtype=np.float32)
         for idx, p in zip(indices, probs):
             policy_dist[idx] = p
 
@@ -149,14 +150,16 @@ def _write_dataset_split(split_dir: Path, samples: List[Dict[str, Any]], split_n
     policy_targets_path = split_dir / "policy_targets.bin"
     meta_path = split_dir / "metadata.json"
 
-    planes_mm = np.memmap(planes_path, dtype=np.float32, mode="w+", shape=(num, 19, 8, 8))
+    planes_mm = np.memmap(
+        planes_path, dtype=np.float32, mode="w+", shape=(num, NUM_PLANES, BOARD_SIZE, BOARD_SIZE)
+    )
     moves_mm = np.memmap(moves_path, dtype=np.int16, mode="w+", shape=(num,))
     outcomes_mm = np.memmap(outcomes_path, dtype=np.uint8, mode="w+", shape=(num,))
     game_ids_mm = np.memmap(game_ids_path, dtype=np.uint64, mode="w+", shape=(num,))
     plies_mm = np.memmap(plies_path, dtype=np.int16, mode="w+", shape=(num,))
     val_targets_mm = np.memmap(val_targets_path, dtype=np.float32, mode="w+", shape=(num, 3))
     policy_targets_mm = np.memmap(
-        policy_targets_path, dtype=np.float32, mode="w+", shape=(num, 4672)
+        policy_targets_path, dtype=np.float32, mode="w+", shape=(num, NUM_ACTIONS)
     )
 
     for i, s in enumerate(samples):

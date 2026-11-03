@@ -26,6 +26,7 @@ import torch.nn.functional as F
 import zstandard
 
 from python.model.chess_net import ChessNet
+from python.constants import NUM_ACTIONS
 import zeropawn_cpp
 
 logger = logging.getLogger(__name__)
@@ -353,7 +354,7 @@ class MistakeLearner:
         best_prob = -1.0
         for m in legal_moves:
             idx = zeropawn_cpp.move_to_index(g, m)
-            if 0 <= idx < 4672 and probs[idx] > best_prob:
+            if 0 <= idx < NUM_ACTIONS and probs[idx] > best_prob:
                 best_prob = float(probs[idx])
                 best_move = m
 
@@ -432,11 +433,11 @@ class MistakeLearner:
                 # Fallback: assume all moves illegal except target (should not happen for valid data)
                 legal_moves_uci = []
             legal_moves_uci = g.legal_moves_uci()
-            mask = torch.zeros(4672, dtype=torch.bool)
+            mask = torch.zeros(NUM_ACTIONS, dtype=torch.bool)
             for mv in legal_moves_uci:
                 try:
                     idx = zeropawn_cpp.move_to_index(g, mv)
-                    if 0 <= idx < 4672:
+                    if 0 <= idx < NUM_ACTIONS:
                         mask[idx] = True
                 except Exception:
                     pass
@@ -527,7 +528,7 @@ class MistakeLearner:
                 continue
             g.make_move_uci(puzzle.opponent_move)
             target_idx = zeropawn_cpp.move_to_index(g, puzzle.solution_move)
-            if not (0 <= target_idx < 4672):
+            if not (0 <= target_idx < NUM_ACTIONS):
                 continue
 
             planes = zeropawn_cpp.encode_state(g)

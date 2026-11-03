@@ -35,12 +35,6 @@ def register_parser(subparsers: argparse._SubParsersAction) -> None:
         "profile", aliases=["prof"], help="Inspect or recalibrate the persistent hardware profile."
     )
     p_prof.add_argument(
-        "--show",
-        action="store_true",
-        default=False,
-        help="Display the active hardware profile (default action)",
-    )
-    p_prof.add_argument(
         "--recalibrate",
         "-r",
         action="store_true",
@@ -105,8 +99,11 @@ def register_parser(subparsers: argparse._SubParsersAction) -> None:
 
 
 def run_hardware_profile_default(args: argparse.Namespace) -> int:
-    """Default handler for `chess hardware` when no subcommand is specified."""
-    setattr(args, "show", True)
+    """Default handler for `chess hardware` when no subcommand is specified.
+
+    Display is the default action (the retired unread ``--show`` flag,
+    S7-06, added nothing on top of it).
+    """
     setattr(args, "recalibrate", False)
     setattr(args, "reset", False)
     setattr(args, "workload", "all")
@@ -277,7 +274,6 @@ def run_hardware_profile(args: argparse.Namespace) -> int:
 def run_hardware_calibrate(args: argparse.Namespace) -> int:
     """Shortcut command to run calibration directly."""
     setattr(args, "recalibrate", True)
-    setattr(args, "show", True)
     setattr(args, "reset", False)
     setattr(args, "workload", "all")
     setattr(args, "format", "table")

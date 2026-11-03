@@ -5,6 +5,7 @@ BOARD_SIZE: int = 8
 NUM_SQUARES: int = 64
 STATE_SIZE: int = 1216  # NUM_PLANES * NUM_SQUARES
 NUM_ACTIONS: int = 4672  # 64 * 73
+PLANES_SHAPE: tuple = (NUM_PLANES, BOARD_SIZE, BOARD_SIZE)  # encode_state output shape
 
 FULL_SIMS: int = 800
 FAST_SIMS: int = 150

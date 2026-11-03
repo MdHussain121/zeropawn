@@ -19,11 +19,12 @@ inferred from directory names alone.
 from __future__ import annotations
 
 import hashlib
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional
 import numpy as np
+
+from python.constants import BOARD_SIZE, NUM_ACTIONS as NUM_ACTIONS, NUM_PLANES as NUM_PLANES
 
 # Schema of the binary split arrays (planes/moves/outcomes/game_ids/plies and
 # optional value/policy/dtz targets). Bump when the layout changes.
@@ -43,8 +44,9 @@ OUTCOME_LOSS: int = 2
 # Syzygy 5-class outcomes (cursed win / blessed loss distinctions).
 OUTCOME_SYZYGY_DOMAIN: tuple[int, ...] = (0, 1, 2, 3, 4)
 
-NUM_ACTIONS = 4672
-PLANES_SHAPE = (19, 8, 8)
+# Re-sourced from python.constants (S7-01 reconnection): the enforced contract
+# mirrors cpp/include/zeropawn/encoder.hpp via python/constants.py.
+PLANES_SHAPE = (NUM_PLANES, BOARD_SIZE, BOARD_SIZE)
 
 # Required array files for every split (the loader memory-maps all of these
 # unconditionally, so any loadable dataset must carry them).
@@ -384,10 +386,3 @@ def detect_git_commit() -> Optional[str]:
     except Exception:
         pass
     return None
-
-
-def atomic_replace(src: Path, dst: Path) -> None:
-    """Publish ``src`` at ``dst`` atomically on the same filesystem."""
-    src = Path(src)
-    dst = Path(dst)
-    os.replace(src, dst)

@@ -24,6 +24,7 @@ from python.cli.common import (
     setup_environment,
     validate_fen_or_raise,
 )
+from python.constants import BOARD_SIZE, NUM_ACTIONS, NUM_PLANES
 from python.hardware.profile import resolve_batch_size
 from python.model.checkpoint_registry import DefaultCheckpointError
 
@@ -87,12 +88,6 @@ def register_parser(subparsers: argparse._SubParsersAction) -> None:
             "Path to neural network model checkpoint (default: the registry-designated "
             "default). Pass '' explicitly to run model-less (uniform-policy evaluator)."
         ),
-    )
-    search_parser.add_argument(
-        "--top-moves",
-        type=int,
-        default=5,
-        help="Number of top candidate moves to display (default: 5)",
     )
     search_parser.add_argument(
         "--format",
@@ -174,9 +169,9 @@ def run_search(args: argparse.Namespace) -> int:
     def _batched_eval(batch_planes: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         n = int(batch_planes.shape[0])
         if n == 0 or model is None:
-            return (np.zeros((n, 4672), dtype=np.float32), np.zeros(n, dtype=np.float32))
+            return (np.zeros((n, NUM_ACTIONS), dtype=np.float32), np.zeros(n, dtype=np.float32))
         t = torch.from_numpy(np.ascontiguousarray(batch_planes, dtype=np.float32))
-        t = t.view(n, 19, 8, 8).to(device, non_blocking=True)
+        t = t.view(n, NUM_PLANES, BOARD_SIZE, BOARD_SIZE).to(device, non_blocking=True)
         if device == "cuda":
             t = t.to(memory_format=torch.channels_last)
         with torch.no_grad():

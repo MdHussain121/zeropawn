@@ -28,7 +28,7 @@ if str(_repo_root) not in sys.path:
 
 import python  # ensures zeropawn_cpp
 import zeropawn_cpp
-from python.cli.common import setup_logging
+from python.cli.common import print_warning, setup_logging
 from python.common.progress import (
     banner,
     emit_error,
@@ -43,6 +43,7 @@ from python.common.progress import (
     summary_block,
 )
 from python.data.dataset import BinaryChessDataset
+from python.data.dataset_validation import verify_receipt
 from python.model.chess_net import ChessNet
 from python.data.fen_utils import decode_planes_to_fen
 from python.train.train_supervised import compute_policy_entropy
@@ -66,6 +67,15 @@ def evaluate_heldout(
     )
 
     val_ds = BinaryChessDataset(val_dir)
+    # S2-12 (2026-11-03): diagnostic script — consumption stays gate-free, but
+    # a dataset without a valid validation receipt must be loudly flagged.
+    _ok, _reasons, _rcpt = verify_receipt(Path(val_dir), deep=False)
+    if not _ok:
+        print_warning(
+            f"UNCERTIFIED DATA: eval_heldout is consuming {val_dir} without a valid "
+            f"validation receipt ({'; '.join(_reasons[:4])}). This consumption is not "
+            "covered by any validation contract."
+        )
     val_loader = DataLoader(
         val_ds,
         batch_size=batch_size,

@@ -15,10 +15,9 @@ phase4_final_checkpoint.pt) unless asked.
 from __future__ import annotations
 
 import logging
-import shutil
 import time
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -48,11 +47,6 @@ PROTECTED_CHECKPOINTS = frozenset(
         "curriculum_final_latest.pt",
     }
 )
-
-# Cross-process lock files created by python.common.artifacts.artifact_lock.
-# They are empty sentinels that the OS releases on process exit; cleanup may
-# remove them once their owning run is over.
-LOCK_FILE_SUFFIXES = (".lock", ".lock.owner")
 
 
 def _rm_file(path: Path) -> bool:
@@ -167,39 +161,6 @@ def prune_tfevents(log_dir: str | Path, keep_last_n: int = 1) -> dict[str, int]:
     return stats
 
 
-def cleanup_caches(repo_root: str | Path) -> dict[str, int]:
-    """Delete regenerable caches: __pycache__, .pytest_cache, .ruff_cache, tmp/ files."""
-    root = Path(repo_root)
-    stats = {"deleted": 0, "failed": 0}
-    for cache_name in (".pytest_cache", ".ruff_cache"):
-        p = root / cache_name
-        if p.exists():
-            try:
-                shutil.rmtree(p, ignore_errors=True)
-                stats["deleted"] += 1
-            except OSError:
-                stats["failed"] += 1
-                logger.debug("cleanup: could not remove %s", p, exc_info=True)
-    for pycache in root.rglob("__pycache__"):
-        try:
-            shutil.rmtree(pycache, ignore_errors=True)
-            stats["deleted"] += 1
-        except OSError:
-            stats["failed"] += 1
-    tmp_dir = root / "tmp"
-    if tmp_dir.is_dir():
-        for p in tmp_dir.iterdir():
-            try:
-                if p.is_dir() and not p.is_symlink():
-                    shutil.rmtree(p, ignore_errors=True)
-                else:
-                    p.unlink()
-                stats["deleted"] += 1
-            except OSError:
-                stats["failed"] += 1
-    return stats
-
-
 def sweep_stale_lock_files(target: str | Path, *, min_age_sec: float = 600.0) -> int:
     """Remove *stale* lock sentinels for one artifact. Never raises.
 
@@ -283,31 +244,3 @@ def cleanup_run(
             except OSError:
                 logger.debug("lock sweep failed for %s", artifact, exc_info=True)
     return report
-
-
-def iter_junk_report(repo_root: str | Path) -> Iterable[tuple[str, int, int]]:
-    """Yield (label, size_bytes, file_count) for known junk locations."""
-    root = Path(repo_root)
-    for label, sub in (
-        ("replay buffers", "runs"),
-        ("tensorboard events", "runs"),
-        ("logs", "logs"),
-        ("tmp", "tmp"),
-        ("build", "build"),
-    ):
-        base = root / sub
-        if not base.exists():
-            continue
-        if label == "replay buffers":
-            files = list(base.rglob("buffer/*.bin"))
-        elif label == "tensorboard events":
-            files = list(base.rglob("events.out.tfevents.*"))
-        else:
-            files = [p for p in base.rglob("*") if p.is_file()]
-        size = 0
-        for p in files:
-            try:
-                size += p.stat().st_size
-            except OSError:
-                continue
-        yield label, size, len(files)

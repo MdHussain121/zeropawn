@@ -471,50 +471,6 @@ def resolve_stockfish(path: Optional[Union[str, Path]] = None) -> Optional[Path]
     return None
 
 
-def ask_int(
-    prompt: str, default: int, min_val: Optional[int] = None, max_val: Optional[int] = None
-) -> int:
-    """REPL integer prompt with range check; falls back to default on bad input."""
-    try:
-        raw = console.input(prompt).strip() or str(default)
-    except (EOFError, KeyboardInterrupt):
-        raise
-    try:
-        val = int(raw)
-    except (ValueError, TypeError):
-        print_warning(f"Invalid integer {raw!r}; using default {default}.")
-        return default
-    if min_val is not None and val < min_val:
-        print_warning(f"Value {val} below min {min_val}; clamped.")
-        return min_val
-    if max_val is not None and val > max_val:
-        print_warning(f"Value {val} above max {max_val}; clamped.")
-        return max_val
-    return val
-
-
-def ask_float(
-    prompt: str, default: float, min_val: Optional[float] = None, max_val: Optional[float] = None
-) -> float:
-    """REPL float prompt with range check; falls back to default on bad input."""
-    try:
-        raw = console.input(prompt).strip() or str(default)
-    except (EOFError, KeyboardInterrupt):
-        raise
-    try:
-        val = float(raw)
-    except (ValueError, TypeError):
-        print_warning(f"Invalid number {raw!r}; using default {default}.")
-        return default
-    if min_val is not None and val < min_val:
-        print_warning(f"Value {val} below min {min_val}; clamped.")
-        return min_val
-    if max_val is not None and val > max_val:
-        print_warning(f"Value {val} above max {max_val}; clamped.")
-        return max_val
-    return val
-
-
 def wait_for_enter(prompt: str = "\nPress [Enter] to continue...") -> None:
     """Prompt the user to press Enter, but immediately return if stdin is not a TTY."""
     if sys.stdin and hasattr(sys.stdin, "isatty") and sys.stdin.isatty():

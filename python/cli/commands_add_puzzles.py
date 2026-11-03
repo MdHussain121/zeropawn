@@ -13,7 +13,6 @@ from typing import Optional
 import zstandard
 
 from python.cli.common import (
-    REPO_ROOT,
     console,
     print_banner,
     print_error,
@@ -40,7 +39,6 @@ import logging
 logger = logging.getLogger(__name__)
 
 LICHESS_PUZZLE_URL = "https://database.lichess.org/lichess_db_puzzle.csv.zst"
-DEFAULT_PUZZLE_CSV = REPO_ROOT / "data" / "puzzles" / "lichess_puzzles_1000_1200_1600.csv"
 
 
 def register_parser(subparsers: argparse._SubParsersAction) -> None:

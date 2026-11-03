@@ -46,6 +46,7 @@ if str(_root) not in sys.path:
 
 import python  # noqa: F401  (ensures zeropawn_cpp + DLL paths)
 import zeropawn_cpp
+from python.constants import NUM_ACTIONS, NUM_PLANES, BOARD_SIZE
 from python.data.build_dataset import (
     OUTCOME_UNAVAILABLE,
     PositionData,
@@ -132,7 +133,7 @@ def _collect_puzzle_records(
                     move_idx = zeropawn_cpp.move_to_index(game, sol_move)
                 except Exception:
                     move_idx = -1
-                if not (0 <= move_idx < 4672):
+                if not (0 <= move_idx < NUM_ACTIONS):
                     skip_reasons["unencodable_move"] += 1
                     break
                 if sol_move not in game.legal_moves_uci():
@@ -383,7 +384,12 @@ def _verify_serialized_output(output_dir: Path, n_train: int, n_val: int) -> dic
     def row_hashes(split_dir: Path, n: int) -> set[bytes]:
         if n == 0:
             return set()
-        mm = np.memmap(split_dir / "planes.bin", dtype=np.float32, mode="r", shape=(n, 19, 8, 8))
+        mm = np.memmap(
+            split_dir / "planes.bin",
+            dtype=np.float32,
+            mode="r",
+            shape=(n, NUM_PLANES, BOARD_SIZE, BOARD_SIZE),
+        )
         keys: set[bytes] = set()
         chunk = 2048
         try:

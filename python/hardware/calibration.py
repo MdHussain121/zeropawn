@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Sequence
 import torch
 
 from python.model.chess_net import ChessNet
+from python.constants import NUM_PLANES, BOARD_SIZE
 
 
 @dataclasses.dataclass
@@ -67,9 +68,9 @@ def run_calibration(
     # 1. CPU Inference Timing
     try:
         if time.time() < deadline:
-            cpu_model = ChessNet(in_channels=19, num_filters=64, num_blocks=4).cpu()
+            cpu_model = ChessNet(in_channels=NUM_PLANES, num_filters=64, num_blocks=4).cpu()
             cpu_model.eval()
-            dummy_cpu = torch.zeros((4, 19, 8, 8), dtype=torch.float32)
+            dummy_cpu = torch.zeros((4, NUM_PLANES, BOARD_SIZE, BOARD_SIZE), dtype=torch.float32)
             # Warm-up
             with torch.inference_mode():
                 _ = cpu_model(dummy_cpu)
@@ -88,7 +89,7 @@ def run_calibration(
     if torch.cuda.is_available():
         try:
             if time.time() < deadline:
-                gpu_model = ChessNet(in_channels=19, num_filters=128, num_blocks=12).cuda()
+                gpu_model = ChessNet(in_channels=NUM_PLANES, num_filters=128, num_blocks=12).cuda()
                 gpu_model = gpu_model.to(memory_format=torch.channels_last)
                 gpu_model.eval()
 
@@ -104,7 +105,9 @@ def run_calibration(
                 for bs in test_batch_sizes:
                     if time.time() >= deadline:
                         break
-                    dummy_gpu = torch.zeros((bs, 19, 8, 8), dtype=torch.float32, device="cuda")
+                    dummy_gpu = torch.zeros(
+                        (bs, NUM_PLANES, BOARD_SIZE, BOARD_SIZE), dtype=torch.float32, device="cuda"
+                    )
                     dummy_gpu = dummy_gpu.to(memory_format=torch.channels_last)
 
                     # Warm-up with bfloat16

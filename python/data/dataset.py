@@ -11,11 +11,12 @@ import logging
 import os
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Optional, Union, Dict, Any, TypedDict
+from typing import Optional, Union, Dict, Any
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from python.constants import NUM_ACTIONS, PLANES_SHAPE
 from python.data.build_dataset import OUTCOME_UNAVAILABLE
 
 logger = logging.getLogger(__name__)
@@ -118,12 +119,6 @@ def determine_is_tactical(
     return False
 
 
-class DatasetMeta(TypedDict, total=False):
-    num_samples: int
-    planes_shape: list[int]
-    split: str
-
-
 def _validate_meta(metadata: Dict[str, Any]) -> tuple[int, tuple[int, ...]]:
     try:
         num_samples = int(metadata["num_samples"])
@@ -131,9 +126,9 @@ def _validate_meta(metadata: Dict[str, Any]) -> tuple[int, tuple[int, ...]]:
         raise ValueError(f"Invalid dataset metadata num_samples: {e}") from e
     if not 1 <= num_samples <= 1_000_000_000:
         raise ValueError(f"num_samples {num_samples} out of range [1, 1e9]")
-    planes_shape = tuple(metadata.get("planes_shape", [19, 8, 8]))
-    if tuple(planes_shape) != (19, 8, 8):
-        raise ValueError(f"planes_shape must be [19, 8, 8], got {list(planes_shape)}")
+    planes_shape = tuple(metadata.get("planes_shape", list(PLANES_SHAPE)))
+    if tuple(planes_shape) != PLANES_SHAPE:
+        raise ValueError(f"planes_shape must be {list(PLANES_SHAPE)}, got {list(planes_shape)}")
     return num_samples, planes_shape  # type: ignore[return-value]
 
 
@@ -172,7 +167,7 @@ def _outcome_to_value_target(outcomes: np.ndarray, is_syzygy: bool) -> np.ndarra
 # (byte >> shift[i]) & 1 with shift = [7, 6, ..., 0].
 _PACK_SHIFT = torch.tensor([7, 6, 5, 4, 3, 2, 1, 0], dtype=torch.uint8)
 
-MASK_PACKED_BYTES = (4672 + 7) // 8  # 584 — 4672 actions bit-packed
+MASK_PACKED_BYTES = (NUM_ACTIONS + 7) // 8  # 584 — NUM_ACTIONS actions bit-packed
 
 
 def decode_packed_masks(packed: torch.Tensor) -> torch.Tensor:
@@ -284,7 +279,7 @@ class BinaryChessDataset(Dataset):
                 policy_targets_path,
                 dtype=np.float32,
                 mode="r",
-                shape=(self.num_samples, 4672),
+                shape=(self.num_samples, NUM_ACTIONS),
             )
         else:
             self.policy_targets = None
@@ -317,7 +312,7 @@ class BinaryChessDataset(Dataset):
         # masked loss in subtle ways.
         self.masks = None
         masks_path = self.data_dir / "masks.bin"
-        packed_bytes = (4672 + 7) // 8
+        packed_bytes = (NUM_ACTIONS + 7) // 8
         if masks_path.exists():
             _check_st_size(masks_path, self.num_samples * packed_bytes)
             self.masks = np.memmap(
@@ -361,7 +356,7 @@ class BinaryChessDataset(Dataset):
         }
 
         if self.masks is not None:
-            unpacked = np.unpackbits(np.array(self.masks[idx]), count=4672)
+            unpacked = np.unpackbits(np.array(self.masks[idx]), count=NUM_ACTIONS)
             sample["legal_mask"] = torch.from_numpy(unpacked.astype(np.bool_))
 
         if outcome == OUTCOME_UNAVAILABLE:

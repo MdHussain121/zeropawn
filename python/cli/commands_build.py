@@ -11,6 +11,7 @@ from rich import box
 from rich.table import Table
 
 from python.cli.common import REPO_ROOT
+from python.constants import NUM_ACTIONS, NUM_PLANES, BOARD_SIZE
 from python.cli.ui import COLOR_BORDER, console
 
 
@@ -182,7 +183,9 @@ def run_build_compat(args: argparse.Namespace) -> int:
     # 3. State encoder
     try:
         planes = cpp_mod.encode_state(g)
-        assert planes.shape == (19, 8, 8), f"Expected (19, 8, 8), got {planes.shape}"
+        assert planes.shape == (NUM_PLANES, BOARD_SIZE, BOARD_SIZE), (
+            f"Expected ({NUM_PLANES}, {BOARD_SIZE}, {BOARD_SIZE}), got {planes.shape}"
+        )
         assert planes.dtype.name == "float32"
         console.print("  [green]✓[/green] encode_state tensor shape verified: (19, 8, 8) float32")
     except Exception as e:
@@ -209,7 +212,7 @@ def run_build_compat(args: argparse.Namespace) -> int:
 
         def mock_eval(game):
             # Return contiguous numpy float32 array
-            policy = np.full(4672, 1.0 / 4672, dtype=np.float32)
+            policy = np.full(NUM_ACTIONS, 1.0 / NUM_ACTIONS, dtype=np.float32)
             return (policy, 0.0)
 
         res = mcts.search(g, 10, mock_eval)

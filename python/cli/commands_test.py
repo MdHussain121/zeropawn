@@ -26,7 +26,6 @@ import logging
 logger = logging.getLogger(__name__)
 
 DENIED_PYTEST_ARGS = {"-p", "--rootdir", "-c", "--config-file", "--rootdir="}
-ALLOWED_PYTEST_PREFIXES = ("-k", "-x", "-q", "-v", "-s", "--lf", "--ff", "-m", "--maxfail", "-l")
 
 SUITE_MAPPING = {
     "all": ["tests/"],

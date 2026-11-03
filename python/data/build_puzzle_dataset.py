@@ -27,61 +27,9 @@ import numpy as np
 import python  # noqa: F401  (ensures zeropawn_cpp + DLL paths)
 import zeropawn_cpp
 
-from python.cli.common import REPO_ROOT
+from python.constants import NUM_ACTIONS, NUM_PLANES, BOARD_SIZE
 
 logger = logging.getLogger(__name__)
-
-
-def validate_label_with_stockfish(
-    sol_move_uci: str, fen_before_opponent: str, opponent_move_uci: str, depth: int = 14
-) -> dict:
-    """Validate a puzzle label against Stockfish (audit Â§9, P2).
-
-    Returns {
-        "agreement": bool,
-        "sf_top1": str | None,
-        "label_is_sf_top": bool,
-        "tie_count_25cp": int,
-        "label_cp_loss": float,
-    }
-    Disabled by default (Stockfish subprocess overhead); call explicitly.
-    """
-    try:
-        stockfish_path = (REPO_ROOT / "tools" / "stockfish.exe").resolve()
-        if not stockfish_path.exists():
-            return {
-                "agreement": False,
-                "sf_top1": None,
-                "label_is_sf_top": False,
-                "tie_count_25cp": 0,
-                "label_cp_loss": 9999,
-                "error": "stockfish not found",
-            }
-        # Write temporary FEN + move for analysis
-        board = chess.Board(fen_before_opponent)
-        if opponent_move_uci:
-            board.push_uci(opponent_move_uci)
-        board.fen()
-        # Quick UCI-based probe: we don't run a full SF session here (too slow for batch),
-        # but we expose the interface so build scripts can call it per-sample.
-        # For production use, run SF depth 14 externally and compare bestmove to sol_move_uci.
-        return {
-            "agreement": None,
-            "sf_top1": None,
-            "label_is_sf_top": None,
-            "tie_count_25cp": 0,
-            "label_cp_loss": 0.0,
-            "note": "Stockfish validation requires external subprocess call; interface provided.",
-        }
-    except Exception as exc:
-        return {
-            "agreement": False,
-            "sf_top1": None,
-            "label_is_sf_top": False,
-            "tie_count_25cp": 0,
-            "label_cp_loss": 9999,
-            "error": str(exc),
-        }
 
 
 def build_puzzle_dataset(
@@ -189,13 +137,13 @@ def build_puzzle_dataset(
 
             try:
                 sol_idx = zeropawn_cpp.move_to_index(cpp_game, sol_move_uci)
-                if not (0 <= sol_idx < 4672):
+                if not (0 <= sol_idx < NUM_ACTIONS):
                     continue
             except Exception:
                 continue
 
             # Build policy distribution: sharp target on winning tactical solution
-            policy_dist = np.zeros(4672, dtype=np.float32)
+            policy_dist = np.zeros(NUM_ACTIONS, dtype=np.float32)
             policy_dist[sol_idx] = 1.0
 
             # Value target: masked when no real WDL outcome is available.
@@ -298,14 +246,16 @@ def _write_dataset_split(split_dir: Path, samples: List[Dict[str, Any]], split_n
     policy_targets_path = split_dir / "policy_targets.bin"
     meta_path = split_dir / "metadata.json"
 
-    planes_mm = np.memmap(planes_path, dtype=np.float32, mode="w+", shape=(num, 19, 8, 8))
+    planes_mm = np.memmap(
+        planes_path, dtype=np.float32, mode="w+", shape=(num, NUM_PLANES, BOARD_SIZE, BOARD_SIZE)
+    )
     moves_mm = np.memmap(moves_path, dtype=np.int16, mode="w+", shape=(num,))
     outcomes_mm = np.memmap(outcomes_path, dtype=np.uint8, mode="w+", shape=(num,))
     game_ids_mm = np.memmap(game_ids_path, dtype=np.uint64, mode="w+", shape=(num,))
     plies_mm = np.memmap(plies_path, dtype=np.int16, mode="w+", shape=(num,))
     val_targets_mm = np.memmap(val_targets_path, dtype=np.float32, mode="w+", shape=(num, 3))
     policy_targets_mm = np.memmap(
-        policy_targets_path, dtype=np.float32, mode="w+", shape=(num, 4672)
+        policy_targets_path, dtype=np.float32, mode="w+", shape=(num, NUM_ACTIONS)
     )
 
     for i, s in enumerate(samples):

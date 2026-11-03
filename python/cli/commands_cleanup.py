@@ -113,18 +113,6 @@ def register_parser(subparsers: argparse._SubParsersAction) -> None:
         default=1,
         help="Keep newest N TensorBoard event files per log dir (default: 1).",
     )
-    parser.add_argument(
-        "--include-buffer",
-        action="store_true",
-        default=False,
-        help="Include preallocated replay buffer memmaps (*.bin) in cleanup scope.",
-    )
-    parser.add_argument(
-        "--include-caches",
-        action="store_true",
-        default=False,
-        help="Include regenerable development caches (__pycache__, .pytest_cache).",
-    )
     parser.set_defaults(func=run_cleanup_default)
 
 

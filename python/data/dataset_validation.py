@@ -35,6 +35,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from python.constants import NUM_ACTIONS
 from python.data.dataset_contract import (
     BUILD_RECORD_NAME,
     OUTCOME_UNAVAILABLE,
@@ -73,7 +74,7 @@ def _array_num_bytes(name: str, num_samples: int) -> int:
     if name == "value_targets.bin":
         return num_samples * 3 * itemsize
     if name == "policy_targets.bin":
-        return num_samples * 4672 * itemsize
+        return num_samples * NUM_ACTIONS * itemsize
     return num_samples * itemsize
 
 
@@ -317,15 +318,15 @@ def validate_split(
         )
     )
 
-    out_of_range_moves = int(((moves < 0) | (moves >= 4672)).sum())
+    out_of_range_moves = int(((moves < 0) | (moves >= NUM_ACTIONS)).sum())
     report.add(
         CheckResult(
             "move_index_range",
             CheckStatus.PASS if out_of_range_moves == 0 else CheckStatus.FAIL,
             (
-                f"all {moves.size} move indices within [0, 4672)"
+                f"all {moves.size} move indices within [0, {NUM_ACTIONS})"
                 if out_of_range_moves == 0
-                else f"{out_of_range_moves} move indices outside [0, 4672)"
+                else f"{out_of_range_moves} move indices outside [0, {NUM_ACTIONS})"
             ),
         )
     )
@@ -377,7 +378,7 @@ def validate_split(
         report.add(_check_value_targets(vt))
     pt_path = split_dir / "policy_targets.bin"
     if pt_path.is_file():
-        pt = np.memmap(pt_path, dtype=np.float32, mode="r", shape=(num_samples, 4672))
+        pt = np.memmap(pt_path, dtype=np.float32, mode="r", shape=(num_samples, NUM_ACTIONS))
         report.add(_check_policy_targets(pt, num_samples))
     dtz_path = split_dir / "dtz_targets.bin"
     if dtz_path.is_file():

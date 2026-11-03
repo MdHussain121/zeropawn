@@ -1417,7 +1417,8 @@ OPERATIONS_REGISTRY: List[OperationDef] = [
         direct_command="zeropawn hardware profile",
         requires_model="none",
         arguments=[
-            OpArgument("show", "--show", "bool", True, "Display the active hardware profile"),
+            # S7-06 (2026-11-03): the unread --show flag was retired; display
+            # is the profile command's default action.
             OpArgument(
                 "recalibrate",
                 "--recalibrate",

@@ -42,10 +42,11 @@ def test_parser_has_all_new_subcommands():
     assert hasattr(args_hw_info, "func")
     assert args_hw_info.hardware_subcommand == "info"
 
-    args_hw_prof = parser.parse_args(["hardware", "profile", "--show"])
+    # --show was retired (S7-06: parsed-never-read); display is the default
+    # profile action, so the bare command must still parse and display.
+    args_hw_prof = parser.parse_args(["hardware", "profile"])
     assert hasattr(args_hw_prof, "func")
     assert args_hw_prof.hardware_subcommand == "profile"
-    assert args_hw_prof.show is True
 
     # 2. Search command parsing
     args_search = parser.parse_args(
@@ -179,8 +180,8 @@ def test_hardware_commands_execution(capsys):
     ret = main(["hardware", "info"])
     assert ret == 0
 
-    # Run hardware profile --show
-    ret = main(["hardware", "profile", "--show"])
+    # Run hardware profile (display is the default action; --show retired S7-06)
+    ret = main(["hardware", "profile"])
     assert ret == 0
 
     # Run hardware profile --format json

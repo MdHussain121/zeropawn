@@ -207,11 +207,22 @@ def generate_value_targets_for_dataset(
     threads: int = 8,
 ) -> None:
     """Generate Stockfish WDL targets for a subset of the dataset and save value_targets.bin."""
+    from python.cli.common import print_warning
     from python.data.dataset import BinaryChessDataset
+    from python.data.dataset_validation import verify_receipt
     from python.data.fen_utils import decode_planes_to_fen
 
     dir_path = Path(data_dir)
     ds = BinaryChessDataset(dir_path)
+    # S2-12 (2026-11-03): diagnostic script — consumption stays gate-free, but
+    # a dataset without a valid validation receipt must be loudly flagged.
+    _ok, _reasons, _rcpt = verify_receipt(dir_path, deep=False)
+    if not _ok:
+        print_warning(
+            f"UNCERTIFIED DATA: stockfish_eval is consuming {dir_path} without a valid "
+            f"validation receipt ({'; '.join(_reasons[:4])}). This consumption is not "
+            "covered by any validation contract."
+        )
     num_samples = len(ds)
     target_subset = min(subset_size, num_samples)
 

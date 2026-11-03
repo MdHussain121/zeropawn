@@ -475,16 +475,14 @@ def classify_token_occurrence(file_path: str, line_num: int, line_text: str) -> 
         return True, "backward compatibility documentation in README.md"
 
     # Category 2: Migration scripts and regression tests for the rename process
+    # (S6-10 cleanup 2026-11-03: rename_to_zeropawn.py / generate_inventory.py /
+    # test_rename_script.py retired with the completed migration; their entries
+    # were removed from this allowlist.)
     MIGRATION_TOOLS_AND_TESTS = {
-        "scripts/rename_to_zeropawn.py": "rename automation script patterns",
-        "scripts/generate_inventory.py": "rename inventory scanner",
         "scripts/capture_baseline.py": "pre-rename baseline capture script",
         "scripts/verify_parity.py": "parity audit scanner",
-        "scripts/apply_cpp_rename.py": "C++ rename migration script",
-        "scripts/apply_presentation_rename.py": "presentation rename script",
         "tests/test_compat_shim.py": "tests verifying chessrl_cpp shim warning and API",
         "tests/test_env_vars.py": "tests verifying CHESSRL_* fallback and precedence",
-        "tests/test_rename_script.py": "tests verifying rename pattern matching",
     }
     if fp in MIGRATION_TOOLS_AND_TESTS:
         return True, f"migration tool/test: {MIGRATION_TOOLS_AND_TESTS[fp]}"

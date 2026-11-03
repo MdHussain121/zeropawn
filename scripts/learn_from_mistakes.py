@@ -1,5 +1,11 @@
 """CLI script for error-driven learning on offline tactical puzzles.
 
+STATUS (S1-06/S2-11, 2026-11-03): this is the standalone LEGACY/DEV variant.
+The CLI-wired production trainer is ``python/train/learn_from_mistakes.py``
+(``zeropawn puzzles learn``). The two share no code and implement DIFFERENT
+curricula (this one: offline spaced-repetition/sweet-spot/replay-ratio; the
+CLI one: online hard-example mining). Fixes to one do NOT transfer to the other.
+
 Key Features:
 1. Multi-Pass Spaced Repetition (--epochs 3-5): reiterates on mistake batches until mastered.
 2. Cumulative Replay Buffer (--replay-ratio 0.25): mixes past mistakes to prevent forgetting.

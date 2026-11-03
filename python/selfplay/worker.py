@@ -26,6 +26,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import numpy as np
 
 import zeropawn_cpp
+from python.constants import BOARD_SIZE, NUM_PLANES, STATE_SIZE
 from python.selfplay.client import ShmInferenceClient
 from python.selfplay.ipc import SharedMemoryPool
 from python.selfplay.tb_adjudicate import TablebaseAdjudicator
@@ -40,7 +41,7 @@ _WARNED_BOOK_PATHS: set[str] = set()
 # rank-4 tensor the inference server requires; flat rows would crash the CUDA
 # channels_last conversion (rank-2 tensor) in ``InferenceServer.predict_batch``.
 _PLANE_LAYOUTS: Dict[int, Tuple[int, int, int]] = {
-    1216: (19, 8, 8),  # chess
+    STATE_SIZE: (NUM_PLANES, BOARD_SIZE, BOARD_SIZE),  # chess
     126: (3, 6, 7),  # connect4
 }
 

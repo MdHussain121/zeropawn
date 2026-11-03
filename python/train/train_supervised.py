@@ -41,6 +41,7 @@ if str(_repo_root) not in sys.path:
     sys.path.insert(0, str(_repo_root))
 
 from python.cli.common import setup_logging
+from python.constants import NUM_ACTIONS, NUM_PLANES
 from python.common.progress import (
     artifacts_list,
     banner,
@@ -764,7 +765,7 @@ def _build_run_metadata(
             "num_blocks": num_blocks,
             "num_filters": num_filters,
             "in_channels": 19,
-            "num_actions": 4672,
+            "num_actions": NUM_ACTIONS,
             "param_count": None,  # filled after model construction
         },
         "optimizer": {
@@ -1042,7 +1043,10 @@ def train_supervised(
         )
 
     model = ChessNet(
-        in_channels=19, num_filters=num_filters, num_blocks=num_blocks, num_actions=4672
+        in_channels=NUM_PLANES,
+        num_filters=num_filters,
+        num_blocks=num_blocks,
+        num_actions=NUM_ACTIONS,
     )
     model = model.to(device=device, memory_format=torch.channels_last)
     # Modern PyTorch optimizations (Finding #8): compile, fused AdamW, cuDNN benchmark, TF32
