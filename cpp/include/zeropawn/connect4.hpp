@@ -59,7 +59,6 @@ private:
     uint64_t hash_ = 0;
 
     bool check_win_at(int r, int c, int player) const;
-    void recompute_hash();
 };
 
 } // namespace zeropawn

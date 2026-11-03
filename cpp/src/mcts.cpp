@@ -1,4 +1,5 @@
 #include "zeropawn/mcts.hpp"
+#include <chrono>
 #include <cmath>
 #include <algorithm>
 #include <numeric>
@@ -450,12 +451,27 @@ SearchResult MCTS::search(const Game& root_state, int num_simulations, const Eva
 
         try {
             int sims_performed = 0;
+            // S5-02: the abort poll must be wall-clock based in addition to the
+            // simulation quantum. A sim-count quantum alone let `go movetime
+            // 500` overshoot to 11.8-21 s and `stop` latency reach 21 s at slow
+            // (CPU) sim rates, because 32 fresh leaf evaluations can take
+            // 4-20 s on a contended host. A >=1 ms wall-clock interval bounds
+            // the deadline/stop overshoot to milliseconds at any sim rate; the
+            // predicate itself is a nanosecond-scale Python flag check behind
+            // one GIL acquisition, so the extra poll frequency is negligible.
+            auto last_abort_poll = std::chrono::steady_clock::now();
             for (int sim = 0; sim < num_simulations; ++sim) {
-                // Poll the abort predicate periodically (approximately every 32
-                // simulations) so UCI clock deadlines and stop requests are
-                // honored during the search instead of only after it.
-                if (abort_fn && (sim % 32) == 0 && abort_fn()) {
-                    break;
+                // Poll the abort predicate periodically (every 32 simulations
+                // or at least once per millisecond, whichever comes first) so
+                // UCI clock deadlines and stop requests are honored during the
+                // search instead of only after it.
+                auto now_poll = std::chrono::steady_clock::now();
+                if (abort_fn && (((sim % 32) == 0) ||
+                                 (now_poll - last_abort_poll) >= std::chrono::milliseconds(1))) {
+                    last_abort_poll = now_poll;
+                    if (abort_fn()) {
+                        break;
+                    }
                 }
                 Node* curr_node = root_.get();
                 auto sim_state = root_state.clone();
@@ -729,7 +745,11 @@ SearchResult MCTS::search(const Game& root_state, int num_simulations, const Eva
         }
     }
 
-    // Aggregate statistics at root
+    // Aggregate statistics at root (S1-09 cross-binding: this inline block and
+    // MCTS::aggregate() below are line-for-line equivalent today; the inline
+    // block serves the serial/internal-batched paths of search(), aggregate()
+    // serves the legacy search_batched path. ANY semantic change to one MUST be
+    // mirrored in the other or the paths silently diverge.)
     int total_visits = 0;
     int max_visits = -1;
     int best_act = -1;
@@ -868,6 +888,10 @@ void MCTS::cache_insert(uint64_t h, std::vector<float> policy, float value) {
 }
 
 SearchResult MCTS::aggregate(const Node& root, int num_legal, int num_actions) const {
+    // S1-09 cross-binding: mirror of the inline root-aggregation block inside
+    // search() (see the comment there). This method serves ONLY the legacy
+    // search_batched path; the serial/internal-batched paths aggregate inline.
+    // ANY semantic change to one MUST be mirrored in the other.
     SearchResult result;
     result.action_visits.assign(num_actions, 0.0f);
     int total_visits = 0;
