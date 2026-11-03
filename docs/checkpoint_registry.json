@@ -154,7 +154,7 @@
       "file": "models/checkpoints_baseline_20261031/best_model.pt",
       "sha256": "01cead16a445f5a228e78ec85da6f1e68bcf1e6de15c1f3219edda3b544b74ef",
       "size_bytes": 103672539,
-      "status": "verified",
+      "status": "missing",
       "role": "supervised_baseline",
       "step": 4802,
       "epoch": 1,
@@ -180,7 +180,8 @@
         "value_head_health": "held-out WDL CE 0.851 (game val) / 0.730 (independent test split) vs uniform 1.099; P(predict loss | true loss) = 0.442 (val) / 0.515 (test) vs 0.0000 on both disqualified predecessors; Brier 0.51/0.43",
         "value_grad_flow": "telemetry value_grad_norm 0.24-0.48 throughout the run; window WDL-valid samples ~468/512",
         "limits": "Single-epoch run: policy top-1 22.2% game-val / 23.2% game-test / 26.6% tactics-val \u2014 weaker than the disqualified 5-epoch predecessors' policy heads. This designation certifies PROVENANCE and VALUE-HEAD HEALTH ONLY. No strength, Elo, or superiority claim is attached (SLQ-04/SLQ-20 discipline)."
-      }
+      },
+      "removal_note_20261103": "Artifact removed from local deployment on 2026-11-03 by explicit operator-authorized cleanup (post-merge remediation follow-up): only the GitHub release supervised models (scaled ckpt-08 / finetuned ckpt-09 lineages) and the training data were retained. The local-only designated baseline (sha 01cead16...) was deleted with the operator's confirmation. Default checkpoint resolution is now fail-closed with NO designated artifact present: engine commands that need a model will raise DefaultCheckpointError naming ckpt-10 until a model is re-acquired (GitHub release assets via 'zeropawn models download' restore the superseded lineage only) or a new supervised baseline is trained. Historical provenance, run_manifest.addendum_20261103.json content, and the remediation report (audit-reports/post-merge-production-readiness-20261103/) remain the record."
     },
     {
       "id": "ckpt-11-unattributed_warm_start_weights",
