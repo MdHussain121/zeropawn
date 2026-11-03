@@ -264,7 +264,7 @@ def remap_syzygy_outcomes(outcomes: Any) -> Any:
     """
     if isinstance(outcomes, np.ndarray):
         arr = outcomes.copy()
-        mask_255 = (arr == OUTCOME_UNAVAILABLE)
+        mask_255 = arr == OUTCOME_UNAVAILABLE
         invalid = (~mask_255) & ((arr < 0) | (arr > 4))
         if np.any(invalid):
             bad_vals = np.unique(arr[invalid]).tolist()
@@ -277,9 +277,10 @@ def remap_syzygy_outcomes(outcomes: Any) -> Any:
         return res
 
     import torch
+
     if isinstance(outcomes, torch.Tensor):
         t = outcomes.clone()
-        mask_255 = (t == OUTCOME_UNAVAILABLE)
+        mask_255 = t == OUTCOME_UNAVAILABLE
         invalid = (~mask_255) & ((t < 0) | (t > 4))
         if invalid.any():
             bad_vals = torch.unique(t[invalid]).tolist()
@@ -333,9 +334,11 @@ class BuildRecord:
         }
         if "torch" in sys.modules:
             import torch
+
             env["torch"] = getattr(torch, "__version__", None)
         if "numpy" in sys.modules:
             import numpy as _np
+
             env["numpy"] = getattr(_np, "__version__", None)
 
         return {

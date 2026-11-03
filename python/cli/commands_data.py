@@ -832,9 +832,7 @@ def run_data_inspect(args: argparse.Namespace) -> int:
 
             eval_indep = mf.get("evaluation_independence", {})
             if eval_indep:
-                table.add_row(
-                    "Evaluation Independence", eval_indep.get("status", "NOT RECORDED")
-                )
+                table.add_row("Evaluation Independence", eval_indep.get("status", "NOT RECORDED"))
         except Exception as e:
             console.print(f"[dim]Failed to parse manifest.json: {e}[/dim]")
 
@@ -892,7 +890,6 @@ def run_data_validate(args: argparse.Namespace) -> int:
         role_by_name,
     )
     from python.data.dataset_validation import (
-        CheckResult,
         CheckStatus,
         ValidationReport,
         check_split_integrity,
@@ -1011,7 +1008,11 @@ def run_data_validate(args: argparse.Namespace) -> int:
         f"[bold green]Dataset '{d.name}' passed {'definitive' if not incomplete else 'incomplete but accepted'} "
         f"validation.[/bold green]"
         + (f" Receipt: {receipt_path}" if receipt_path else "")
-        + (f" ({RECEIPT_NAME} binds these results to the exact validated bytes.)" if receipt_path else "")
+        + (
+            f" ({RECEIPT_NAME} binds these results to the exact validated bytes.)"
+            if receipt_path
+            else ""
+        )
     )
     return 0
 

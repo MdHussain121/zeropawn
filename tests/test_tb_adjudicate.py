@@ -122,7 +122,9 @@ def test_cursed_win_maps_to_draw(adjudicator: TablebaseAdjudicator):
 
     res_b, meta_b = adjudicator.probe(fen_blessed)
     assert meta_b["qualified"] is True
-    assert meta_b["raw_wdl"] == -1, f"Expected raw_wdl == -1 (blessed loss), got {meta_b.get('raw_wdl')}"
+    assert meta_b["raw_wdl"] == -1, (
+        f"Expected raw_wdl == -1 (blessed loss), got {meta_b.get('raw_wdl')}"
+    )
     assert res_b == 0, f"Blessed loss (-1) must map to draw (0), got {res_b}"
 
     # 3. Additional verified cursed win fixtures (KNNvKP family)

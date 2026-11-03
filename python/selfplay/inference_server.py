@@ -45,8 +45,8 @@ class InferenceServer:
 
         BATCH-TUNING PARAMETERS — ``min_batch_size``, ``max_batch_size`` and
         ``max_wait_ms`` (audit S4-08) — are consumed ONLY by the legacy SHM
-        serving loop (:meth:`start_serving`; SR-17 legacy path with zero
-        production callers). The production path is
+        serving loop (``run_inference_server_process`` below; SR-17 legacy
+        path with zero production callers). The production path is
         ``DirectInferenceClient`` → :meth:`predict_batch`, whose batch size is
         capped by the worker's ``WorkerBatchAggregator`` (max_batch_size =
         num_concurrent_games), NOT by these knobs: passing them does not tune
@@ -303,9 +303,7 @@ class InferenceServer:
             new_version = self.model_version
             self.active_checkpoint_path = str(path)
         self.last_reload_error = None
-        logger.info(
-            "Successfully reloaded checkpoint %s. New model version: %d", path, new_version
-        )
+        logger.info("Successfully reloaded checkpoint %s. New model version: %d", path, new_version)
         return new_version
 
     def load_state_dict_weights(
@@ -356,9 +354,7 @@ class InferenceServer:
                 copy_done_event.record()
         except Exception as e:
             logger.exception("Failed to load state_dict weights; keeping old weights")
-            return self._record_reload_failure(
-                "<state_dict push>", "invalid state dict", str(e)
-            )
+            return self._record_reload_failure("<state_dict push>", "invalid state dict", str(e))
 
         if copy_done_event is not None and self.stream is not None:
             try:

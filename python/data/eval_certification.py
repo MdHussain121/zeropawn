@@ -25,7 +25,9 @@ from typing import Any, Dict, List, Optional, Tuple
 from python.data.dataset_contract import sha256_file
 
 
-def verify_eval_certification(csv_path: str | Path) -> Tuple[bool, List[str], Optional[Dict[str, Any]]]:
+def verify_eval_certification(
+    csv_path: str | Path,
+) -> Tuple[bool, List[str], Optional[Dict[str, Any]]]:
     """Re-verify an eval CSV's certification against current bytes.
 
     Returns:
@@ -68,6 +70,7 @@ def verify_eval_certification(csv_path: str | Path) -> Tuple[bool, List[str], Op
             # DI-13 / P2-4: Resolve relative to repo root or manifest directory before failing
             try:
                 from python.cli.common import REPO_ROOT
+
                 if (REPO_ROOT / src_path).is_file():
                     src_path = REPO_ROOT / src_path
             except Exception:

@@ -13,7 +13,10 @@ from rich.panel import Panel
 from rich.table import Table
 
 import python.cli.common as _cli_common
-from python.cli.common import REPO_ROOT
+
+# Re-export (explicit ``as`` idiom): tests/test_default_checkpoint_resolver.py
+# monkeypatches ``python.cli.models.REPO_ROOT`` as a module attribute.
+from python.cli.common import REPO_ROOT as REPO_ROOT
 from python.cli.ui import COLOR_BORDER, console
 
 logger = logging.getLogger(__name__)

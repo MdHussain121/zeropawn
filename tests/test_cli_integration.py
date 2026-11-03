@@ -206,8 +206,17 @@ def test_search_command_execution():
     # Batched search with explicit batch size
     ret_batched = main(
         [
-            "search", "--fen", startpos, "--sims", "5", "--mode", "batched",
-            "--batch-size", "4", "--checkpoint", "",
+            "search",
+            "--fen",
+            startpos,
+            "--sims",
+            "5",
+            "--mode",
+            "batched",
+            "--batch-size",
+            "4",
+            "--checkpoint",
+            "",
         ]
     )
     assert ret_batched == 0
@@ -215,8 +224,17 @@ def test_search_command_execution():
     # Batched search with auto batch size
     ret_auto = main(
         [
-            "search", "--fen", startpos, "--sims", "5", "--mode", "batched",
-            "--batch-size", "auto", "--checkpoint", "",
+            "search",
+            "--fen",
+            startpos,
+            "--sims",
+            "5",
+            "--mode",
+            "batched",
+            "--batch-size",
+            "auto",
+            "--checkpoint",
+            "",
         ]
     )
     assert ret_auto == 0

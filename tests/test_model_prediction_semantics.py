@@ -151,8 +151,9 @@ def test_value_matches_win_minus_loss_probability_exactly():
 
 
 def test_model_returns_raw_logits_not_probabilities():
-    model = _controlled_model(wdl_bias=(10.0, 0.0, -10.0), policy_bias_index=0,
-                             policy_bias_value=20.0)
+    model = _controlled_model(
+        wdl_bias=(10.0, 0.0, -10.0), policy_bias_index=0, policy_bias_value=20.0
+    )
     x = _planes_tensor()
     with torch.no_grad():
         p_logits, w_logits = model(x)
@@ -171,8 +172,7 @@ def test_model_returns_raw_logits_not_probabilities():
 def test_cli_factory_chain_agrees_with_canonical_conversion():
     from python.cli.eval_callbacks import make_serial_eval_fn
 
-    model = _controlled_model(wdl_bias=(2.0, 0.0, -2.0), policy_bias_index=7,
-                              policy_bias_value=5.0)
+    model = _controlled_model(wdl_bias=(2.0, 0.0, -2.0), policy_bias_index=7, policy_bias_value=5.0)
     planes = zeropawn_cpp.encode_state(zeropawn_cpp.ChessGame(START_FEN))
     eval_fn = make_serial_eval_fn(model, "cpu", cpp_module=_StubCpp(planes))
 
@@ -182,9 +182,9 @@ def test_cli_factory_chain_agrees_with_canonical_conversion():
     with torch.no_grad():
         p_logits, w_logits = model(x)
     expected_policy = torch.softmax(p_logits.float(), -1)[0].numpy()
-    expected_value = float(torch.softmax(w_logits.float(), -1)[0, 0] - torch.softmax(
-        w_logits.float(), -1
-    )[0, 2])
+    expected_value = float(
+        torch.softmax(w_logits.float(), -1)[0, 0] - torch.softmax(w_logits.float(), -1)[0, 2]
+    )
     assert len(policy) == 4672
     assert np.allclose(np.asarray(policy), expected_policy, atol=1e-6)
     assert np.isclose(np.sum(policy), 1.0, atol=1e-5)
@@ -275,12 +275,8 @@ def test_color_mirrored_positions_encode_identically():
     """Side-to-move perspective: 'White up a queen, White to move' and
     'Black up a queen, Black to move' are the same position from the mover's
     view and must encode identically."""
-    white_up = zeropawn_cpp.ChessGame(
-        "rnb1kbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
-    )
-    black_up = zeropawn_cpp.ChessGame(
-        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNB1KBNR b KQkq - 0 1"
-    )
+    white_up = zeropawn_cpp.ChessGame("rnb1kbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
+    black_up = zeropawn_cpp.ChessGame("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNB1KBNR b KQkq - 0 1")
     p_white = zeropawn_cpp.encode_state(white_up)
     p_black = zeropawn_cpp.encode_state(black_up)
     assert np.array_equal(p_white, p_black)
@@ -311,12 +307,8 @@ def _load_real_default():
 
 def test_real_model_predictions_are_perspective_consistent():
     model = _load_real_default()
-    white_up = zeropawn_cpp.ChessGame(
-        "rnb1kbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
-    )
-    black_up = zeropawn_cpp.ChessGame(
-        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNB1KBNR b KQkq - 0 1"
-    )
+    white_up = zeropawn_cpp.ChessGame("rnb1kbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
+    black_up = zeropawn_cpp.ChessGame("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNB1KBNR b KQkq - 0 1")
     with torch.no_grad():
         w1 = model(torch.from_numpy(zeropawn_cpp.encode_state(white_up)).unsqueeze(0))[1]
         w2 = model(torch.from_numpy(zeropawn_cpp.encode_state(black_up)).unsqueeze(0))[1]

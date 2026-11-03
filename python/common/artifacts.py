@@ -222,9 +222,7 @@ def assert_safe_artifact_destination(
                 f"intends this write should pass an explicit output path or run the "
                 f"production launcher, which mints a ProductionWriteTicket."
             )
-        logger.info(
-            "Authorized protected production write to %s (%s)", resolved, ticket.describe()
-        )
+        logger.info("Authorized protected production write to %s (%s)", resolved, ticket.describe())
 
     if arch is not None and not allow_arch_change:
         existing_arch = read_checkpoint_arch(resolved)

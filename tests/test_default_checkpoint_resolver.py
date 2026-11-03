@@ -117,9 +117,7 @@ def _weak_disqualified_entry(repo: Path):
 
 def test_single_designated_verified_entry_resolves_deterministically(tmp_path):
     repo = _make_repo(tmp_path)
-    entry = _entry(
-        repo, SETTLED_ARTIFACT, designated=True, id="ckpt-10-test_baseline", step=4802
-    )
+    entry = _entry(repo, SETTLED_ARTIFACT, designated=True, id="ckpt-10-test_baseline", step=4802)
     _write_registry(repo, [entry])
 
     r1 = resolve_default_checkpoint(repo_root=repo)
@@ -137,12 +135,27 @@ def test_all_preferred_defaults_missing_fails_closed_not_silent(tmp_path):
     raise — never quietly select the weak file."""
     repo = _make_repo(tmp_path)
     entries = [
-        _entry(repo, "models/checkpoints_finetune/best_model.pt", status="missing",
-               create=False, id="ckpt-09"),
-        _entry(repo, "models/checkpoints_scaled/best_model.pt", status="missing",
-               create=False, id="ckpt-08"),
-        _entry(repo, "models/checkpoints_rl/phase4_final_checkpoint.pt", status="missing",
-               create=False, id="ckpt-04"),
+        _entry(
+            repo,
+            "models/checkpoints_finetune/best_model.pt",
+            status="missing",
+            create=False,
+            id="ckpt-09",
+        ),
+        _entry(
+            repo,
+            "models/checkpoints_scaled/best_model.pt",
+            status="missing",
+            create=False,
+            id="ckpt-08",
+        ),
+        _entry(
+            repo,
+            "models/checkpoints_rl/phase4_final_checkpoint.pt",
+            status="missing",
+            create=False,
+            id="ckpt-04",
+        ),
         _weak_disqualified_entry(repo),
     ]
     _write_registry(repo, entries)
@@ -172,8 +185,9 @@ def test_designated_file_missing_on_disk_fails_closed(tmp_path):
 
 def test_designated_hash_mismatch_fails_closed(tmp_path):
     repo = _make_repo(tmp_path)
-    entries = [_entry(repo, SETTLED_ARTIFACT, designated=True, id="ckpt-10-tampered",
-                      sha256="f" * 64)]
+    entries = [
+        _entry(repo, SETTLED_ARTIFACT, designated=True, id="ckpt-10-tampered", sha256="f" * 64)
+    ]
     _write_registry(repo, entries)
 
     with pytest.raises(DefaultCheckpointError) as exc:
@@ -186,8 +200,9 @@ def test_designated_hash_mismatch_fails_closed(tmp_path):
 
 def test_designated_size_mismatch_fails_closed(tmp_path):
     repo = _make_repo(tmp_path)
-    entries = [_entry(repo, SETTLED_ARTIFACT, designated=True, id="ckpt-10-wrong-size",
-                      size_bytes=1)]
+    entries = [
+        _entry(repo, SETTLED_ARTIFACT, designated=True, id="ckpt-10-wrong-size", size_bytes=1)
+    ]
     _write_registry(repo, entries)
 
     with pytest.raises(DefaultCheckpointError) as exc:
@@ -198,8 +213,14 @@ def test_designated_size_mismatch_fails_closed(tmp_path):
 def test_quarantined_and_undesignated_never_become_default(tmp_path):
     repo = _make_repo(tmp_path)
     entries = [
-        _entry(repo, "models/checkpoints_rl/quarantined/x.pt", status="quarantined",
-               create=False, id="ckpt-05", sha256="b" * 64),
+        _entry(
+            repo,
+            "models/checkpoints_rl/quarantined/x.pt",
+            status="quarantined",
+            create=False,
+            id="ckpt-05",
+            sha256="b" * 64,
+        ),
         _entry(repo, "models/checkpoints_rl/ok.pt", designated=False, id="ckpt-03"),
     ]
     _write_registry(repo, entries)
@@ -236,8 +257,11 @@ def test_missing_registry_fails_closed(tmp_path):
 
 def test_designated_entry_without_sha256_is_ineligible(tmp_path):
     repo = _make_repo(tmp_path)
-    entries = [_entry(repo, SETTLED_ARTIFACT, designated=True, create=False,
-                      sha256=None, id="ckpt-10-nosha")]
+    entries = [
+        _entry(
+            repo, SETTLED_ARTIFACT, designated=True, create=False, sha256=None, id="ckpt-10-nosha"
+        )
+    ]
     _write_registry(repo, entries)
     with pytest.raises(DefaultCheckpointError) as exc:
         resolve_default_checkpoint(repo_root=repo)
@@ -391,9 +415,10 @@ def test_explicit_unregistered_checkpoint_loads_with_warning(tmp_path):
         common_mod.REPO_ROOT = old_root
     assert info["path"] == Path(p)
     assert info["registry_entry_id"] is None
-    assert info["provenance_warning"] and "not in the checkpoint registry" in info[
-        "provenance_warning"
-    ]
+    assert (
+        info["provenance_warning"]
+        and "not in the checkpoint registry" in info["provenance_warning"]
+    )
 
 
 def test_explicit_disqualified_checkpoint_warns_loudly(tmp_path):

@@ -94,7 +94,11 @@ class CheckResult:
     data: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
-        out: Dict[str, Any] = {"name": self.name, "status": self.status.value, "detail": self.detail}
+        out: Dict[str, Any] = {
+            "name": self.name,
+            "status": self.status.value,
+            "detail": self.detail,
+        }
         if self.coverage:
             out["coverage"] = self.coverage
         if self.data:
@@ -143,10 +147,7 @@ class ValidationReport:
         counts = {s.value: 0 for s in CheckStatus}
         for r in self.results:
             counts[r.status.value] += 1
-        return (
-            f"overall={self.overall} definitive={self.is_definitive} "
-            f"checks={counts}"
-        )
+        return f"overall={self.overall} definitive={self.is_definitive} checks={counts}"
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -168,14 +169,14 @@ class ValidationReport:
 def _read_metadata(split_dir: Path) -> Tuple[Optional[Dict[str, Any]], Optional[CheckResult]]:
     meta_path = split_dir / "metadata.json"
     if not meta_path.is_file():
-        return None, CheckResult(
-            "metadata_present", CheckStatus.FAIL, f"missing {meta_path}"
-        )
+        return None, CheckResult("metadata_present", CheckStatus.FAIL, f"missing {meta_path}")
     try:
         with open(meta_path, "r", encoding="utf-8") as f:
             metadata = json.load(f)
     except Exception as e:
-        return None, CheckResult("metadata_parse", CheckStatus.FAIL, f"malformed metadata.json: {e}")
+        return None, CheckResult(
+            "metadata_parse", CheckStatus.FAIL, f"malformed metadata.json: {e}"
+        )
     return metadata, None
 
 
@@ -222,9 +223,7 @@ def validate_split(
         if num_samples < 1:
             raise ValueError(f"num_samples {num_samples} out of range")
     except (KeyError, TypeError, ValueError) as e:
-        report.add(
-            CheckResult("num_samples_valid", CheckStatus.FAIL, f"invalid num_samples: {e}")
-        )
+        report.add(CheckResult("num_samples_valid", CheckStatus.FAIL, f"invalid num_samples: {e}"))
         return report
 
     shape = metadata.get("planes_shape", list(PLANES_SHAPE))
@@ -248,9 +247,7 @@ def validate_split(
         )
 
     present_files: Dict[str, int] = {}
-    for name in REQUIRED_ARRAYS + tuple(
-        n for n in ARRAY_DTYPES if n not in REQUIRED_ARRAYS
-    ):
+    for name in REQUIRED_ARRAYS + tuple(n for n in ARRAY_DTYPES if n not in REQUIRED_ARRAYS):
         path = split_dir / name
         if not path.is_file():
             if name in REQUIRED_ARRAYS:
@@ -418,7 +415,9 @@ def _value_histogram(arr: np.ndarray, max_values: int = 16) -> Dict[str, int]:
     return {str(int(v)): int(c) for v, c in zip(values[:max_values], counts[:max_values])}
 
 
-def _check_planes(planes_path: Path, num_samples: int, scan_mode: str, scan_rows: int) -> CheckResult:
+def _check_planes(
+    planes_path: Path, num_samples: int, scan_mode: str, scan_rows: int
+) -> CheckResult:
     n_check = num_samples if scan_mode == "full" else min(scan_rows, num_samples)
     mm = np.memmap(planes_path, dtype=np.float32, mode="r", shape=(num_samples, *PLANES_SHAPE))
     bad_finite = 0
@@ -435,7 +434,11 @@ def _check_planes(planes_path: Path, num_samples: int, scan_mode: str, scan_rows
             mm._mmap.close()  # type: ignore[attr-defined]
         except Exception:
             pass
-    coverage = f"full ({n_check} rows)" if n_check == num_samples else f"first {n_check} of {num_samples} rows"
+    coverage = (
+        f"full ({n_check} rows)"
+        if n_check == num_samples
+        else f"first {n_check} of {num_samples} rows"
+    )
     status = CheckStatus.PASS if (bad_finite == 0 and bad_range == 0) else CheckStatus.FAIL
     if scan_mode == "bounded":
         status = CheckStatus.BOUNDED if status == CheckStatus.PASS else status
@@ -533,7 +536,9 @@ def _check_build_record(
         with open(record_path, "r", encoding="utf-8") as f:
             record = json.load(f)
     except Exception as e:
-        return CheckResult("build_record_agreement", CheckStatus.FAIL, f"malformed build record: {e}")
+        return CheckResult(
+            "build_record_agreement", CheckStatus.FAIL, f"malformed build record: {e}"
+        )
 
     outputs = record.get("outputs", {})
     split_key = split_dir.name if split_dir.name in ("train", "val", "test") else ""
@@ -553,7 +558,9 @@ def _check_build_record(
             continue
         actual = file_identities.get(name, {}).get("sha256") or sha256_file(path)
         if expected_hash and actual != expected_hash:
-            mismatches.append(f"{name}: sha256 {actual[:12]}… != build record {str(expected_hash)[:12]}…")
+            mismatches.append(
+                f"{name}: sha256 {actual[:12]}… != build record {str(expected_hash)[:12]}…"
+            )
     if mismatches:
         return CheckResult(
             "build_record_agreement",
@@ -572,7 +579,9 @@ def _check_build_record(
 # ────────────────────────────────────────────────────────────────────────────
 
 
-def _plane_row_hashes(planes_path: Path, num_samples: int, limit: Optional[int]) -> Tuple[Dict[bytes, List[int]], int]:
+def _plane_row_hashes(
+    planes_path: Path, num_samples: int, limit: Optional[int]
+) -> Tuple[Dict[bytes, List[int]], int]:
     """Row-wise MD5 of serialized plane records. Returns (hash -> row indices, rows hashed)."""
     n = num_samples if limit is None else min(limit, num_samples)
     mm = np.memmap(planes_path, dtype=np.float32, mode="r", shape=(num_samples, *PLANES_SHAPE))
@@ -828,7 +837,12 @@ def verify_receipt(
 
     if first_rel and (candidate_root / first_rel).is_file():
         base = candidate_root
-    elif recorded_path and recorded_path.is_dir() and first_rel and (recorded_path / first_rel).is_file():
+    elif (
+        recorded_path
+        and recorded_path.is_dir()
+        and first_rel
+        and (recorded_path / first_rel).is_file()
+    ):
         base = recorded_path
     else:
         base = candidate_root
@@ -843,9 +857,7 @@ def verify_receipt(
             actual = sha256_file(path)
             expected = ident.get("sha256")
             if not expected or actual != expected:
-                reasons.append(
-                    f"{rel}: sha256 {actual[:12]}… != receipt {str(expected)[:12]}…"
-                )
+                reasons.append(f"{rel}: sha256 {actual[:12]}… != receipt {str(expected)[:12]}…")
         else:
             if not identity_matches(path, ident):
                 reasons.append(f"{rel}: size/mtime differ from receipt (stale receipt)")

@@ -525,9 +525,7 @@ class GpuResidentReplayCache:
             valid_count = int(valid_mask.sum().item())
             if valid_count >= batch_size:
                 valid_indices = torch.nonzero(valid_mask, as_tuple=True)[0]
-                rand_sub = torch.randint(
-                    0, len(valid_indices), (batch_size,), device=self.device
-                )
+                rand_sub = torch.randint(0, len(valid_indices), (batch_size,), device=self.device)
                 indices = valid_indices[rand_sub]
             else:
                 # Not enough known-fresh rows (e.g. a cache restored without
@@ -1305,12 +1303,14 @@ class ReplayBuffer:
         if size <= 0:
             return
         checks = (
-            ("outcomes", np.int64, lambda a: np.isin(a, (0, 1, 2)).all(),
-             "values outside {0=Win, 1=Draw, 2=Loss}"),
-            ("versions", np.int32, lambda a: bool((a >= 0).all()),
-             "negative model versions"),
-            ("game_ids", np.uint64, lambda a: bool((a > 0).all()),
-             "zero game ids"),
+            (
+                "outcomes",
+                np.int64,
+                lambda a: np.isin(a, (0, 1, 2)).all(),
+                "values outside {0=Win, 1=Draw, 2=Loss}",
+            ),
+            ("versions", np.int32, lambda a: bool((a >= 0).all()), "negative model versions"),
+            ("game_ids", np.uint64, lambda a: bool((a > 0).all()), "zero game ids"),
         )
         for key, dtype, predicate, description in checks:
             path = self.paths[key]
@@ -1325,7 +1325,9 @@ class ReplayBuffer:
                 del m
             if not predicate(window):
                 bad = np.nonzero(~np.isin(window, (0, 1, 2)))[0] if key == "outcomes" else None
-                detail = f"first offending index {int(bad[0])}" if bad is not None and bad.size else ""
+                detail = (
+                    f"first offending index {int(bad[0])}" if bad is not None and bad.size else ""
+                )
                 raise BufferIntegrityError(
                     f"Replay shard {key} contains {description} within [0, {size}) "
                     f"({detail}); {meta_path} cannot be validated against its data. "
@@ -1425,7 +1427,10 @@ class ReplayBuffer:
         if snap_total is None:
             # Legacy checkpoint (only buffer_size / buffer_write_head existed).
             if (snap_size, snap_head) == (live[0], live[1]):
-                return "match", f"legacy snapshot matches live state (size={live[0]}, head={live[1]})"
+                return (
+                    "match",
+                    f"legacy snapshot matches live state (size={live[0]}, head={live[1]})",
+                )
             return (
                 "mismatch",
                 f"legacy snapshot (size={snap_size}, write_head={snap_head}) does not match live "
@@ -1515,9 +1520,7 @@ class ReplayBuffer:
             report["checks"].setdefault("shard_bytes", {})[key] = actual
             if actual != spec["bytes"]:
                 report["ok"] = False
-                report["errors"].append(
-                    f"shard {key} has {actual} bytes; expected {spec['bytes']}"
-                )
+                report["errors"].append(f"shard {key} has {actual} bytes; expected {spec['bytes']}")
         # 2. Scalar domains (live records only)
         if self.size:
             try:
@@ -1566,7 +1569,9 @@ class ReplayBuffer:
                     report["errors"].append(f"checksum mismatch for shard(s): {sorted(mismatches)}")
                 if missing:
                     report["ok"] = False
-                    report["errors"].append(f"stores checksums for missing shard(s): {sorted(missing)}")
+                    report["errors"].append(
+                        f"stores checksums for missing shard(s): {sorted(missing)}"
+                    )
                 report["checks"]["checksums_verified"] = not (mismatches or missing)
         return report
 
@@ -1860,10 +1865,12 @@ class ReplayBuffer:
             planes_np = np.ascontiguousarray(self.human_dataset.planes[indices], dtype=np.float32)
             moves_np = np.ascontiguousarray(self.human_dataset.moves[indices], dtype=np.int64)
             outcomes_np = np.ascontiguousarray(self.human_dataset.outcomes[indices], dtype=np.int64)
-            if getattr(self.human_dataset, "is_syzygy", False) or getattr(
-                self.human_dataset, "metadata", {}
-            ).get("role") == "endgame_syzygy":
+            if (
+                getattr(self.human_dataset, "is_syzygy", False)
+                or getattr(self.human_dataset, "metadata", {}).get("role") == "endgame_syzygy"
+            ):
                 from python.data.dataset_contract import remap_syzygy_outcomes
+
                 outcomes_np = remap_syzygy_outcomes(outcomes_np)
 
             if target_dev is not None and target_dev.type == "cuda" and torch.cuda.is_available():
@@ -2191,7 +2198,10 @@ class ReplayBuffer:
         expected_planes = (self.in_channels, self.height, self.width)
         expected_visits = (self.num_actions,)
         for idx, p in enumerate(positions):
-            if tuple(np.shape(p.planes)) != expected_planes or tuple(np.shape(p.visits)) != expected_visits:
+            if (
+                tuple(np.shape(p.planes)) != expected_planes
+                or tuple(np.shape(p.visits)) != expected_visits
+            ):
                 self.rejected_records += n_offered
                 raise ReplayRecordValidationError(
                     f"record {idx} (game_id={getattr(p, 'game_id', '?')}) has planes shape "
@@ -2481,10 +2491,12 @@ class ReplayBuffer:
                 h_planes = np.array(self.human_dataset.planes[h_indices], dtype=np.float32)
                 h_moves = np.array(self.human_dataset.moves[h_indices], dtype=np.int64)
                 h_outcomes = np.array(self.human_dataset.outcomes[h_indices], dtype=np.int64)
-                if getattr(self.human_dataset, "is_syzygy", False) or getattr(
-                    self.human_dataset, "metadata", {}
-                ).get("role") == "endgame_syzygy":
+                if (
+                    getattr(self.human_dataset, "is_syzygy", False)
+                    or getattr(self.human_dataset, "metadata", {}).get("role") == "endgame_syzygy"
+                ):
                     from python.data.dataset_contract import remap_syzygy_outcomes
+
                     h_outcomes = remap_syzygy_outcomes(h_outcomes)
 
             # Create one-hot visit distribution for human moves (vectorized)
@@ -2784,17 +2796,16 @@ class ReplayBuffer:
                     # the batch's outcome/game-id provenance instead.
                     human_len = len(self.human_dataset)
                     h_indices = np.random.randint(0, human_len, size=num_human)
-                    h_planes_np = np.array(
-                        self.human_dataset.planes[h_indices], dtype=np.float32
-                    )
+                    h_planes_np = np.array(self.human_dataset.planes[h_indices], dtype=np.float32)
                     h_moves_np = np.array(self.human_dataset.moves[h_indices], dtype=np.int64)
-                    h_outcomes_np = np.array(
-                        self.human_dataset.outcomes[h_indices], dtype=np.int64
-                    )
-                    if getattr(self.human_dataset, "is_syzygy", False) or getattr(
-                        self.human_dataset, "metadata", {}
-                    ).get("role") == "endgame_syzygy":
+                    h_outcomes_np = np.array(self.human_dataset.outcomes[h_indices], dtype=np.int64)
+                    if (
+                        getattr(self.human_dataset, "is_syzygy", False)
+                        or getattr(self.human_dataset, "metadata", {}).get("role")
+                        == "endgame_syzygy"
+                    ):
                         from python.data.dataset_contract import remap_syzygy_outcomes
+
                         h_outcomes_np = remap_syzygy_outcomes(h_outcomes_np)
 
                 h_visits_np = np.zeros((num_human, self.num_actions), dtype=np.float32)

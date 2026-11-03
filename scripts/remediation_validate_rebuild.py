@@ -63,7 +63,10 @@ def main() -> int:
         print(f"  labels: {report.label_stats.get(split)}")
 
     if not args.skip_overlap and len(args.splits) >= 2:
-        print("[integrity] exhaustive cross-split scan (this re-hashes every plane row)...", flush=True)
+        print(
+            "[integrity] exhaustive cross-split scan (this re-hashes every plane row)...",
+            flush=True,
+        )
         test_dir = root / "test" if (root / "test").is_dir() else None
         results = check_split_integrity(
             root / "train", root / args.splits[1], exhaustive_states=True, test_dir=test_dir
@@ -72,7 +75,12 @@ def main() -> int:
         for r in results:
             print(f"  {r.status.value.upper()} {r.name}: {r.detail} [{r.coverage}]")
             integrity.append(
-                {"name": r.name, "status": r.status.value, "detail": r.detail, "coverage": r.coverage}
+                {
+                    "name": r.name,
+                    "status": r.status.value,
+                    "detail": r.detail,
+                    "coverage": r.coverage,
+                }
             )
             if r.status in (CheckStatus.FAIL,):
                 all_pass = False

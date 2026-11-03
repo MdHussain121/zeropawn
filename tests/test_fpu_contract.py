@@ -82,9 +82,7 @@ def test_root_fpu_with_default_settings_mate_still_found():
         n = game.num_actions()
         return (np.full(n, 1.0 / n, dtype=np.float32), 0.0)
 
-    game = zeropawn_cpp.ChessGame(
-        "rnbqkbnr/ppppp2p/8/5pp1/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 1"
-    )
+    game = zeropawn_cpp.ChessGame("rnbqkbnr/ppppp2p/8/5pp1/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 1")
     res = mcts.search(game, 200, uniform_eval)
     assert game.action_to_string(res.best_action) == "d1h5"
 

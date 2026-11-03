@@ -22,9 +22,11 @@ from typing import Any, Optional
 
 from python.eval.stats import (
     agresti_caffo_elo_ci,
-    compute_sprt_llr,
-    elo_to_score,
-    score_to_elo,
+    # Facade re-exports (explicit ``as`` idiom — audit S7-10): scripts/run_sprt.py
+    # and tests/test_sprt.py import these through this module.
+    compute_sprt_llr as compute_sprt_llr,
+    elo_to_score as elo_to_score,
+    score_to_elo as score_to_elo,
     wilson_score_interval,
 )
 

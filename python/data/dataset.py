@@ -695,9 +695,7 @@ class GpuResidentDataLoader:
                     )
                 if t_targets_path.exists():
                     t_targets_arr = np.asarray(
-                        np.memmap(
-                            t_targets_path, dtype=np.float32, mode="r", shape=(tactics_n, 3)
-                        )
+                        np.memmap(t_targets_path, dtype=np.float32, mode="r", shape=(tactics_n, 3))
                     )
                 elif t_outcomes_m is not None:
                     t_targets_arr = _outcome_to_value_target(np.asarray(t_outcomes_m), False)
@@ -793,7 +791,10 @@ class GpuResidentDataLoader:
         # only when BOTH sources have one — a partial stream would silently
         # change loss semantics for the uncovered rows.
         if t_planes_m is not None:
-            planes_segments = [(planes_m, 0, master_n), (t_planes_m, master_n, master_n + tactics_n)]
+            planes_segments = [
+                (planes_m, 0, master_n),
+                (t_planes_m, master_n, master_n + tactics_n),
+            ]
             if masks_m is not None and t_masks_m is not None:
                 mask_segments = [
                     (masks_m, 0, master_n),

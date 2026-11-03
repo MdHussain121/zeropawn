@@ -111,7 +111,12 @@ def test_promotion_keeps_previous_artifact_on_copy_failure(tmp_path, monkeypatch
     orch = _bare_orchestrator(tmp_path)
     first = _candidate(tmp_path / "first.pt", step=1)
     assert orch._promote_best_eval(
-        first, ckpt_name="first.pt", comp_score=0.5, match_res=_match_res(), solve_rate=0.4, gate_reason="g1"
+        first,
+        ckpt_name="first.pt",
+        comp_score=0.5,
+        match_res=_match_res(),
+        solve_rate=0.4,
+        gate_reason="g1",
     )[0]
     good_bytes = (orch.checkpoint_dir / "best_eval.pt").read_bytes()
     good_record = orch._best_eval_state_path.read_text(encoding="utf-8")
@@ -125,7 +130,12 @@ def test_promotion_keeps_previous_artifact_on_copy_failure(tmp_path, monkeypatch
 
     monkeypatch.setattr(_shutil, "copyfileobj", broken_copy)
     orch._promote_best_eval(
-        second, ckpt_name="second.pt", comp_score=0.9, match_res=_match_res(), solve_rate=0.5, gate_reason="g2"
+        second,
+        ckpt_name="second.pt",
+        comp_score=0.9,
+        match_res=_match_res(),
+        solve_rate=0.5,
+        gate_reason="g2",
     )
     # The previous valid promotion is untouched, and its metadata still matches.
     assert (orch.checkpoint_dir / "best_eval.pt").read_bytes() == good_bytes
@@ -152,7 +162,12 @@ def test_promotion_reports_verification_failure_and_leaves_state_intact(tmp_path
 
     monkeypatch.setattr(cr, "compute_sha256", flaky_compute)
     promoted, generation, detail = orch._promote_best_eval(
-        candidate, ckpt_name="cand2.pt", comp_score=0.7, match_res=_match_res(), solve_rate=0.5, gate_reason="g"
+        candidate,
+        ckpt_name="cand2.pt",
+        comp_score=0.7,
+        match_res=_match_res(),
+        solve_rate=0.5,
+        gate_reason="g",
     )
     assert promoted is False
     assert "verification failed" in detail
@@ -190,7 +205,12 @@ def test_promotion_after_interruption_never_pairs_stale_metadata(tmp_path, monke
 
     monkeypatch.setattr(os, "replace", failing_replace)
     promoted, _generation, detail = orch._promote_best_eval(
-        candidate, ckpt_name="cand3.pt", comp_score=0.8, match_res=_match_res(), solve_rate=0.6, gate_reason="g"
+        candidate,
+        ckpt_name="cand3.pt",
+        comp_score=0.8,
+        match_res=_match_res(),
+        solve_rate=0.6,
+        gate_reason="g",
     )
     assert promoted is False
     assert "promotion failed" in detail
@@ -216,7 +236,12 @@ def test_protected_promotion_destination_requires_a_ticket(tmp_path, monkeypatch
 
     candidate = _candidate(tmp_path / "cand4.pt")
     promoted, _gen, detail = orch._promote_best_eval(
-        candidate, ckpt_name="cand4.pt", comp_score=0.8, match_res=_match_res(), solve_rate=0.6, gate_reason="g"
+        candidate,
+        ckpt_name="cand4.pt",
+        comp_score=0.8,
+        match_res=_match_res(),
+        solve_rate=0.6,
+        gate_reason="g",
     )
     assert promoted is False
     assert "protected production" in detail
@@ -256,7 +281,9 @@ def test_eval_history_header_is_written_and_flushed(tmp_path):
 def test_eval_history_appends_rows_with_promotion_evidence(tmp_path):
     orch = _bare_eval_csv_orchestrator(tmp_path)
     orch._init_eval_csv()
-    orch._append_eval_row([1.0, 0.1] + [0] * 30 + ["promoted", "200 games, engine score 0.6", "promo-x"])
+    orch._append_eval_row(
+        [1.0, 0.1] + [0] * 30 + ["promoted", "200 games, engine score 0.6", "promo-x"]
+    )
     rows = list(csv.reader(orch.eval_csv_path.open(encoding="utf-8")))
     assert len(rows) == 2, "header + one data row"
     assert rows[1][-3:] == ["promoted", "200 games, engine score 0.6", "promo-x"]
@@ -300,8 +327,12 @@ def test_puzzle_and_match_records_carry_checkpoint_identity(tmp_path):
     orch.stockfish_nodes = 1000
     orch.eval_sims = 400
     orch._persist_puzzle_result(0.42, 42, 100)
-    orch._persist_match_game({"opening_idx": 1, "engine_is_white": True, "result": "1-0", "seed": 42, "moves": ["e2e4"]})
-    orch._persist_match_game({"opening_idx": 2, "engine_is_white": False, "result": "1/2-1/2", "seed": 43, "moves": []})
+    orch._persist_match_game(
+        {"opening_idx": 1, "engine_is_white": True, "result": "1-0", "seed": 42, "moves": ["e2e4"]}
+    )
+    orch._persist_match_game(
+        {"opening_idx": 2, "engine_is_white": False, "result": "1/2-1/2", "seed": 43, "moves": []}
+    )
 
     puzzle = json.loads(orch.puzzle_eval_jsonl_path.read_text(encoding="utf-8").splitlines()[0])
     assert puzzle["model_sha256"] != "unknown"

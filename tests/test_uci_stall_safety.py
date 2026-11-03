@@ -28,9 +28,7 @@ def engine():
     # use_book=False keeps the stall scenario deterministic: an opening-book
     # answer for the start position would emit bestmove without ever reaching
     # the (blocked) evaluator.
-    eng = UCIEngine(
-        checkpoint_path="nonexistent-checkpoint.pt", device="cpu", use_book=False
-    )
+    eng = UCIEngine(checkpoint_path="nonexistent-checkpoint.pt", device="cpu", use_book=False)
     eng._stall_timeout = 0.2
     eng._stop_event = threading.Event()
     eng._search_thread = None

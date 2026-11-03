@@ -10,7 +10,8 @@ Covers, per finding:
 - SR-12  per-game RNG isolation for unseeded runs.
 - SR-14  search-mode support assertion vs. actual serial enforcement.
 - SR-16  mover-relative outcome propagation pinned as a pure function.
-- SR-17  the legacy IPC/multiprocessing paths stay unreachable from production.
+- SR-17  the legacy IPC/multiprocessing paths are retained carriers whose
+         import surface and serving loop stay outside production dispatch.
 
 All tests are deterministic and use synthetic fixtures; no production
 experience is generated and the historical replay buffer is never touched.
@@ -18,6 +19,7 @@ experience is generated and the historical replay buffer is never touched.
 
 from __future__ import annotations
 
+import ast
 import random
 import threading
 import time
@@ -367,9 +369,11 @@ def test_worker_shutdown_sinks_no_partial_games():
         worker.stop()
         client.unblock()  # let the parked calls finish; threads then observe stop
         assert _wait_until(
-            lambda: all(not t.is_alive() for t in worker.threads)
-            or worker.aborted_games + worker.invalid_games + worker.total_games_played
-            >= worker.game_counter - (1_000_000 + 1) + 1,
+            lambda: (
+                all(not t.is_alive() for t in worker.threads)
+                or worker.aborted_games + worker.invalid_games + worker.total_games_played
+                >= worker.game_counter - (1_000_000 + 1) + 1
+            ),
             timeout=15.0,
         )
         # Give the final threads a moment to settle after stop()'s 1s join.
@@ -512,49 +516,208 @@ def test_outcomes_from_result_mover_relative_mapping():
 
 
 # ---------------------------------------------------------------------------
-# SR-17 — legacy IPC paths stay unreachable from production
+# SR-17 — legacy IPC paths are retained carriers, isolated from production dispatch
 # ---------------------------------------------------------------------------
 
+_REPO_ROOT = Path(__file__).resolve().parent.parent
 
-def test_legacy_ipc_paths_have_no_production_importers():
-    root = Path(__file__).resolve().parent.parent
-    # Production ENTRY POINTS never construct the legacy paths. Modules that
-    # merely carry the retained server-side code (inference_server.py's
-    # run_inference_server_process) are allowed to mention them, but must
-    # document their status as legacy/unexercised.
-    entry_points = [
-        root / "scripts" / "run_phase4_rl.py",
-        root / "python" / "cli" / "commands_train.py",
-        root / "python" / "cli" / "commands_match.py",
-        root / "python" / "uci" / "uci_engine.py",
-        root / "python" / "selfplay" / "replay_buffer.py",
-        root / "python" / "selfplay" / "metrics.py",
+
+def _ast_import_targets(path: Path) -> set:
+    """Return the set of module targets actually imported by a file (AST-level)."""
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8", errors="ignore"))
+    except (OSError, SyntaxError):
+        return set()
+    targets: set = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            if node.module:
+                targets.add(node.module)
+            # Relative imports: resolve against the file's package so
+            # ``from .ipc import X`` inside python/selfplay is caught.
+            if node.level:
+                pkg = path.parent.relative_to(_REPO_ROOT).as_posix().replace("/", ".")
+                if node.module:
+                    targets.add(f"{pkg}.{node.module}")
+                else:
+                    targets.add(pkg)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                targets.add(alias.name)
+    return targets
+
+
+def _is_ipc_import(target: str) -> bool:
+    if target == "selfplay.ipc" or target.endswith(".selfplay.ipc"):
+        return True
+    if target == "ipc" or target.endswith(".ipc"):
+        # Relative-import resolution can only produce a bare/…ipc target that
+        # means selfplay.ipc when it resolves into python/selfplay.
+        return target == "ipc"
+    return False
+
+
+# Production dispatch surfaces the legacy SHM self-play path must never touch.
+_DISPATCH_FILES = (
+    "scripts/run_phase4_rl.py",  # orchestrator run loop
+    "cli.py",  # repo-root CLI shim
+    "python/uci/uci_engine.py",
+    "python/selfplay/replay_buffer.py",
+    "python/selfplay/metrics.py",
+)
+_DISPATCH_DIRS = (
+    "python/cli",  # CLI command dispatch
+    "zeropawn",  # python -m zeropawn shim package
+)
+# Symbols that exist only to serve the retained legacy multiprocessing path.
+_LEGACY_SYMBOLS = (
+    "run_inference_server_process",
+    "run_worker_process",
+    "start_serving",
+    "ShmInferenceClient",
+    "SharedMemoryPool",
+)
+# The only production modules allowed to import python/selfplay/ipc.py: the
+# three files that carry the retained legacy code paths themselves.
+_EXPECTED_IPC_IMPORTERS = {
+    "python/selfplay/worker.py",
+    "python/selfplay/client.py",
+    "python/selfplay/inference_server.py",
+}
+
+
+def test_legacy_ipc_paths_are_retained_carriers_outside_production_dispatch():
+    """Pin the current SR-17 contract (audit S6-04 rewrite).
+
+    The original form of this test asserted that ``python/selfplay/ipc.py``
+    had NO production importers; that premise no longer holds — the retained
+    legacy carriers (worker.py's ``run_worker_process``, client.py's
+    ``ShmInferenceClient``, inference_server.py's ``run_inference_server_process``)
+    legitimately import the pool. The CURRENT true contract is:
+
+    1. The IPC module's production import surface is EXACTLY those three
+       retained-carrier modules — no fourth module may adopt the legacy pool.
+    2. The legacy SHM serving loop and its worker-side counterpart are
+       referenced by no production dispatch surface (CLI, orchestrator run
+       loop, worker runtime) and are called from nowhere outside their
+       defining module.
+    3. Both retained entry points stay explicitly documented as LEGACY.
+    4. ``eval/batched.py`` (the other SR-17 dead path) gains no importers.
+    """
+    # -- 1) exact production import surface of python/selfplay/ipc.py --------
+    importers: Dict[str, str] = {}
+    for base in ("python", "scripts"):
+        for py in sorted((_REPO_ROOT / base).rglob("*.py")):
+            rel = py.relative_to(_REPO_ROOT).as_posix()
+            if rel in _EXPECTED_IPC_IMPORTERS:
+                continue
+            if any(_is_ipc_import(t) for t in _ast_import_targets(py)):
+                importers[rel] = "real import"
+    for root_file in (
+        "cli.py",
+        *(p.as_posix() for p in sorted((_REPO_ROOT / "zeropawn").glob("*.py"))),
+    ):
+        py = _REPO_ROOT / root_file
+        if py.exists() and any(_is_ipc_import(t) for t in _ast_import_targets(py)):
+            importers[root_file] = "real import"
+    assert not importers, (
+        "python/selfplay/ipc.py gained production importers beyond the three "
+        f"retained carriers {sorted(_EXPECTED_IPC_IMPORTERS)}: {sorted(importers)}"
+    )
+    # The three carriers must still exist and still import the pool (the
+    # retained path must not be silently gutted behind this test's back).
+    for rel in _EXPECTED_IPC_IMPORTERS:
+        tree_targets = _ast_import_targets(_REPO_ROOT / rel)
+        assert any(_is_ipc_import(t) for t in tree_targets), (
+            f"{rel} stopped importing python.selfplay.ipc; the retained legacy "
+            "carrier contract (SR-17) changed — update this test deliberately"
+        )
+
+    # -- 2) legacy serving loop stays outside production dispatch ------------
+    for base_dir in _DISPATCH_DIRS:
+        for py in sorted((_REPO_ROOT / base_dir).rglob("*.py")):
+            text = py.read_text(encoding="utf-8", errors="ignore")
+            for needle in _LEGACY_SYMBOLS:
+                assert needle not in text, (
+                    f"{py.relative_to(_REPO_ROOT).as_posix()} references legacy "
+                    f"SHM-path symbol {needle}"
+                )
+    for rel in _DISPATCH_FILES:
+        py = _REPO_ROOT / rel
+        assert py.exists(), f"dispatch surface {rel} disappeared"
+        text = py.read_text(encoding="utf-8", errors="ignore")
+        for needle in _LEGACY_SYMBOLS:
+            assert needle not in text, f"{rel} references legacy SHM-path symbol {needle}"
+
+    # No caller of the serving loop anywhere in production trees; within its
+    # defining module it must never be *called* (only defined + documented).
+    offenders = []
+    for base in ("python", "scripts"):
+        for py in sorted((_REPO_ROOT / base).rglob("*.py")):
+            rel = py.relative_to(_REPO_ROOT).as_posix()
+            if rel == "python/selfplay/inference_server.py":
+                continue
+            text = py.read_text(encoding="utf-8", errors="ignore")
+            for needle in ("run_inference_server_process", "start_serving"):
+                if needle in text:
+                    offenders.append(f"{rel} references {needle}")
+    for root_file in (
+        "cli.py",
+        *(p.as_posix() for p in sorted((_REPO_ROOT / "zeropawn").glob("*.py"))),
+    ):
+        py = _REPO_ROOT / root_file
+        if not py.exists():
+            continue
+        text = py.read_text(encoding="utf-8", errors="ignore")
+        for needle in ("run_inference_server_process", "start_serving"):
+            if needle in text:
+                offenders.append(f"{root_file} references {needle}")
+    assert offenders == [], (
+        f"the legacy SHM serving loop gained references outside its retained carrier: {offenders}"
+    )
+    server_tree = ast.parse(
+        (_REPO_ROOT / "python/selfplay/inference_server.py").read_text(encoding="utf-8")
+    )
+    self_calls = [
+        node.lineno
+        for node in ast.walk(server_tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "run_inference_server_process"
     ]
-    legacy_imports = ("ShmInferenceClient", "SharedMemoryPool", "eval.batched", "run_worker_process")
-    for path in entry_points:
-        text = path.read_text(encoding="utf-8")
-        for needle in legacy_imports:
-            assert needle not in text, f"{path.name} references legacy IPC symbol {needle}"
-
-    server_text = (root / "python" / "selfplay" / "inference_server.py").read_text(encoding="utf-8")
-    assert "SharedMemoryPool" in server_text  # retained carrier, documented below
-    marker = server_text.split("def run_inference_server_process")[1][:1500]
-    assert "LEGACY" in marker or "legacy" in marker, (
-        "run_inference_server_process must be explicitly marked as a legacy path"
+    assert self_calls == [], (
+        f"inference_server.py calls run_inference_server_process at lines {self_calls}; "
+        "the legacy serving loop must stay unreachable, not self-dispatched"
     )
 
-    # eval/batched.py has zero importers anywhere in the tree (tests excluded:
-    # this file pins its dead status, it does not import it at runtime).
-    offenders = []
-    for py in root.rglob("*.py"):
-        if ".git" in py.parts or py.name == "test_selfplay_replay_remediation.py":
-            continue
-        if py.name == "batched.py" and py.parent.name == "eval":
-            continue
-        try:
-            text = py.read_text(encoding="utf-8", errors="ignore")
-        except OSError:
-            continue
-        if "eval.batched" in text or "eval import batched" in text:
-            offenders.append(str(py.relative_to(root)))
-    assert offenders == [], f"eval/batched.py gained importers: {offenders}"
+    # Worker runtime: worker.py may reference the legacy client/pool symbols
+    # only in its import block and inside the retained run_worker_process
+    # region — never in the production SelfPlayWorker runtime above it.
+    worker_text = (_REPO_ROOT / "python/selfplay/worker.py").read_text(encoding="utf-8")
+    head, sep, _tail = worker_text.partition("def run_worker_process")
+    assert sep, "worker.run_worker_process (retained legacy entry) went missing"
+    for lineno, line in enumerate(head.splitlines(), start=1):
+        if any(sym in line for sym in _LEGACY_SYMBOLS):
+            stripped = line.strip()
+            assert stripped.startswith(("from python.selfplay", "import ")), (
+                f"worker.py production runtime references legacy IPC symbol "
+                f"outside an import (line {lineno}): {stripped}"
+            )
+
+    # -- 3) retained entry points stay documented as LEGACY ------------------
+    server_text = (_REPO_ROOT / "python/selfplay/inference_server.py").read_text(encoding="utf-8")
+    marker = server_text.split("def run_inference_server_process")[1][:1500]
+    assert "LEGACY" in marker, "run_inference_server_process must stay explicitly marked as legacy"
+    worker_marker = worker_text.split("def run_worker_process")[1][:1500]
+    assert "LEGACY" in worker_marker, "run_worker_process must stay explicitly marked as legacy"
+
+    # -- 4) eval/batched.py keeps its zero-importer (dead) status ------------
+    batched_importers = []
+    for base in ("python", "scripts"):
+        for py in sorted((_REPO_ROOT / base).rglob("*.py")):
+            if py.name == "batched.py" and py.parent.name == "eval":
+                continue
+            targets = _ast_import_targets(py)
+            if any(t == "eval.batched" or t.endswith(".eval.batched") for t in targets):
+                batched_importers.append(py.relative_to(_REPO_ROOT).as_posix())
+    assert batched_importers == [], f"eval/batched.py gained importers: {batched_importers}"

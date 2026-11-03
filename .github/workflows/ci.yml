@@ -110,4 +110,8 @@ jobs:
 
       - name: Run Python Pytest Suite
         run: |
-          python -m pytest tests/ -k "not soak and not test_correctness_replay_200_games" -v --durations=10
+          # test_correctness_replay_200_games_and_policy_and_outcomes is a
+          # long-running replay-campaign test (200 full games); it is
+          # intentionally excluded from CI (audit S6-04). The former "not
+          # soak" term matched zero tests and was pruned as inert.
+          python -m pytest tests/ -k "not test_correctness_replay_200_games" -v --durations=10

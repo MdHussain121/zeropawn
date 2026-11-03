@@ -152,9 +152,7 @@ def test_architecture_change_under_an_existing_name_is_refused(tmp_path, monkeyp
 def test_architecture_change_allowed_for_a_deliberate_migration(tmp_path):
     target = tmp_path / "migrating.pt"
     _save_small_checkpoint(target, num_blocks=2, num_filters=32)
-    resolved = assert_safe_artifact_destination(
-        target, arch=(12, 128), allow_arch_change=True
-    )
+    resolved = assert_safe_artifact_destination(target, arch=(12, 128), allow_arch_change=True)
     assert resolved == target
 
 
@@ -255,7 +253,9 @@ def test_rl_trainer_authorized_write_still_refuses_arch_downgrade(tmp_path, monk
     assert read_checkpoint_arch(live) == (12, 128)
 
 
-def test_supervised_save_checkpoint_refuses_protected_destination_without_ticket(tmp_path, monkeypatch):
+def test_supervised_save_checkpoint_refuses_protected_destination_without_ticket(
+    tmp_path, monkeypatch
+):
     prod = _fake_production_root(tmp_path, monkeypatch)
     from python.train.train_supervised import WarmupCosineScheduler, save_checkpoint
 

@@ -162,7 +162,9 @@ def _assign_split_by_family(
     train (preserving the 98/2 balance), else val. Deterministic and input
     order independent. Returns (puzzle_id -> split, component size histogram).
     """
-    candidate_split = {pid: ("val" if rec.gid % 100 < 2 else "train") for pid, rec in puzzles.items()}
+    candidate_split = {
+        pid: ("val" if rec.gid % 100 < 2 else "train") for pid, rec in puzzles.items()
+    }
 
     # Union-find over puzzles sharing an exact encoded state.
     parent: dict[str, str] = {pid: pid for pid in puzzles}
@@ -239,7 +241,11 @@ def _detect_conflicts_and_dedup(
                         {
                             "split": split,
                             "state_md5": pos_key.hex(),
-                            "kept": {"puzzle_id": prev_pid, "solver_seq": prev_seq, "move": prev_move},
+                            "kept": {
+                                "puzzle_id": prev_pid,
+                                "solver_seq": prev_seq,
+                                "move": prev_move,
+                            },
                             "discarded": {"puzzle_id": pid, "solver_seq": seq, "move": move_idx},
                         }
                     )
@@ -412,8 +418,6 @@ def build_tactics_dataset(
     chunk_size: int = 10_000,
 ) -> tuple[int, int]:
     """Build the tactics dataset with position-family split integrity."""
-    import numpy as np
-
     csv_path = Path(csv_path)
     out_dir = Path(output_dir)
     train_dir = out_dir / "train"

@@ -147,9 +147,9 @@ def _write_hermetic_dataset(root: Path) -> Path:
         planes.tofile(sd / "planes.bin")
         np.asarray([10] * count, dtype=np.int16).tofile(sd / "moves.bin")
         np.zeros(count, dtype=np.uint8).tofile(sd / "outcomes.bin")  # all wins: real WDL labels
-        np.asarray(
-            [base_ids[split] + i for i in range(count)], dtype=np.uint64
-        ).tofile(sd / "game_ids.bin")
+        np.asarray([base_ids[split] + i for i in range(count)], dtype=np.uint64).tofile(
+            sd / "game_ids.bin"
+        )
         np.asarray([10 + i for i in range(count)], dtype=np.int16).tofile(sd / "plies.bin")
         (sd / "metadata.json").write_text(
             json.dumps(

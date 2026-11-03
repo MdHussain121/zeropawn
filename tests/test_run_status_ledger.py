@@ -76,7 +76,9 @@ def _make_trainer(tmp_path: Path, name: str = "a") -> RLTrainer:
 
 
 def test_new_ledger_starts_created_with_identity():
-    ledger = build_run_metadata(run_type="rl", git_commit="abc123", seed=42, config={"base_lr": 0.01})
+    ledger = build_run_metadata(
+        run_type="rl", git_commit="abc123", seed=42, config={"base_lr": 0.01}
+    )
     assert ledger["run_state"] == RUN_STATE_CREATED
     assert ledger["run_id"]
     assert ledger["started_at"] is None
@@ -108,8 +110,15 @@ def test_legal_transitions(sequence):
 
 
 def test_terminal_states_are_final():
-    for terminal in (RUN_STATE_COMPLETED, RUN_STATE_FAILED, RUN_STATE_INTERRUPTED, RUN_STATE_CANCELLED):
-        ledger = stamp_run_state(stamp_run_state(build_run_metadata(run_type="rl"), RUN_STATE_RUNNING), terminal)
+    for terminal in (
+        RUN_STATE_COMPLETED,
+        RUN_STATE_FAILED,
+        RUN_STATE_INTERRUPTED,
+        RUN_STATE_CANCELLED,
+    ):
+        ledger = stamp_run_state(
+            stamp_run_state(build_run_metadata(run_type="rl"), RUN_STATE_RUNNING), terminal
+        )
         for later in (RUN_STATE_RUNNING, RUN_STATE_COMPLETED, RUN_STATE_FAILED):
             if later == terminal:
                 continue  # re-stamping the same state is a no-op refresh, not a transition
@@ -280,8 +289,16 @@ def test_supervised_checkpoint_write_carries_a_ledger(tmp_path):
 
     path = tmp_path / "sup.pt"
     save_checkpoint(
-        path, model, optimizer, scheduler, step=1, epoch=0, best_val_loss=1.0,
-        num_blocks=2, num_filters=32, run_metadata=ledger,
+        path,
+        model,
+        optimizer,
+        scheduler,
+        step=1,
+        epoch=0,
+        best_val_loss=1.0,
+        num_blocks=2,
+        num_filters=32,
+        run_metadata=ledger,
     )
     saved = torch.load(path, weights_only=False)
     assert saved["run_metadata"]["run_state"] == RUN_STATE_RUNNING
@@ -378,9 +395,7 @@ def test_supervised_final_save_failure_is_loud_and_marks_the_run_failed(tmp_path
     monkeypatch.setattr(ts, "save_checkpoint", flaky_save)
     monkeypatch.setattr(ts, "_RunTelemetry", RecordingTelemetry)
     monkeypatch.setattr(ts, "BinaryChessDataset", lambda *a, **k: _StubDataset())
-    monkeypatch.setattr(
-        ts, "GpuResidentDataLoader", lambda *a, **k: _StubLoader(_StubDataset(), 2)
-    )
+    monkeypatch.setattr(ts, "GpuResidentDataLoader", lambda *a, **k: _StubLoader(_StubDataset(), 2))
     monkeypatch.setattr(ts, "SourceAwareCombinedDataset", None)
 
     def _stub_dataloader(dataset, batch_size=1, **kwargs):
@@ -406,9 +421,9 @@ def test_supervised_final_save_failure_is_loud_and_marks_the_run_failed(tmp_path
             num_blocks=2,
             num_filters=32,
         )
-    assert any(
-        e.get("event") == "checkpoint_saved_failed" for e in telemetry_events
-    ), f"the failed persistence must be recorded: {telemetry_events}"
+    assert any(e.get("event") == "checkpoint_saved_failed" for e in telemetry_events), (
+        f"the failed persistence must be recorded: {telemetry_events}"
+    )
     assert any(
         e.get("event") == "run_finished" and e.get("status") == "failed" for e in telemetry_events
     ), f"the run must be finalized as failed: {telemetry_events}"

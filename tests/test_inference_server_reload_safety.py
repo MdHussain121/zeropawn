@@ -210,8 +210,7 @@ def test_hot_reload_and_report_logs_non_activation(tmp_path, caplog):
         v = _hot_reload_and_report(_StubServer(), "new.pt")
     assert v == 7
     assert any(
-        "DID NOT ACTIVATE" in rec.message and "new.pt" in rec.getMessage()
-        for rec in caplog.records
+        "DID NOT ACTIVATE" in rec.message and "new.pt" in rec.getMessage() for rec in caplog.records
     )
 
 

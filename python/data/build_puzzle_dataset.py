@@ -103,7 +103,7 @@ def build_puzzle_dataset(
     cannot produce both splits fails explicitly.
     """
     from python.data.build_dataset import OUTCOME_UNAVAILABLE, hash_game_id
-    from python.data.dataset_contract import SCHEMA_VERSION, BuildRecord, detect_git_commit, sha256_file
+    from python.data.dataset_contract import BuildRecord, detect_git_commit, sha256_file
 
     csv_path = Path(csv_path)
     output_dir = Path(output_dir)
@@ -280,9 +280,7 @@ def build_puzzle_dataset(
             "outcome_encoding": "255=masked (policy-only example)",
             "wdl_supervised": False,
         },
-        counts={
-            k: v for k, v in summary.items() if k not in ("output_dir", "certification_hint")
-        },
+        counts={k: v for k, v in summary.items() if k not in ("output_dir", "certification_hint")},
         git_commit=detect_git_commit(),
     ).write(output_dir)
     logger.info("Built tactical puzzle dataset: %s", summary)

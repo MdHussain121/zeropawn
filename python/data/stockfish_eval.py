@@ -246,7 +246,7 @@ def generate_value_targets_for_dataset(
             outcome = int(ds.outcomes[idx])
 
             # Positions in first 10 plies get no value loss, but can still be evaluated
-            is_white = (bool(stms[idx]) if stms is not None else ply % 2 == 0)
+            is_white = bool(stms[idx]) if stms is not None else ply % 2 == 0
             planes = np.array(ds.planes[idx], dtype=np.float32)
             fen = decode_planes_to_fen(planes, is_white_to_move=is_white, ply=ply)
 

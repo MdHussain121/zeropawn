@@ -58,6 +58,7 @@ def _compute_material_balance(opening_fen: str, moves: list[str], engine_is_whit
     except Exception:
         return 0
 
+
 VALID_SEARCH_MODES = ("serial", "batched")
 
 
@@ -1191,9 +1192,7 @@ class MatchRunner:
                         games_done = completed_pairs * 2
                         eff_done = engine_wins + engine_draws + engine_losses
                         score = (
-                            (engine_wins + 0.5 * engine_draws) / eff_done
-                            if eff_done > 0
-                            else 0.0
+                            (engine_wins + 0.5 * engine_draws) / eff_done if eff_done > 0 else 0.0
                         )
                         elapsed = time.time() - start_time
                         logger.info(
@@ -1240,9 +1239,7 @@ class MatchRunner:
         completed_total = len(games)
         denominator = completed_total if interrupted else total_games
         primary_score = (
-            (engine_wins + 0.5 * engine_draws) / effective_games
-            if effective_games > 0
-            else 0.0
+            (engine_wins + 0.5 * engine_draws) / effective_games if effective_games > 0 else 0.0
         )
         draw_rate = engine_draws / effective_games if effective_games > 0 else 0.0
         capped_rate = capped_games / completed_total if completed_total > 0 else 0.0
@@ -1271,9 +1268,7 @@ class MatchRunner:
                 pairs_dict[idx]["white" if eng_white else "black"] = s
 
         valid_pairs = [
-            (p["white"], p["black"])
-            for p in pairs_dict.values()
-            if "white" in p and "black" in p
+            (p["white"], p["black"]) for p in pairs_dict.values() if "white" in p and "black" in p
         ]
         pairing_res = paired_score_and_ci(valid_pairs, confidence=0.95)
 

@@ -173,9 +173,7 @@ def test_factory_encodes_the_passed_game_directly_black_repetition():
     game = _black_repetition_game()
     assert game.side_to_move() is False  # Black to move
     spy = EncodeSpy(zeropawn_cpp)
-    eval_fn = eval_callbacks.make_serial_eval_fn(
-        ScriptedPolicyModel(), "cpu", cpp_module=spy
-    )
+    eval_fn = eval_callbacks.make_serial_eval_fn(ScriptedPolicyModel(), "cpu", cpp_module=spy)
 
     eval_fn(game)
 
@@ -187,9 +185,7 @@ def test_factory_encodes_the_passed_game_directly_black_repetition():
 def test_factory_preserves_ordinary_positions():
     game = zeropawn_cpp.ChessGame()  # startpos, no history, White to move
     spy = EncodeSpy(zeropawn_cpp)
-    eval_fn = eval_callbacks.make_serial_eval_fn(
-        ScriptedPolicyModel(), "cpu", cpp_module=spy
-    )
+    eval_fn = eval_callbacks.make_serial_eval_fn(ScriptedPolicyModel(), "cpu", cpp_module=spy)
 
     policy, value = eval_fn(game)
 
@@ -221,9 +217,7 @@ def test_factory_value_is_side_to_move_relative_win_minus_loss():
     assert value == pytest.approx(expected, abs=1e-6)
     # Swapped logits (loss dominant) must flip the sign.
     model2 = ScriptedPolicyModel(wdl_logits=(-2.0, 0.0, 2.0))
-    eval_fn2 = eval_callbacks.make_serial_eval_fn(
-        model2, "cpu", cpp_module=EncodeSpy(zeropawn_cpp)
-    )
+    eval_fn2 = eval_callbacks.make_serial_eval_fn(model2, "cpu", cpp_module=EncodeSpy(zeropawn_cpp))
     _, value2 = eval_fn2(game)
     assert value2 == pytest.approx(-expected, abs=1e-6)
 
@@ -272,9 +266,7 @@ def test_match_live_eval_callback_preserves_history_and_repetition(
     monkeypatch.setattr(
         commands_match, "load_engine_model", lambda path, device=None: (model, {"path": path})
     )
-    monkeypatch.setattr(
-        match_runner, "StockfishPlayer", _ScriptedStockfish
-    )
+    monkeypatch.setattr(match_runner, "StockfishPlayer", _ScriptedStockfish)
     sf_dummy = tmp_path / "stockfish.exe"
     sf_dummy.write_bytes(b"x")
     monkeypatch.setattr(commands_match, "get_default_stockfish_path", lambda: sf_dummy)
@@ -390,8 +382,7 @@ def test_puzzles_solve_eval_callback_preserves_history(tmp_path, dummy_ckpt, mon
 
     csv_path = tmp_path / "puzzles.csv"
     csv_path.write_text(
-        "puzzle_id,fen,moves,rating\n"
-        f"test-1,{START_FEN},e2e4 e7e5,1500\n",
+        f"puzzle_id,fen,moves,rating\ntest-1,{START_FEN},e2e4 e7e5,1500\n",
         encoding="utf-8",
     )
 

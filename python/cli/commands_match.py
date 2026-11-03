@@ -71,9 +71,7 @@ def _elo_diff_ci(wins: int, draws: int, losses: int) -> str:
     return f"{elo:+.1f} +/- {half:.1f} (95% CI Agresti-Caffo: [{lo:+.1f}, {hi:+.1f}], N={n})"
 
 
-def _append_match_ledger(
-    entry: dict, ledger_path: str = "runs/matches/match_ledger.jsonl"
-) -> None:
+def _append_match_ledger(entry: dict, ledger_path: str = "runs/matches/match_ledger.jsonl") -> None:
     """Append a match summary record to the persistent match ledger."""
     try:
         p = Path(ledger_path)
@@ -450,8 +448,7 @@ def run_batch_match(args: argparse.Namespace) -> int:
                 "--checkpoint '' (explicit no-model) is not supported by 'match': "
                 "match play requires network weights.",
                 "explicit empty --checkpoint",
-                "omit --checkpoint for the designated default, or pass a .pt path, "
-                "then see LOG",
+                "omit --checkpoint for the designated default, or pass a .pt path, then see LOG",
             )
         else:
             ckpt_path = args.checkpoint
@@ -611,7 +608,9 @@ def run_batch_match(args: argparse.Namespace) -> int:
                 (
                     "pgn",
                     pgn_path or "disabled",
-                    "user" if getattr(args, "pgn", None) or getattr(args, "no_pgn", False) else "default (auto)",
+                    "user"
+                    if getattr(args, "pgn", None) or getattr(args, "no_pgn", False)
+                    else "default (auto)",
                 ),
                 (
                     "output_json",
@@ -799,7 +798,10 @@ def run_batch_match(args: argparse.Namespace) -> int:
             "crashes_illegal_forfeits",
             "n/a (not tracked by runner; non-decisive engine faults count as losses)",
         ),
-        ("total_time", f"{elapsed:.1f}s ({elapsed / max(1, results['total_games']):.1f}s/game) (M)"),
+        (
+            "total_time",
+            f"{elapsed:.1f}s ({elapsed / max(1, results['total_games']):.1f}s/game) (M)",
+        ),
     ]
     emit_report(results_table(res_items))
 

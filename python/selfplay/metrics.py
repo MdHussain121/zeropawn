@@ -278,9 +278,10 @@ class MetricsTracker:
         never counted as a played or drawn game — it increments the dedicated
         aborted counter and returns.
         """
-        if getattr(summary, "aborted", False) or getattr(
-            summary, "termination_reason", ""
-        ) == "aborted":
+        if (
+            getattr(summary, "aborted", False)
+            or getattr(summary, "termination_reason", "") == "aborted"
+        ):
             self.total_aborted_games += 1
             return
         self.total_games += 1
@@ -537,7 +538,9 @@ class MetricsTracker:
         """Ensure at least one durable telemetry record is written before close (audit F-15)."""
         if self.rows_written == 0 and self.csv_path is not None:
             try:
-                self.log_step(step=step, buffer_size=buffer_size, model_version=model_version, **kwargs)
+                self.log_step(
+                    step=step, buffer_size=buffer_size, model_version=model_version, **kwargs
+                )
             except Exception as e:
                 logger.warning("Final telemetry flush failed: %s", e)
         self.close()

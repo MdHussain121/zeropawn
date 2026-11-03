@@ -52,7 +52,9 @@ def download(url: str, dest: Path) -> Path | None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists() and dest.stat().st_size > 0:
         if _zip_is_valid(dest):
-            print(f"  exists and validates, reusing: {dest.name} ({dest.stat().st_size / 1e6:.0f} MB)")
+            print(
+                f"  exists and validates, reusing: {dest.name} ({dest.stat().st_size / 1e6:.0f} MB)"
+            )
             return dest
         print(f"  exists but FAILS archive validation, re-downloading: {dest.name}")
         dest.unlink()
@@ -83,7 +85,9 @@ def download(url: str, dest: Path) -> Path | None:
         # Validate the archive BEFORE publishing it for future reuse.
         if not _zip_is_valid(part_dest):
             part_dest.unlink(missing_ok=True)
-            raise ValueError(f"Downloaded archive failed validation (truncated or no .pgn member): {url}")
+            raise ValueError(
+                f"Downloaded archive failed validation (truncated or no .pgn member): {url}"
+            )
         part_dest.replace(dest)
     except Exception:
         part_dest.unlink(missing_ok=True)

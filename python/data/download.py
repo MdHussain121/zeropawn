@@ -201,7 +201,9 @@ def download_file(
     last_print = t0
 
     resumed = existing_bytes > 0
-    with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=timeout) as resp:
+    with urllib.request.urlopen(
+        urllib.request.Request(url, headers=headers), timeout=timeout
+    ) as resp:
         status = getattr(resp, "status", None)
         if not isinstance(status, int):
             status = getattr(resp, "code", None)
@@ -281,7 +283,9 @@ def download_file(
     part_dest.replace(destination)
 
     digest = hasher.hexdigest()
-    Path(str(destination) + ".sha256").write_text(f"{digest}  {destination.name}\n", encoding="utf-8")
+    Path(str(destination) + ".sha256").write_text(
+        f"{digest}  {destination.name}\n", encoding="utf-8"
+    )
     Path(str(destination) + ".provenance.json").write_text(
         _json.dumps(
             {
@@ -299,7 +303,9 @@ def download_file(
         encoding="utf-8",
     )
 
-    print(f"\nDownload finished and verified: {total_downloaded / 1e6:.1f} MB published to {destination}")
+    print(
+        f"\nDownload finished and verified: {total_downloaded / 1e6:.1f} MB published to {destination}"
+    )
     return destination
 
 

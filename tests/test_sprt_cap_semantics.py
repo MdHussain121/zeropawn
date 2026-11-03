@@ -113,10 +113,7 @@ def test_classify_game_record_outcome_table():
     assert classify_game_record({"board_result": "1-0", "cand_white": False}) == "decisive_loss"
     assert classify_game_record({"board_result": "0-1", "cand_white": True}) == "decisive_loss"
     assert classify_game_record({"board_result": "0-1", "cand_white": False}) == "decisive_win"
-    assert (
-        classify_game_record({"board_result": "1/2-1/2", "cand_white": True})
-        == "genuine_draw"
-    )
+    assert classify_game_record({"board_result": "1/2-1/2", "cand_white": True}) == "genuine_draw"
     # Ply cap: "*" and the cap_policy="draw" board string with capped
     # provenance BOTH classify as capped — never as a genuine draw (S5-05).
     assert classify_game_record({"board_result": "*", "cand_white": True}) == "capped"
@@ -396,9 +393,7 @@ def test_play_records_plies_and_material_balance(monkeypatch):
 
 def test_sprt_match_runner_rejects_unknown_cap_policy():
     with pytest.raises(ValueError):
-        SprtMatchRunner(
-            candidate_checkpoint="a.pt", base_checkpoint="b.pt", cap_policy="banana"
-        )
+        SprtMatchRunner(candidate_checkpoint="a.pt", base_checkpoint="b.pt", cap_policy="banana")
 
 
 # ---------------------------------------------------------------------------
@@ -618,9 +613,7 @@ def test_legacy_state_records_default_to_uncapped(tmp_path):
         },
     ]
     _write_state(tmp_path / "legacy_state.json", "legacy", legacy_games)
-    result = runner.run_sprt(
-        "legacy", dict(CAND_CFG), dict(BASE_CFG), tmp_path, max_games=4
-    )
+    result = runner.run_sprt("legacy", dict(CAND_CFG), dict(BASE_CFG), tmp_path, max_games=4)
     assert result["sprt"]["n"] == 4
     assert result["sprt"]["wins"] == 1
     assert result["sprt"]["draws"] == 2  # legacy capped record stays a draw
@@ -657,9 +650,7 @@ def test_new_schema_state_reclassifies_capped_on_resume(tmp_path):
         },
     ]
     _write_state(tmp_path / "recl_state.json", "recl", games)
-    result = runner.run_sprt(
-        "recl", dict(CAND_CFG), dict(BASE_CFG), tmp_path, max_games=4
-    )
+    result = runner.run_sprt("recl", dict(CAND_CFG), dict(BASE_CFG), tmp_path, max_games=4)
     assert result["sprt"]["n"] == 2
     assert result["sprt"]["wins"] == 2
     assert result["sprt"]["draws"] == 0
@@ -711,9 +702,7 @@ def test_run_sprt_resume_plays_remaining_games_with_stubbed_player(tmp_path, mon
         return ("1-0" if cand_white else "0-1", ["e2e4", "e7e5", "d2d4", "d7d5"])
 
     monkeypatch.setattr(runner, "play_single_game", fake_play)
-    result = runner.run_sprt(
-        "resume", dict(CAND_CFG), dict(BASE_CFG), tmp_path, max_games=4
-    )
+    result = runner.run_sprt("resume", dict(CAND_CFG), dict(BASE_CFG), tmp_path, max_games=4)
 
     # Exactly the two remaining games were played, with the production cap.
     assert len(played) == 2

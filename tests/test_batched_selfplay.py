@@ -25,7 +25,12 @@ import zeropawn_cpp
 from python.model.chess_net import ChessNet
 from python.selfplay.client import DirectInferenceClient
 from python.selfplay.inference_server import InferenceServer
-from python.selfplay.worker import InferenceError, SelfPlayGame, SelfPlayWorker, WorkerBatchAggregator
+from python.selfplay.worker import (
+    InferenceError,
+    SelfPlayGame,
+    SelfPlayWorker,
+    WorkerBatchAggregator,
+)
 
 
 class MockInferenceClient:
@@ -52,8 +57,6 @@ class FailingInferenceClient:
     def evaluate_leaves(self, states: np.ndarray):
         self.calls += 1
         raise RuntimeError("simulated inference backend failure")
-
-
 
 
 @pytest.fixture
@@ -163,7 +166,9 @@ def test_serial_selfplay_still_works():
 def test_inference_failure_aborts_serial_search():
     """A failing backend raises InferenceError out of search instead of
     silently feeding uniform policies into the running tree."""
-    aggregator = WorkerBatchAggregator(client=FailingInferenceClient(), max_batch_size=4, max_wait_ms=1.0)
+    aggregator = WorkerBatchAggregator(
+        client=FailingInferenceClient(), max_batch_size=4, max_wait_ms=1.0
+    )
     disp = threading.Thread(target=aggregator.dispatcher_loop, daemon=True)
     disp.start()
     try:
@@ -189,7 +194,9 @@ def test_inference_failure_aborts_serial_search():
 
 def test_inference_failure_aborts_batched_search():
     """Same contract through the legacy batched entry point."""
-    aggregator = WorkerBatchAggregator(client=FailingInferenceClient(), max_batch_size=4, max_wait_ms=1.0)
+    aggregator = WorkerBatchAggregator(
+        client=FailingInferenceClient(), max_batch_size=4, max_wait_ms=1.0
+    )
     disp = threading.Thread(target=aggregator.dispatcher_loop, daemon=True)
     disp.start()
     try:
@@ -215,7 +222,9 @@ def test_inference_failure_aborts_batched_search():
 
 def test_stop_wakes_waiters_with_error_not_uniform():
     """Shutdown wake-up must be distinguishable from a real evaluation."""
-    aggregator = WorkerBatchAggregator(client=MockInferenceClient(), max_batch_size=8, max_wait_ms=50.0)
+    aggregator = WorkerBatchAggregator(
+        client=MockInferenceClient(), max_batch_size=8, max_wait_ms=50.0
+    )
     results = []
 
     def waiter():

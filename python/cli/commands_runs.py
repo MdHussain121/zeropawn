@@ -237,9 +237,7 @@ def run_runs_recover(args: argparse.Namespace) -> int:
 
         ckpts = [
             f
-            for f in sorted(
-                ckpt_dir.glob("*.pt"), key=lambda f: f.stat().st_mtime, reverse=True
-            )
+            for f in sorted(ckpt_dir.glob("*.pt"), key=lambda f: f.stat().st_mtime, reverse=True)
             if _resumable(f)
         ]
         if ckpts:

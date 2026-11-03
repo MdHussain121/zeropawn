@@ -36,9 +36,7 @@ def slow_callback_factory(engine):
                         p_logits, v_wdl = engine.model(t)
                 else:
                     p_logits, v_wdl = engine.model(t)
-            p_probs = (
-                torch.softmax(p_logits.float(), dim=-1).squeeze(0).cpu().numpy().tolist()
-            )
+            p_probs = torch.softmax(p_logits.float(), dim=-1).squeeze(0).cpu().numpy().tolist()
             v_probs = torch.softmax(v_wdl.float(), dim=-1).squeeze(0).cpu().numpy()
             scalar_val = float(v_probs[0] - v_probs[2])
         return (p_probs, scalar_val)
@@ -74,11 +72,15 @@ def main():
         dt, mv = run_once(engine, fast_cb)
         fast.append(dt)
         fast_moves.append(mv)
-        print(f"pair {i+1}: slow={slow[-1]*1000:.1f}ms fast={fast[-1]*1000:.1f}ms")
+        print(f"pair {i + 1}: slow={slow[-1] * 1000:.1f}ms fast={fast[-1] * 1000:.1f}ms")
 
     s_med, f_med = statistics.median(slow), statistics.median(fast)
-    print(f"slow: median {s_med*1000:.1f} ms ({SIMS/s_med:.1f} sims/s) min {min(slow)*1000:.1f} max {max(slow)*1000:.1f} moves={set(slow_moves)}")
-    print(f"fast: median {f_med*1000:.1f} ms ({SIMS/f_med:.1f} sims/s) min {min(fast)*1000:.1f} max {max(fast)*1000:.1f} moves={set(fast_moves)}")
+    print(
+        f"slow: median {s_med * 1000:.1f} ms ({SIMS / s_med:.1f} sims/s) min {min(slow) * 1000:.1f} max {max(slow) * 1000:.1f} moves={set(slow_moves)}"
+    )
+    print(
+        f"fast: median {f_med * 1000:.1f} ms ({SIMS / f_med:.1f} sims/s) min {min(fast) * 1000:.1f} max {max(fast) * 1000:.1f} moves={set(fast_moves)}"
+    )
     print(f"delta: {(s_med - f_med) / s_med * 100:.2f}% wall time saved (fast vs slow, paired)")
 
 

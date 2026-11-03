@@ -77,6 +77,7 @@ def adjudicator():
 # SY-01: Rule-50 safeguard
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class TestSY01Rule50Safeguard:
     """Verifies that decisive tablebase adjudications enforce halfmove_clock == 0."""
 
@@ -97,13 +98,17 @@ class TestSY01Rule50Safeguard:
         assert meta["halfmove_clock"] == 0
         assert not meta.get("halfmove_ineligible", False)
 
-    def test_decisive_at_clock_greater_than_zero_returns_none(self, adjudicator: TablebaseAdjudicator):
+    def test_decisive_at_clock_greater_than_zero_returns_none(
+        self, adjudicator: TablebaseAdjudicator
+    ):
         init_ineligible = adjudicator.probes_halfmove_ineligible
 
         # KRvK: White to move winning, but halfmove_clock = 5
         fen_clock5 = "8/8/8/8/8/4K3/R7/7k w - - 5 1"
         outcome, meta = adjudicator.probe(fen_clock5)
-        assert outcome is None, "Decisive position with clock > 0 must return None, not a fabricated draw"
+        assert outcome is None, (
+            "Decisive position with clock > 0 must return None, not a fabricated draw"
+        )
         assert meta["qualified"] is True
         assert meta["raw_wdl"] == 2
         assert meta["halfmove_ineligible"] is True
@@ -129,7 +134,9 @@ class TestSY01Rule50Safeguard:
         assert meta["halfmove_clock"] == 25
         assert not meta.get("halfmove_ineligible", False)
 
-    def test_cursed_win_and_blessed_loss_at_clock_greater_than_zero(self, adjudicator: TablebaseAdjudicator):
+    def test_cursed_win_and_blessed_loss_at_clock_greater_than_zero(
+        self, adjudicator: TablebaseAdjudicator
+    ):
         # KNNvKP: Cursed win (raw_wdl = 1), clock = 10
         fen_cursed = "7k/8/4N3/4p3/1N6/8/8/K7 w - - 10 1"
         outcome, meta = adjudicator.probe(fen_cursed)
@@ -140,7 +147,9 @@ class TestSY01Rule50Safeguard:
         # KNNvKP: Blessed loss (raw_wdl = -1), clock = 20
         fen_blessed = "7k/4N3/3p4/8/5N2/8/8/K7 b - - 20 1"
         outcome, meta = adjudicator.probe(fen_blessed)
-        assert outcome == 0, "Blessed loss must adjudicate to draw under rule-50 regardless of clock"
+        assert outcome == 0, (
+            "Blessed loss must adjudicate to draw under rule-50 regardless of clock"
+        )
         assert meta["raw_wdl"] == -1
         assert meta["halfmove_clock"] == 20
 
@@ -148,6 +157,7 @@ class TestSY01Rule50Safeguard:
 # ─────────────────────────────────────────────────────────────────────────────
 # SY-02: Supervision target mapping (5-class to 3-class)
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 class TestSY02SupervisionTargets:
     """Verifies 5-class tablebase outcome to 3-class FIDE value target mapping."""
@@ -206,18 +216,22 @@ class TestSY02SupervisionTargets:
         assert raw_wdl == 1
         assert outcome_class == 1
         np.testing.assert_array_equal(
-            wdl_target, np.array([0.0, 1.0, 0.0], dtype=np.float32),
-            err_msg="Cursed win must produce draw value target [0, 1, 0]"
+            wdl_target,
+            np.array([0.0, 1.0, 0.0], dtype=np.float32),
+            err_msg="Cursed win must produce draw value target [0, 1, 0]",
         )
 
         # Blessed loss: KNNvKP
         board_blessed = chess.Board("7k/4N3/3p4/8/5N2/8/8/K7 b - - 0 1")
-        raw_wdl, outcome_class, wdl_target, move_scores = gen.probe_position_and_moves(board_blessed)
+        raw_wdl, outcome_class, wdl_target, move_scores = gen.probe_position_and_moves(
+            board_blessed
+        )
         assert raw_wdl == -1
         assert outcome_class == 3
         np.testing.assert_array_equal(
-            wdl_target, np.array([0.0, 1.0, 0.0], dtype=np.float32),
-            err_msg="Blessed loss must produce draw value target [0, 1, 0]"
+            wdl_target,
+            np.array([0.0, 1.0, 0.0], dtype=np.float32),
+            err_msg="Blessed loss must produce draw value target [0, 1, 0]",
         )
         gen.close()
 
@@ -257,6 +271,7 @@ class TestSY02SupervisionTargets:
 # SY-03: Cursed win and blessed loss unconditional assertions
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class TestSY03CursedWinUnconditional:
     """Verifies genuine cursed-win and blessed-loss positions with unconditional assertions."""
 
@@ -292,6 +307,7 @@ class TestSY03CursedWinUnconditional:
 # SY-04: DTZ artifact handling and validation
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class TestSY04DTZHandlingAndValidation:
     """Verifies that DTZ tables absence is handled cleanly and all-NaN DTZ is rejected."""
 
@@ -324,7 +340,9 @@ class TestSY04DTZHandlingAndValidation:
         nan_dtz.tofile(split_dir / "dtz_targets.bin")
 
         report = validate_split(split_dir)
-        assert report.overall == "fail", "validate_split must FAIL when dtz_targets.bin contains all NaNs"
+        assert report.overall == "fail", (
+            "validate_split must FAIL when dtz_targets.bin contains all NaNs"
+        )
         dtz_check = next((c for c in report.results if c.name == "dtz_targets_valid"), None)
         assert dtz_check is not None
         assert dtz_check.status == CheckStatus.FAIL
@@ -350,6 +368,7 @@ class TestSY04DTZHandlingAndValidation:
 # ─────────────────────────────────────────────────────────────────────────────
 # SY-05: Singleton lifecycle and resource cleanup
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 class TestSY05SingletonLifecycle:
     """Verifies tablebase file handle management and singleton lifecycle."""
@@ -386,6 +405,7 @@ class TestSY05SingletonLifecycle:
 # SY-06: Invalid position handling
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class TestSY06InvalidPositionHandling:
     """Verifies that invalid positions are never silently adjudicated as draws."""
 
@@ -421,6 +441,7 @@ class TestSY06InvalidPositionHandling:
 # SY-07: Tooling, CWD independence, exit codes, and network failure handling
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class TestSY07ToolingAndProvenance:
     """Verifies CWD-independent path resolution, exit codes, and network error semantics."""
 
@@ -449,15 +470,21 @@ class TestSY07ToolingAndProvenance:
 
     def test_validate_tb_offline_exit_code(self):
         from scripts import validate_tb_offline
+
         # Run on a tiny sample of 2 games
         with pytest.raises(SystemExit) as excinfo:
             validate_tb_offline.main(["--max-games", "2", "--min-agreement", "0.90"])
-        assert excinfo.value.code == 0, f"validate_tb_offline should exit with 0, got {excinfo.value.code}"
+        assert excinfo.value.code == 0, (
+            f"validate_tb_offline should exit with 0, got {excinfo.value.code}"
+        )
 
     def test_tb_feasibility_probe_network_error_semantics(self):
         from scripts.tb_feasibility import probe_syzygy_wdl
+
         # When urlopen raises URLError/HTTPError, probe_syzygy_wdl must return None, not raise
-        with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("Network unreachable")):
+        with patch(
+            "urllib.request.urlopen", side_effect=urllib.error.URLError("Network unreachable")
+        ):
             cat = probe_syzygy_wdl("8/8/8/8/8/5K2/4R3/7k w - - 0 1")
             assert cat is None, "Network failure must return None"
 
@@ -465,6 +492,7 @@ class TestSY07ToolingAndProvenance:
 # ─────────────────────────────────────────────────────────────────────────────
 # SY-08: Build record provenance and schema versioning
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 class TestSY08BuildRecordProvenance:
     """Verifies dataset generation produces valid BuildRecord with schema versioning."""
@@ -499,10 +527,13 @@ class TestSY08BuildRecordProvenance:
 # SY-09 through SY-12: Architectural boundaries and intentional limitations
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class TestSY09ThroughSY12ArchitecturalBoundaries:
     """Verifies intentional architectural boundaries (SY-09 through SY-12)."""
 
-    def test_sy09_six_piece_positions_rejected_by_fast_filter(self, adjudicator: TablebaseAdjudicator):
+    def test_sy09_six_piece_positions_rejected_by_fast_filter(
+        self, adjudicator: TablebaseAdjudicator
+    ):
         # 6-piece position: White K+Q+R+P vs Black K+p
         fen_6piece = "8/8/8/4p3/8/5K2/4QP2/R6k w - - 0 1"
         passed, pc = adjudicator.fast_filter(fen_6piece, max_pieces=5)
@@ -528,6 +559,7 @@ class TestSY09ThroughSY12ArchitecturalBoundaries:
         # Verify that TablebaseAdjudicator is decoupled from MCTS search and evaluation functions
         # Inspect model and worker imports to confirm Syzygy is solely used between plies
         import python.model
+
         assert not hasattr(python.model, "chess_tablebase"), (
             "Neural network models must have zero tablebase coupling"
         )

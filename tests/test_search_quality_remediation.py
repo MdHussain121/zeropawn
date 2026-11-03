@@ -765,9 +765,7 @@ def test_f03_stop_event_aborts_running_search():
     engine._eval_batch_callback = lambda games: [slow_eval(g) for g in games]
 
     engine._stop_event = threading.Event()
-    thread = threading.Thread(
-        target=engine.search_and_respond, args=(500_000, None), daemon=True
-    )
+    thread = threading.Thread(target=engine.search_and_respond, args=(500_000, None), daemon=True)
     start = time.perf_counter()
     thread.start()
     assert started.wait(timeout=10)

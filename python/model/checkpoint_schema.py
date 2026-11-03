@@ -152,7 +152,9 @@ def validate_checkpoint_schema(
     optimizer+scheduler state is resumable, a weights-only export is not.
     """
     if not isinstance(ckpt, Mapping):
-        raise CheckpointSchemaError(f"'{path}' is not a checkpoint mapping (got {type(ckpt).__name__}).")
+        raise CheckpointSchemaError(
+            f"'{path}' is not a checkpoint mapping (got {type(ckpt).__name__})."
+        )
 
     family = detect_family(ckpt)
     if expected_family is not None and family != expected_family:
@@ -185,9 +187,7 @@ def validate_checkpoint_schema(
         missing = [f for f in LEGACY_REQUIRED_FIELDS if f not in ckpt]
         verdict.missing_required = missing
         if missing:
-            raise CheckpointSchemaError(
-                f"'{path}' is not a usable checkpoint: missing {missing}."
-            )
+            raise CheckpointSchemaError(f"'{path}' is not a usable checkpoint: missing {missing}.")
         verdict.warnings.append(
             f"legacy artifact without checkpoint_format (family={family}); accepted through "
             "the explicit legacy path"
@@ -223,7 +223,9 @@ def validate_checkpoint_schema(
     if version < 1:
         raise CheckpointSchemaError(f"'{path}' declares an invalid checkpoint_format={version}.")
 
-    verdict = SchemaVerdict(path=str(path), family=family, version=version, is_legacy=version < (current or version))
+    verdict = SchemaVerdict(
+        path=str(path), family=family, version=version, is_legacy=version < (current or version)
+    )
     if verdict.is_legacy:
         verdict.warnings.append(
             f"checkpoint_format={version} predates current format {current} for family "
@@ -415,7 +417,9 @@ def advance_run_state_inplace(
     return ledger
 
 
-def validate_run_metadata(ledger: Any, *, path: Union[str, Path], required: bool = False) -> list[str]:
+def validate_run_metadata(
+    ledger: Any, *, path: Union[str, Path], required: bool = False
+) -> list[str]:
     """Check an embedded ledger; return warnings. Raises when unusable-but-present.
 
     ``required=True`` demands a present, structurally valid ledger with a state
@@ -433,7 +437,9 @@ def validate_run_metadata(ledger: Any, *, path: Union[str, Path], required: bool
     """
     if ledger is None:
         if required:
-            raise CheckpointSchemaError(f"'{path}' has no run_metadata ledger (required by schema).")
+            raise CheckpointSchemaError(
+                f"'{path}' has no run_metadata ledger (required by schema)."
+            )
         return [f"no run_metadata ledger inside '{Path(path).name}' (legacy artifact)"]
     if not isinstance(ledger, Mapping):
         raise CheckpointSchemaError(

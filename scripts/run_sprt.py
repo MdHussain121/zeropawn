@@ -29,6 +29,7 @@ treated as UNCAPPED and keep their recorded result (the historical
 cap-as-draw residue in a legacy state is visible via its
 ``adjudication_reason == "max_plies_cap"`` but is not reinterpreted).
 """
+
 from __future__ import annotations
 
 import argparse
@@ -51,8 +52,9 @@ sys.path.insert(0, str(ROOT))
 import python  # noqa: F401
 import zeropawn_cpp
 from python.cli.common import get_default_checkpoint_path
-from python.eval.sprt import compute_sprt_llr, wilson_interval
+from python.eval.sprt import compute_sprt_llr
 from python.model.chess_net import ChessNet
+
 # Shared F-01/S5-05 classification contract: ONE implementation of the
 # capped-game (cap != draw) semantics for MatchRunner and this SPRT harness.
 from python.eval.match_runner import (
@@ -102,8 +104,7 @@ def sprt_tally(games: list) -> dict:
     capped_white = sum(
         1
         for g in games
-        if is_capped_game_record(g)
-        and bool(g.get("cand_white", g.get("engine_is_white")))
+        if is_capped_game_record(g) and bool(g.get("cand_white", g.get("engine_is_white")))
     )
     counts["capped_candidate_white"] = capped_white
     counts["capped_candidate_black"] = counts["capped_games"] - capped_white
@@ -182,9 +183,12 @@ def _file_sha256(path: Path | str) -> str:
 
 def _git_commit() -> str:
     try:
-        return subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"], capture_output=True, text=True
+        ).stdout.strip()
     except Exception:
         return "unknown"
+
 
 # Pre-registered search-parameter candidates from the 2026-10-16 screen
 # (locked baseline: c_puct=2.0, fpu_reduction=0.2).
@@ -486,7 +490,9 @@ class SprtMatchRunner:
 
         if len(games_played) >= max_games or sprt["decision"] != "CONTINUE":
             final_status = sprt["decision"] if sprt["decision"] != "CONTINUE" else "INCONCLUSIVE"
-            print(f"Candidate {name} already complete: {final_status} after {len(games_played)} games.")
+            print(
+                f"Candidate {name} already complete: {final_status} after {len(games_played)} games."
+            )
             return {
                 "name": name,
                 "cand_cfg": cand_cfg,
@@ -528,7 +534,7 @@ class SprtMatchRunner:
             batch_results: list[dict[str, Any]] = []
             with concurrent.futures.ThreadPoolExecutor(max_workers=self.workers) as executor:
                 futures = {}
-                for (p_idx, opening_idx, fen, cand_white, seed) in tasks:
+                for p_idx, opening_idx, fen, cand_white, seed in tasks:
                     # Audit RL-20: per-game adjudication provenance.
                     game_info: dict[str, object] = {}
                     futures[
@@ -586,7 +592,7 @@ class SprtMatchRunner:
                     pf.write(f'[Result "{gr["board_result"]}"]\n')
                     pf.write(f'[FEN "{gr["opening_fen"]}"]\n')
                     pf.write(f'[CandidateWhite "{gr["cand_white"]}"]\n\n')
-                    pf.write(" ".join(gr["moves"]) + f' {gr["board_result"]}\n\n')
+                    pf.write(" ".join(gr["moves"]) + f" {gr['board_result']}\n\n")
 
             counts = _tally()
             cand_wins, cand_draws, cand_losses = counts["wins"], counts["draws"], counts["losses"]
@@ -635,7 +641,10 @@ class SprtMatchRunner:
                 )
 
             if sprt["decision"] != "CONTINUE":
-                print(f"--> SPRT STOP for {name}: {sprt['decision']} at {sprt['n']} games!", flush=True)
+                print(
+                    f"--> SPRT STOP for {name}: {sprt['decision']} at {sprt['n']} games!",
+                    flush=True,
+                )
                 break
 
         final_status = sprt["decision"] if sprt["decision"] != "CONTINUE" else "INCONCLUSIVE"
@@ -672,14 +681,10 @@ class SprtMatchRunner:
             # MatchRunner's summary accounting).
             "adjudicated_games": sum(1 for g in games_played if g.get("adjudicated")),
             "adjudicated_value_cutoff_wins": sum(
-                1
-                for g in games_played
-                if g.get("adjudication_reason") == "value_cutoff_win"
+                1 for g in games_played if g.get("adjudication_reason") == "value_cutoff_win"
             ),
             "adjudicated_value_cutoff_losses": sum(
-                1
-                for g in games_played
-                if g.get("adjudication_reason") == "value_cutoff_loss"
+                1 for g in games_played if g.get("adjudication_reason") == "value_cutoff_loss"
             ),
         }
 
@@ -693,8 +698,12 @@ def main() -> int:
         help="Pre-registered search-parameter candidate, 'all' of them, or a "
         "candidate-CHECKPOINT-vs-base promotion test",
     )
-    parser.add_argument("--candidate-checkpoint", default=None, help="Candidate weights (promotion test)")
-    parser.add_argument("--base-checkpoint", default=None, help="Base weights (default: same as candidate)")
+    parser.add_argument(
+        "--candidate-checkpoint", default=None, help="Candidate weights (promotion test)"
+    )
+    parser.add_argument(
+        "--base-checkpoint", default=None, help="Base weights (default: same as candidate)"
+    )
     parser.add_argument("--max-games", type=int, default=200)
     parser.add_argument("--sims", type=int, default=200)
     parser.add_argument("--workers", type=int, default=8)
@@ -768,7 +777,11 @@ def main() -> int:
     for r in results:
         s = r["sprt"]
         wdl = f"{s['wins']}/{s['draws']}/{s['losses']}"
-        elo_str = f"{s['elo_diff']:+.1f} [{s['elo_lo']:+.1f}, {s['elo_hi']:+.1f}]" if s["elo_diff"] is not None else "N/A"
+        elo_str = (
+            f"{s['elo_diff']:+.1f} [{s['elo_lo']:+.1f}, {s['elo_hi']:+.1f}]"
+            if s["elo_diff"] is not None
+            else "N/A"
+        )
         capped = r.get("capped_games", 0)
         sens = r.get("capped_sensitivity") or {}
         sens_str = ""

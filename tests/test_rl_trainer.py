@@ -810,7 +810,13 @@ def test_checkpoint_rejects_quarantine_and_finetune_candidates(tmp_path):
             "model": model.state_dict(),
             "optimizer": {
                 "param_groups": [
-                    {"params": list(model.parameters()), "lr": 0.0, "momentum": 0.9, "dampening": 0.0, "nesterov": False},
+                    {
+                        "params": list(model.parameters()),
+                        "lr": 0.0,
+                        "momentum": 0.9,
+                        "dampening": 0.0,
+                        "nesterov": False,
+                    },
                 ]
             },
             "checkpoint_type": "rnd",
@@ -823,7 +829,13 @@ def test_checkpoint_rejects_quarantine_and_finetune_candidates(tmp_path):
             "model": model.state_dict(),
             "optimizer": {
                 "param_groups": [
-                    {"params": list(model.parameters()), "lr": 0.0, "momentum": 0.9, "dampening": 0.0, "nesterov": False},
+                    {
+                        "params": list(model.parameters()),
+                        "lr": 0.0,
+                        "momentum": 0.9,
+                        "dampening": 0.0,
+                        "nesterov": False,
+                    },
                 ]
             },
             "checkpoint_type": "finetune",
@@ -849,7 +861,9 @@ def test_checkpoint_rejects_quarantine_and_finetune_candidates(tmp_path):
         selected = str(candidate)
         break
 
-    assert selected is not None, "Expected the valid RL checkpoint to be selected from the active dir"
+    assert selected is not None, (
+        "Expected the valid RL checkpoint to be selected from the active dir"
+    )
     assert str(checkpoint_dir / "latest_checkpoint.pt") == selected
 
     # Confirm the incompatible files outside checkpoint_dir are not selected, and that the

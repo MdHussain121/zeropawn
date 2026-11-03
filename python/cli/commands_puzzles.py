@@ -8,7 +8,6 @@ import time
 from pathlib import Path
 from typing import Optional
 
-import torch
 from rich.panel import Panel
 from rich import box
 

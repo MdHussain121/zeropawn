@@ -63,7 +63,9 @@ def _run_in_subprocess(code: str) -> subprocess.CompletedProcess:
 
 
 class TestConnect4CellBounds:
-    @pytest.mark.parametrize("r,c", [(6, 0), (-1, 0), (0, 7), (0, -1), (10**7, 0), (-1, -1), (100, 100)])
+    @pytest.mark.parametrize(
+        "r,c", [(6, 0), (-1, 0), (0, 7), (0, -1), (10**7, 0), (-1, -1), (100, 100)]
+    )
     def test_out_of_range_raises_valueerror(self, r, c):
         c4 = zeropawn_cpp.Connect4()
         with pytest.raises(ValueError):
@@ -169,9 +171,7 @@ class TestApplyActionLegality:
             clone.apply_action(idx)
             assert clone.history_len() == 1
 
-        ep = zeropawn_cpp.ChessGame(
-            "rnbqkbnr/ppp1p1pp/8/3pPp2/8/8/PPPP1PPP/RNBQKBNR w KQkq f6 0 3"
-        )
+        ep = zeropawn_cpp.ChessGame("rnbqkbnr/ppp1p1pp/8/3pPp2/8/8/PPPP1PPP/RNBQKBNR w KQkq f6 0 3")
         idx = ep.string_to_action("e5f6")
         assert idx >= 0
         ep.apply_action(idx)
@@ -248,7 +248,10 @@ class TestSearchBatchedValidation:
 
         def bad(planes):
             n = planes.shape[0]
-            return (np.full((n, 4672), 1.0 / 4672, dtype=np.float32), np.zeros((1,), dtype=np.float32))
+            return (
+                np.full((n, 4672), 1.0 / 4672, dtype=np.float32),
+                np.zeros((1,), dtype=np.float32),
+            )
 
         with pytest.raises(RuntimeError):
             m.search_batched(g, 8, 4, bad)
@@ -258,7 +261,10 @@ class TestSearchBatchedValidation:
 
         def bad(planes):
             n = planes.shape[0]
-            return (np.full((n + 1, 4672), 1.0 / 4672, dtype=np.float32), np.zeros((n + 1,), dtype=np.float32))
+            return (
+                np.full((n + 1, 4672), 1.0 / 4672, dtype=np.float32),
+                np.zeros((n + 1,), dtype=np.float32),
+            )
 
         with pytest.raises(RuntimeError):
             m.search_batched(g, 8, 4, bad)
@@ -347,9 +353,7 @@ class TestSearchGILDiscipline:
                 for _ in range(20):
                     mcts = zeropawn_cpp.MCTS()
                     mcts.set_seed(1)
-                    res = mcts.search(
-                        zeropawn_cpp.ChessGame(), 64, shared_eval, None, shared_abort
-                    )
+                    res = mcts.search(zeropawn_cpp.ChessGame(), 64, shared_eval, None, shared_abort)
                     assert res.best_action >= 0
             except Exception as e:  # pragma: no cover - failure path
                 errors.append(e)

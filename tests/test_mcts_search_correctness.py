@@ -16,8 +16,9 @@ from typing import Optional
 import numpy as np
 import pytest
 
-# Ensure native extension and diagnostics reference can be imported
-DIAG_DIR = Path(__file__).resolve().parent.parent / "audit-reports" / "mcts-search-correctness" / "diagnostics"
+# Reference implementation lives in the test tree (audit S6-09: it is a test
+# asset, not evidence — relocated out of audit-reports/).
+DIAG_DIR = Path(__file__).resolve().parent / "reference"
 if str(DIAG_DIR) not in sys.path:
     sys.path.insert(0, str(DIAG_DIR))
 
@@ -36,6 +37,7 @@ from python.uci.uci_engine import UCIEngine
 # ---------------------------------------------------------------------------
 # Helpers & deterministic evaluators
 # ---------------------------------------------------------------------------
+
 
 def _deterministic_eval(salt: int, num_actions: int):
     rng = np.random.default_rng(42 + salt)
@@ -75,6 +77,7 @@ def _make_cfg(c_puct=2.0, fpu=0.2, vl=1, noise=False, seed=42, reuse=False, batc
 # ==============================================================================
 # S-1: UCI Clock Deadlines & Responsive Search Cancellation
 # ==============================================================================
+
 
 def test_s1_uci_go_movetime_enforces_deadline():
     """Verify that a movetime search finishes within the requested time budget."""
@@ -170,6 +173,7 @@ def test_s1_zero_or_tiny_movetime_boundary():
 # S-2: Worker Shutdown Race & Vacuous Game Elimination
 # ==============================================================================
 
+
 def test_s2_worker_shutdown_race_eliminates_vacuous_games(monkeypatch):
     """Delay during SelfPlayGame construction racing worker.stop() must not
     create a false completed game, must not increment total_games_played,
@@ -191,7 +195,9 @@ def test_s2_worker_shutdown_race_eliminates_vacuous_games(monkeypatch):
 
     class DummyClient:
         def evaluate_planes(self, planes):
-            return np.ones((len(planes), 4672), dtype=np.float32) / 4672, np.zeros((len(planes), 3), dtype=np.float32)
+            return np.ones((len(planes), 4672), dtype=np.float32) / 4672, np.zeros(
+                (len(planes), 3), dtype=np.float32
+            )
 
     w = SelfPlayWorker(
         worker_id=1,
@@ -251,6 +257,7 @@ def test_s2_accepts_for_sink_rejects_zero_ply():
 # S-3: Retained-Visits State Reporting (MCTS.retained_visits)
 # ==============================================================================
 
+
 def test_s3_retained_visits_getter_monotone_and_accurate():
     """MCTS.retained_visits() must reflect the promoted root's visit mass
     immediately after advance_root() BEFORE the next search() is called."""
@@ -302,6 +309,7 @@ def test_s3_failed_advance_root_resets_retained_visits():
 # S-4: Legacy Batched Deduplication Prior Assignment
 # ==============================================================================
 
+
 def test_s4_legacy_search_batched_duplicate_nodes_receive_priors():
     """In search_batched, when two candidates in the same batch reach the same
     cache key, the duplicate node must receive evaluated priors from the batch."""
@@ -325,6 +333,7 @@ def test_s4_legacy_search_batched_duplicate_nodes_receive_priors():
 # ==============================================================================
 # S-5: Evaluator Exception Handling in UCI Engine
 # ==============================================================================
+
 
 def test_s5_uci_evaluator_exception_emits_legal_bestmove_and_recovers():
     """Inference failure during search must not crash the UCI loop, must emit
@@ -371,6 +380,7 @@ def test_s5_uci_evaluator_exception_emits_legal_bestmove_and_recovers():
 # S-7: UCI SearchMode Functional Toggling & Configuration
 # ==============================================================================
 
+
 def test_s7_search_mode_toggles_batch_size_and_rebuilds_mcts():
     """setoption SearchMode must actively adjust batch size and rebuild MCTS."""
     engine = UCIEngine(checkpoint_path="", use_book=False, device="cpu", batch_size=1)
@@ -410,6 +420,7 @@ def test_s7_search_mode_toggles_batch_size_and_rebuilds_mcts():
 # S-8.2: Oracle-Math Parity Against Independent Reference
 # ==============================================================================
 
+
 def test_s8_oracle_parity_connect4_serial():
     """Verify exact parity between native serial search and independent reference on Connect4."""
     game = zeropawn_cpp.Connect4()
@@ -419,8 +430,17 @@ def test_s8_oracle_parity_connect4_serial():
 
     prod_res = m.search(game, 40, eval_fn)
     ref_best, ref_val, ref_visits = ref_mcts.reference_serial_search(
-        game, 40, eval_fn,
-        {"c_puct": 2.0, "fpu": 0.2, "fpu_reduction": 0.2, "virtual_loss": 1, "add_noise": False, "seed": 42}
+        game,
+        40,
+        eval_fn,
+        {
+            "c_puct": 2.0,
+            "fpu": 0.2,
+            "fpu_reduction": 0.2,
+            "virtual_loss": 1,
+            "add_noise": False,
+            "seed": 42,
+        },
     )
 
     assert prod_res.best_action == ref_best
@@ -437,8 +457,17 @@ def test_s8_oracle_parity_chess_serial():
 
     prod_res = m.search(game, 40, eval_fn)
     ref_best, ref_val, ref_visits = ref_mcts.reference_serial_search(
-        game, 40, eval_fn,
-        {"c_puct": 2.0, "fpu": 0.2, "fpu_reduction": 0.2, "virtual_loss": 1, "add_noise": False, "seed": 42}
+        game,
+        40,
+        eval_fn,
+        {
+            "c_puct": 2.0,
+            "fpu": 0.2,
+            "fpu_reduction": 0.2,
+            "virtual_loss": 1,
+            "add_noise": False,
+            "seed": 42,
+        },
     )
 
     assert prod_res.best_action == ref_best
@@ -449,6 +478,7 @@ def test_s8_oracle_parity_chess_serial():
 # ==============================================================================
 # S-8.3: Batch-Size-One Equivalence (Serial == Batched B=1)
 # ==============================================================================
+
 
 def test_s8_batch_size_one_internal_equals_serial():
     """Internal-batched search with B=1 must be exactly equivalent to serial search."""
@@ -461,6 +491,7 @@ def test_s8_batch_size_one_internal_equals_serial():
 
     # Internal batched B=1
     m_batched = zeropawn_cpp.MCTS(_make_cfg(batch_size=1, seed=123))
+
     def batch_cb(states):
         return [eval_fn(s) for s in states]
 
@@ -475,6 +506,7 @@ def test_s8_batch_size_one_internal_equals_serial():
 # ==============================================================================
 # S-8.4: Root Advancement Statistics & Visit Mass Identity
 # ==============================================================================
+
 
 def test_s8_root_advancement_visit_mass_identity():
     """Verify that tree reuse preserves visit mass: raw sum == retained + new."""
@@ -502,6 +534,7 @@ def test_s8_root_advancement_visit_mass_identity():
 # ==============================================================================
 # S-8.5: Dirichlet Noise Distribution & Normalization
 # ==============================================================================
+
 
 def test_s8_dirichlet_noise_normalization_and_root_only():
     """Verify Dirichlet noise properties: normalized, non-negative, root-only."""
@@ -563,6 +596,7 @@ def test_s8_dirichlet_monte_carlo_distribution_bounds():
 # S-1 Additional: Honest EWMA Completed Simulation Accounting
 # ==============================================================================
 
+
 def test_s1_ewma_records_actual_sims_not_planned_budget():
     """Verify that SearchTimeManager records only actual completed simulations,
     not the requested/planned simulation budget."""
@@ -594,6 +628,7 @@ def test_s1_ewma_records_actual_sims_not_planned_budget():
 # S-2 Additional: Completed Game Preservation on Shutdown
 # ==============================================================================
 
+
 def test_s2_healthy_game_preserved_on_shutdown():
     """Verify that a game completing normally with plies > 0 is accepted for sink
     and counted as completed, not discarded as an aborted 0-ply game."""
@@ -618,18 +653,35 @@ def test_s2_healthy_game_preserved_on_shutdown():
 # S-4 Additional: Transposition Dedup Prior Assignment & Parity
 # ==============================================================================
 
+
 def test_s4_legacy_batched_transposition_dedup_assigns_priors_and_matches_reference():
     """Crafted Connect4 transposition: multiple paths in the same batch reach
     the exact same board state. Verifies that duplicate nodes receive evaluated
     priors and that production search_batched matches the independent reference."""
     g0 = zeropawn_cpp.Connect4()
-    g_0 = zeropawn_cpp.Connect4(); g_0.apply_action(0)
-    g_1 = zeropawn_cpp.Connect4(); g_1.apply_action(1)
-    g_02 = zeropawn_cpp.Connect4(); g_02.apply_action(0); g_02.apply_action(2)
-    g_12 = zeropawn_cpp.Connect4(); g_12.apply_action(1); g_12.apply_action(2)
-    g_021 = zeropawn_cpp.Connect4(); g_021.apply_action(0); g_021.apply_action(2); g_021.apply_action(1)
-    g_120 = zeropawn_cpp.Connect4(); g_120.apply_action(1); g_120.apply_action(2); g_120.apply_action(0)
-    g_trans = zeropawn_cpp.Connect4(); g_trans.apply_action(0); g_trans.apply_action(2); g_trans.apply_action(1); g_trans.apply_action(3)
+    g_0 = zeropawn_cpp.Connect4()
+    g_0.apply_action(0)
+    g_1 = zeropawn_cpp.Connect4()
+    g_1.apply_action(1)
+    g_02 = zeropawn_cpp.Connect4()
+    g_02.apply_action(0)
+    g_02.apply_action(2)
+    g_12 = zeropawn_cpp.Connect4()
+    g_12.apply_action(1)
+    g_12.apply_action(2)
+    g_021 = zeropawn_cpp.Connect4()
+    g_021.apply_action(0)
+    g_021.apply_action(2)
+    g_021.apply_action(1)
+    g_120 = zeropawn_cpp.Connect4()
+    g_120.apply_action(1)
+    g_120.apply_action(2)
+    g_120.apply_action(0)
+    g_trans = zeropawn_cpp.Connect4()
+    g_trans.apply_action(0)
+    g_trans.apply_action(2)
+    g_trans.apply_action(1)
+    g_trans.apply_action(3)
 
     hashes = {
         g0.get_hash(): ([0.5, 0.5, 0, 0, 0, 0, 0], 0.0),
@@ -668,7 +720,14 @@ def test_s4_legacy_batched_transposition_dedup_assigns_priors_and_matches_refere
                 vals[i] = 0.0
         return pols, vals
 
-    cfg = {"c_puct": 2.0, "fpu": 0.2, "fpu_reduction": 0.2, "virtual_loss": 1, "add_noise": False, "seed": 42}
+    cfg = {
+        "c_puct": 2.0,
+        "fpu": 0.2,
+        "fpu_reduction": 0.2,
+        "virtual_loss": 1,
+        "add_noise": False,
+        "seed": 42,
+    }
     sims = 20
     ref_res, stats = ref_mcts.reference_legacy_batched_search(g0, sims, eval_fn, cfg, 4)
     assert stats["dedup_attaches"] > 0, "Transposition dedup must fire"
@@ -686,6 +745,7 @@ def test_s4_legacy_batched_transposition_dedup_assigns_priors_and_matches_refere
 # ==============================================================================
 # S-8 Additional: PUCT Mathematical Contract & Virtual Loss Hygiene
 # ==============================================================================
+
 
 def test_s8_puct_cpuct_zero_first_action_tie_break():
     """Under c_puct=0 and uniform evaluation, selection is purely greedy and
@@ -731,6 +791,7 @@ def test_s8_virtual_loss_and_alloc_free_hygiene():
     m = zeropawn_cpp.MCTS(cfg)
 
     call_count = 0
+
     def failing_after_3_eval(game):
         nonlocal call_count
         call_count += 1
@@ -744,4 +805,3 @@ def test_s8_virtual_loss_and_alloc_free_hygiene():
         pass
 
     assert m.total_active_virtual_losses() == 0, "Virtual losses must be fully unwound"
-

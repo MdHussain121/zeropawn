@@ -37,7 +37,7 @@ def main() -> int:
     args = parser.parse_args()
 
     split = Path(args.split)
-    meta = (split / "metadata.json")
+    meta = split / "metadata.json"
     import json
 
     m = json.loads(meta.read_text())

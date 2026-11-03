@@ -92,7 +92,9 @@ def test_syzygy_wdl_perspective_white_and_black(syzygy_gen: SyzygySupervisionGen
     raw_wdl_c, out_c, wdl_target_c, moves_c = res_c
     assert raw_wdl_c == 1
     assert out_c == 1  # 1 = Cursed Win (raw 5-class metadata)
-    assert np.array_equal(wdl_target_c, [0.0, 1.0, 0.0]), f"Cursed win value target must be Draw [0, 1, 0], got {wdl_target_c}"
+    assert np.array_equal(wdl_target_c, [0.0, 1.0, 0.0]), (
+        f"Cursed win value target must be Draw [0, 1, 0], got {wdl_target_c}"
+    )
 
     # 5. Verified Blessed Loss position (KNNvKP, Black to move) -> raw -1, class 3, target [0, 1, 0] (SY-02)
     # Under FIDE rule 50, blessed loss is saved by 50-move rule -> theoretical Draw
@@ -102,7 +104,9 @@ def test_syzygy_wdl_perspective_white_and_black(syzygy_gen: SyzygySupervisionGen
     raw_wdl_bl, out_bl, wdl_target_bl, moves_bl = res_bl
     assert raw_wdl_bl == -1
     assert out_bl == 3  # 3 = Blessed Loss (raw 5-class metadata)
-    assert np.array_equal(wdl_target_bl, [0.0, 1.0, 0.0]), f"Blessed loss value target must be Draw [0, 1, 0], got {wdl_target_bl}"
+    assert np.array_equal(wdl_target_bl, [0.0, 1.0, 0.0]), (
+        f"Blessed loss value target must be Draw [0, 1, 0], got {wdl_target_bl}"
+    )
 
 
 def test_syzygy_training_sample_creation(syzygy_gen: SyzygySupervisionGenerator):

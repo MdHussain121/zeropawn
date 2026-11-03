@@ -256,9 +256,7 @@ class WorkerBatchAggregator:
             self.total_eval_calls += 1
         return res0, res1
 
-    def evaluate_games_batch(
-        self, games: List[Any]
-    ) -> List[Tuple[np.ndarray, float]]:
+    def evaluate_games_batch(self, games: List[Any]) -> List[Tuple[np.ndarray, float]]:
         """Batch evaluator for the canonical ``search(batch_evaluator=...)`` contract.
 
         Encodes each game, submits every leaf through the same cross-game
@@ -530,7 +528,9 @@ class WorkerBatchAggregator:
                 # runner instead of recorded with uniform-policy garbage.
                 item[1][0] = None
                 item[1][1] = None
-                item[1][2] = InferenceError("WorkerBatchAggregator stopped before evaluation completed")
+                item[1][2] = InferenceError(
+                    "WorkerBatchAggregator stopped before evaluation completed"
+                )
                 item[2].set()
             self.pending.clear()
             self.cond.notify_all()

@@ -98,7 +98,11 @@ class TestStartupBlockersRemediation:
             allow_uncertified_data=True,
             allow_uncertified_eval=True,
         )
-        fake_record = {"status": "verified", "sha256": "abcdef1234567890", "role": "supervised_baseline"}
+        fake_record = {
+            "status": "verified",
+            "sha256": "abcdef1234567890",
+            "role": "supervised_baseline",
+        }
         orch._warm_start_record = fake_record
         assert orch._warm_start_info == fake_record
 
@@ -190,6 +194,7 @@ class TestReplayAndTrainerRemediation:
     def test_replay_buffer_add_position_force_false(self):
         """F-17: add_position passes force=False to _save_meta to eliminate per-position fsync."""
         import inspect
+
         src = inspect.getsource(ReplayBuffer.add_position)
         assert "self._save_meta(force=False)" in src
         assert "self._save_meta(force=True)" not in src
@@ -197,6 +202,7 @@ class TestReplayAndTrainerRemediation:
     def test_train_rl_module_has_hashlib_and_json(self):
         """Verifies train_rl has hashlib and json imported for dataset provenance hashing."""
         import python.train.train_rl as trl
+
         assert hasattr(trl, "hashlib")
         assert hasattr(trl, "json")
 

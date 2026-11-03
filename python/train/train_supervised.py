@@ -290,9 +290,7 @@ def legal_masked_policy_loss(
     legal_counts = legal_mask.sum(dim=1)
     if int((legal_counts == 0).sum().item()):
         bad = int((legal_counts == 0).sum().item())
-        raise ValueError(
-            f"legal-mask stream contains {bad} position(s) with zero legal actions"
-        )
+        raise ValueError(f"legal-mask stream contains {bad} position(s) with zero legal actions")
 
     # Data-integrity gate: the stored label must be a legal action.
     label_legal = legal_mask.gather(1, moves.unsqueeze(1)).squeeze(1)
@@ -570,18 +568,20 @@ def save_checkpoint(
         what="supervised checkpoint",
     )
     ledger = dict(run_metadata) if run_metadata else {}
-    provenance_payload = dict(provenance) if provenance else build_provenance(
-        run_id=ledger.get("run_id"),
-        run_type=ledger.get("run_type", "supervised"),
-        config=ledger.get("config"),
-        model_arch=(int(num_blocks), int(num_filters)),
-        param_count=int(sum(p.numel() for p in model.parameters())),
-        dataset=ledger.get("dataset"),
-        parent_checkpoint=ledger.get("parent_checkpoint"),
-        optimizer_config={"type": type(optimizer).__name__},
-        scheduler_config=scheduler.state_dict()
-        if hasattr(scheduler, "state_dict")
-        else {},
+    provenance_payload = (
+        dict(provenance)
+        if provenance
+        else build_provenance(
+            run_id=ledger.get("run_id"),
+            run_type=ledger.get("run_type", "supervised"),
+            config=ledger.get("config"),
+            model_arch=(int(num_blocks), int(num_filters)),
+            param_count=int(sum(p.numel() for p in model.parameters())),
+            dataset=ledger.get("dataset"),
+            parent_checkpoint=ledger.get("parent_checkpoint"),
+            optimizer_config={"type": type(optimizer).__name__},
+            scheduler_config=scheduler.state_dict() if hasattr(scheduler, "state_dict") else {},
+        )
     )
     cuda_rng: Optional[list] = None
     if torch.cuda.is_available():
@@ -656,9 +656,7 @@ class _RunTelemetry:
         if self.manifest_path.exists():
             prior_stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
             try:
-                self.manifest_path.replace(
-                    self.ckpt_dir / f"run_manifest_{prior_stamp}.json"
-                )
+                self.manifest_path.replace(self.ckpt_dir / f"run_manifest_{prior_stamp}.json")
             except OSError:
                 logger.debug("manifest rotation failed", exc_info=True)
         self.manifest = manifest
@@ -1176,7 +1174,9 @@ def train_supervised(
         for warning in verdict_schema.warnings:
             logger.warning("[SCHEMA] %s: %s", Path(resume_path).name, warning)
         predecessor_ledger = (
-            checkpoint.get("run_metadata") if isinstance(checkpoint.get("run_metadata"), dict) else None
+            checkpoint.get("run_metadata")
+            if isinstance(checkpoint.get("run_metadata"), dict)
+            else None
         )
         for warning in validate_run_metadata(
             predecessor_ledger, path=resume_path, required=not verdict_schema.is_legacy
@@ -1198,13 +1198,17 @@ def train_supervised(
 
         run_metadata["parent_checkpoint"] = _ckpt_identity(resume_path, hash_file=True)
         run_metadata["predecessor_run"] = predecessor_ledger
-        run_metadata["run_type"] = "supervised-warm-start" if resume_weights_only else "supervised-resume"
+        run_metadata["run_type"] = (
+            "supervised-warm-start" if resume_weights_only else "supervised-resume"
+        )
 
         # Dataset identity compatibility check (DI-04 / P1-5)
         saved_dataset = None
         if predecessor_ledger and isinstance(predecessor_ledger.get("dataset"), dict):
             saved_dataset = predecessor_ledger.get("dataset")
-        elif isinstance(checkpoint.get("provenance"), dict) and isinstance(checkpoint["provenance"].get("dataset"), dict):
+        elif isinstance(checkpoint.get("provenance"), dict) and isinstance(
+            checkpoint["provenance"].get("dataset"), dict
+        ):
             saved_dataset = checkpoint["provenance"].get("dataset")
 
         if saved_dataset and run_metadata.get("dataset"):
@@ -1614,7 +1618,15 @@ def train_supervised(
             # Durable per-epoch telemetry (audit SLQ-02) — val metrics are
             # recomputable from the saved checkpoint + the receipt-identified
             # val split recorded in the manifest.
-            telemetry.log({"event": "epoch_end", "epoch": epoch, "step": global_step, "val": val_metrics, "epoch_samples": epoch_samples})
+            telemetry.log(
+                {
+                    "event": "epoch_end",
+                    "epoch": epoch,
+                    "step": global_step,
+                    "val": val_metrics,
+                    "epoch_samples": epoch_samples,
+                }
+            )
 
             # Save best model checkpoint
             if val_metrics["total_loss"] < best_val_loss:
@@ -1645,7 +1657,10 @@ def train_supervised(
         # artifact itself carries "interrupted" (CKP-01 §6.4) instead of the
         # "running" state it would inherit from the periodic save path.
         advance_run_state_inplace(
-            run_metadata, "interrupted", step=int(global_step), epoch=int(current_epoch),
+            run_metadata,
+            "interrupted",
+            step=int(global_step),
+            epoch=int(current_epoch),
             reason="KeyboardInterrupt",
         )
         save_checkpoint(
@@ -1672,9 +1687,7 @@ def train_supervised(
             reason=f"{type(exc).__name__}: {exc}",
         )
         try:
-            telemetry.log(
-                {"event": "run_failed", "error": f"{type(exc).__name__}: {exc}"}
-            )
+            telemetry.log({"event": "run_failed", "error": f"{type(exc).__name__}: {exc}"})
         except Exception:
             logger.debug("telemetry failure log failed", exc_info=True)
         raise
@@ -1710,9 +1723,7 @@ def train_supervised(
                     provenance=provenance if "provenance" in locals() else None,
                     artifact_ticket=artifact_ticket,
                 )
-                telemetry.checkpoint_event(
-                    ckpt_dir / "latest_checkpoint.pt", "final", final_step
-                )
+                telemetry.checkpoint_event(ckpt_dir / "latest_checkpoint.pt", "final", final_step)
         except BaseException as exc:  # noqa: BLE001 - must not be swallowed
             save_error = exc
             logger.exception("Final supervised checkpoint save FAILED: %s", exc)
@@ -1731,7 +1742,9 @@ def train_supervised(
         in_flight = sys.exc_info()[1]
         if save_error is not None:
             final_status = "failed"
-            failure_reason = f"final checkpoint save failed: {type(save_error).__name__}: {save_error}"
+            failure_reason = (
+                f"final checkpoint save failed: {type(save_error).__name__}: {save_error}"
+            )
         elif isinstance(in_flight, KeyboardInterrupt):
             final_status = "interrupted"
             failure_reason = None

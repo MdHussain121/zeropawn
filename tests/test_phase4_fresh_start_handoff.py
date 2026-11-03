@@ -85,9 +85,7 @@ def test_slq07_fresh_start_reaches_trainer_setup(tmp_path, monkeypatch):
         def __init__(self, *a, **k):
             # A real ChessNet on CPU: the orchestrator copies the server's
             # state_dict into the trainer's model during construction.
-            self.model = ChessNet(
-                in_channels=19, num_filters=128, num_blocks=12, num_actions=4672
-            )
+            self.model = ChessNet(in_channels=19, num_filters=128, num_blocks=12, num_actions=4672)
             self.model_version = 0
 
     class _StubClient:
@@ -171,6 +169,8 @@ def test_slq07_warm_start_refusal_is_fail_closed(tmp_path, monkeypatch):
             train_device="cpu",
             infer_device="cpu",
         )
-    assert "Refusing to start Phase 4" in str(excinfo.value) or "not found" in str(
-        excinfo.value
-    ).lower() or "missing" in str(excinfo.value).lower()
+    assert (
+        "Refusing to start Phase 4" in str(excinfo.value)
+        or "not found" in str(excinfo.value).lower()
+        or "missing" in str(excinfo.value).lower()
+    )

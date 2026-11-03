@@ -48,7 +48,13 @@ def _rl_payload(**overrides) -> dict:
         "step": 3,
         "num_blocks": 2,
         "num_filters": 32,
-        "buffer_state": {"write_head": 3, "size": 3, "total_added": 3, "capacity": 100, "generation": "g1"},
+        "buffer_state": {
+            "write_head": 3,
+            "size": 3,
+            "total_added": 3,
+            "capacity": 100,
+            "generation": "g1",
+        },
         "run_metadata": {"run_id": "r1", "run_type": "rl", "run_state": "running"},
         "provenance": {"run_id": "r1", "run_type": "rl"},
     }
@@ -184,8 +190,10 @@ def test_pickled_object_payload_is_refused_without_execution(tmp_path):
     # instead of executing its unpickling; never a silent accept.
     with pytest.raises(Exception) as excinfo:
         inspect_checkpoint(path)
-    assert "payload" in str(excinfo.value) or "Unpickl" in str(excinfo.value) or "weights" in str(
-        excinfo.value
+    assert (
+        "payload" in str(excinfo.value)
+        or "Unpickl" in str(excinfo.value)
+        or "weights" in str(excinfo.value)
     )
 
 
@@ -503,7 +511,9 @@ def test_export_does_not_leave_tmp_files(tmp_path):
     src = tmp_path / "src2.pt"
     torch.save({"model": _small_state(), "num_blocks": 2, "num_filters": 32}, src)
     out = tmp_path / "exported2.pt"
-    cm.run_models_export(argparse.Namespace(checkpoint=str(src), output=str(out), weights_only=True))
+    cm.run_models_export(
+        argparse.Namespace(checkpoint=str(src), output=str(out), weights_only=True)
+    )
     assert not list(tmp_path.glob("*.tmp"))
 
 
@@ -512,7 +522,5 @@ def test_check_compat_exits_nonzero_on_mismatch(tmp_path, capsys):
 
     mismatched = tmp_path / "small.pt"
     torch.save({"model": _small_state(), "num_blocks": 2, "num_filters": 32}, mismatched)
-    args = argparse.Namespace(
-        checkpoint=str(mismatched), expected_blocks=12, expected_filters=128
-    )
+    args = argparse.Namespace(checkpoint=str(mismatched), expected_blocks=12, expected_filters=128)
     assert cm.run_models_check_compat(args) == 1

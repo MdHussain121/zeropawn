@@ -74,7 +74,10 @@ def test_classify_optimizer_state_variants():
     assert classify_optimizer_state({"optimizer": None}) == "empty"
     assert classify_optimizer_state({}) == "empty"
     # Adam-family per-param state (the supervised warm-start poison).
-    assert classify_optimizer_state({"optimizer": _opt_state({"exp_avg": 1, "exp_avg_sq": 1})}) == "AdamW"
+    assert (
+        classify_optimizer_state({"optimizer": _opt_state({"exp_avg": 1, "exp_avg_sq": 1})})
+        == "AdamW"
+    )
     # SGD momentum buffer.
     assert classify_optimizer_state({"optimizer": _opt_state({"momentum_buffer": 1})}) == "SGD"
     # SGD before its first step has no per-param state.
@@ -98,8 +101,7 @@ def test_classify_optimizer_state_variants():
     # A stamp is authoritative when the state carries no per-param entries
     # (a first-save RL checkpoint legitimately has none yet).
     assert (
-        classify_optimizer_state({"_optimizer_type": "SGD", "optimizer": _opt_state({})})
-        == "SGD"
+        classify_optimizer_state({"_optimizer_type": "SGD", "optimizer": _opt_state({})}) == "SGD"
     )
     # Unrecognizable keys.
     assert classify_optimizer_state({"optimizer": _opt_state({"something_else": 1})}) == "unknown"
@@ -203,8 +205,12 @@ def test_auto_resume_unstamped_healthy_sgd_selected(tmp_path):
     by their per-param state keys, not rejected for lacking a stamp."""
     ckpt_dir = tmp_path / "ckpts"
     ckpt_dir.mkdir()
-    _write_ckpt(ckpt_dir / "phase4_ckpt_v5_step997.pt", step=997, optimizer_class="SGD", stamp=False)
-    _write_ckpt(ckpt_dir / "phase4_ckpt_v1_step6000.pt", step=6000, optimizer_class="AdamW", stamp=False)
+    _write_ckpt(
+        ckpt_dir / "phase4_ckpt_v5_step997.pt", step=997, optimizer_class="SGD", stamp=False
+    )
+    _write_ckpt(
+        ckpt_dir / "phase4_ckpt_v1_step6000.pt", step=6000, optimizer_class="AdamW", stamp=False
+    )
     choice = _select(ckpt_dir)
     assert choice is not None
     assert Path(choice).name == "phase4_ckpt_v5_step997.pt"
@@ -229,9 +235,7 @@ def _make_trainer(tmp_path, name: str, reopen: bool = False) -> RLTrainer:
     generation, no reset) — the legitimate same-buffer resume case of the
     audit SR-04 contract.
     """
-    buf = ReplayBuffer(
-        buffer_dir=tmp_path / f"buf_{name}", capacity=100, create_new=not reopen
-    )
+    buf = ReplayBuffer(buffer_dir=tmp_path / f"buf_{name}", capacity=100, create_new=not reopen)
     if reopen:
         model = ChessNet(num_blocks=2, num_filters=32)
         return RLTrainer(
@@ -391,7 +395,9 @@ def test_staleness_filter_excludes_unknown_and_stale_rows():
     outcomes = np.array([1] * n_known + [2] * n_unknown, dtype=np.int64)
     full = np.ones(n_known + n_unknown, dtype=np.bool_)
     versions = np.array([30] * n_known + [UNKNOWN_MODEL_VERSION] * n_unknown, dtype=np.int32)
-    cache.add_positions(planes=planes, visits=visits, outcomes=outcomes, full_search=full, versions=versions)
+    cache.add_positions(
+        planes=planes, visits=visits, outcomes=outcomes, full_search=full, versions=versions
+    )
 
     batch = cache.sample_batch(batch_size=16)
     assert int(batch["outcomes"].min()) == 1  # unknown rows never sampled
@@ -408,7 +414,9 @@ def test_staleness_filter_is_relative_from_first_push():
     visits = np.zeros((n, 4672), dtype=np.float32)
     outcomes = versions.astype(np.int64)  # outcome == version
     full = np.ones(n, dtype=np.bool_)
-    cache.add_positions(planes=planes, visits=visits, outcomes=outcomes, full_search=full, versions=versions)
+    cache.add_positions(
+        planes=planes, visits=visits, outcomes=outcomes, full_search=full, versions=versions
+    )
 
     # batch_size must not exceed the valid (fresh) row count, otherwise the
     # documented fallback (sample everything) kicks in.

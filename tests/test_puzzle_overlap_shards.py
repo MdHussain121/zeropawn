@@ -46,7 +46,11 @@ def test_shard_mode_detects_and_clears_overlap(tmp_path):
     eval_rows = [
         {"PuzzleId": "inTrain", "FEN": STARTPOS, "Rating": "1500"},
         {"PuzzleId": "afterE4", "FEN": AFTER_E4, "Rating": "1500"},
-        {"PuzzleId": "clean", "FEN": "rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2", "Rating": "1500"},
+        {
+            "PuzzleId": "clean",
+            "FEN": "rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2",
+            "Rating": "1500",
+        },
     ]
     keys = load_shard_keys([shard_dir])
     assert len(keys) == 2

@@ -19,10 +19,14 @@ from python.train.train_opening_policy import train_opening_step
 def test_eval_config_hash_content_sensitive(tmp_path: Path):
     """Verify eval_config_hash incorporates file content hash, seed, and stockfish_elo (DI-15)."""
     openings_1 = tmp_path / "openings1.epd"
-    openings_1.write_text("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1\n", encoding="utf-8")
+    openings_1.write_text(
+        "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1\n", encoding="utf-8"
+    )
 
     openings_2 = tmp_path / "openings2.epd"
-    openings_2.write_text("rnbqkbnr/pppppppp/8/8/3P4/8/PPP1PPPP/RNBQKBNR b KQkq d3 0 1\n", encoding="utf-8")
+    openings_2.write_text(
+        "rnbqkbnr/pppppppp/8/8/3P4/8/PPP1PPPP/RNBQKBNR b KQkq d3 0 1\n", encoding="utf-8"
+    )
 
     h1 = eval_config_hash(1000, 400, 2.0, openings_1, 8, stockfish_elo=2000, seed=42)
     h2 = eval_config_hash(1000, 400, 2.0, openings_2, 8, stockfish_elo=2000, seed=42)
@@ -109,7 +113,9 @@ def test_value_targets_consistency_check(tmp_path: Path):
     # Create planes, moves, outcomes, game_ids, plies
     (split_dir / "planes.bin").write_bytes(np.zeros((N, 19, 8, 8), dtype=np.float32).tobytes())
     (split_dir / "moves.bin").write_bytes(np.zeros(N, dtype=np.int16).tobytes())
-    (split_dir / "outcomes.bin").write_bytes(np.zeros(N, dtype=np.uint8).tobytes())  # outcome = 0 (Win)
+    (split_dir / "outcomes.bin").write_bytes(
+        np.zeros(N, dtype=np.uint8).tobytes()
+    )  # outcome = 0 (Win)
     (split_dir / "game_ids.bin").write_bytes(np.zeros(N, dtype=np.uint64).tobytes())
     (split_dir / "plies.bin").write_bytes(np.zeros(N, dtype=np.int16).tobytes())
 

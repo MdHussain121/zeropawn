@@ -343,9 +343,7 @@ def test_slq11_resume_restores_checkpoint_geometry(tmp_path):
     # trainer does (checkpoint geometry wins over differing CLI values).
     loaded = torch.load(ckpt, map_location="cpu", weights_only=True)
     saved = loaded["scheduler"]
-    cli_like = WarmupCosineScheduler(
-        opt, warmup_steps=500, total_steps=9000, base_lr=2e-4
-    )
+    cli_like = WarmupCosineScheduler(opt, warmup_steps=500, total_steps=9000, base_lr=2e-4)
     cli_like.warmup_steps = saved["warmup_steps"]
     cli_like.total_steps = saved["total_steps"]
     cli_like.base_lr = saved["base_lr"]
@@ -376,8 +374,14 @@ def test_slq16_nonfinite_batch_clears_gradients():
     }
     # First micro-batch backprops finite gradients into the model.
     train_step(
-        model, good, optimizer, "cpu", use_autocast=False, accum_steps=2,
-        step_optimizer=False, zero_grad=True,
+        model,
+        good,
+        optimizer,
+        "cpu",
+        use_autocast=False,
+        accum_steps=2,
+        step_optimizer=False,
+        zero_grad=True,
     )
     assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.parameters())
     # A non-finite batch then skips: the skip semantics abort the window and
@@ -387,8 +391,14 @@ def test_slq16_nonfinite_batch_clears_gradients():
     bad_planes[0, 0, 0, 0] = float("nan")
     bad["planes"] = bad_planes
     result = train_step(
-        model, bad, optimizer, "cpu", use_autocast=False, accum_steps=2,
-        step_optimizer=False, zero_grad=False,
+        model,
+        bad,
+        optimizer,
+        "cpu",
+        use_autocast=False,
+        accum_steps=2,
+        step_optimizer=False,
+        zero_grad=False,
     )
     skip_flag = result[6]
     if skip_flag:
@@ -454,7 +464,9 @@ def test_slq18_tactics_ratio_default_shared():
 
 
 def test_slq08_gate_refuses_roleless_dataset(tmp_path):
-    save_dataset_split(tmp_path / "train", _make_positions(4, outcomes=[0, 1, 2, 0], plies=[10] * 4), "train")
+    save_dataset_split(
+        tmp_path / "train", _make_positions(4, outcomes=[0, 1, 2, 0], plies=[10] * 4), "train"
+    )
     # Strip the role declaration → the gate must refuse.
     meta_path = tmp_path / "train" / "metadata.json"
     meta = json.loads(meta_path.read_text())

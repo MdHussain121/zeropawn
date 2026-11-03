@@ -106,8 +106,15 @@ VALID_OUTCOMES: tuple[int, ...] = (0, 1, 2, OUTCOME_UNAVAILABLE)
 
 class PositionData:
     __slots__ = (
-        "planes", "move_idx", "outcome", "game_id", "ply", "pos_hash",
-        "state_key", "legal_mask", "stm",
+        "planes",
+        "move_idx",
+        "outcome",
+        "game_id",
+        "ply",
+        "pos_hash",
+        "state_key",
+        "legal_mask",
+        "stm",
     )
 
     # 4672 actions packed into bits: ceil(4672/8) bytes per position.
@@ -138,9 +145,11 @@ class PositionData:
         # engine hash distinguishes rule state the 19-plane encoder renders
         # identically, so val dedup MUST key on the serialized bytes or
         # identical encoded states survive across splits (audit finding).
-        self.state_key = state_key if state_key is not None else hashlib.md5(
-            np.ascontiguousarray(planes).tobytes()
-        ).digest()
+        self.state_key = (
+            state_key
+            if state_key is not None
+            else hashlib.md5(np.ascontiguousarray(planes).tobytes()).digest()
+        )
         self.legal_mask = legal_mask
         # Side to move: 1 = white, 0 = black. The 19-plane encoder is fully
         # side-relative (no absolute side plane), so the side cannot be
@@ -389,7 +398,9 @@ def _flush_positions_chunk(
     game_ids_arr = np.empty(n, dtype=np.uint64)
     plies_arr = np.empty(n, dtype=np.int16)
     masks_arr = (
-        np.empty((n, PositionData.MASK_PACKED_BYTES), dtype=np.uint8) if f_masks is not None else None
+        np.empty((n, PositionData.MASK_PACKED_BYTES), dtype=np.uint8)
+        if f_masks is not None
+        else None
     )
     stm_arr = np.empty(n, dtype=np.uint8) if f_stm is not None else None
 
@@ -791,10 +802,14 @@ def build_binary_dataset(
     print(f"Training positions:              {n_train}")
     print(f"Candidate validation positions:  {len(candidate_val_positions)}")
     pct_removed = (removed_count / max(1, len(candidate_val_positions))) * 100
-    print(f"Validation positions removed:    {removed_count} ({pct_removed:.2f}%) [cross: {val_removed_cross}, within-val: {val_removed_within}]")
+    print(
+        f"Validation positions removed:    {removed_count} ({pct_removed:.2f}%) [cross: {val_removed_cross}, within-val: {val_removed_within}]"
+    )
     print(f"Final validation positions:      {n_val_final}")
     print(f"Candidate test positions:        {len(candidate_test_positions)}")
-    print(f"Test positions removed:          {test_removed_count} [cross: {test_removed_cross}, within-test: {test_removed_within}]")
+    print(
+        f"Test positions removed:          {test_removed_count} [cross: {test_removed_cross}, within-test: {test_removed_within}]"
+    )
     print(f"Final test positions:            {n_test_final}")
     print(f"Duplicate games skipped:         {duplicate_games}")
     print(f"Conflicting duplicate games:     {conflicting_duplicate_games}")

@@ -19,7 +19,6 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-import torch
 
 torch = pytest.importorskip("torch")
 
@@ -87,9 +86,7 @@ def toy_world(tmp_path):
 
 def test_real_optimizer_update_changes_parameters_and_counters(toy_world):
     tmp_path, _buf, trainer = toy_world
-    weights_before = {
-        k: v.detach().clone() for k, v in trainer.model.state_dict().items()
-    }
+    weights_before = {k: v.detach().clone() for k, v in trainer.model.state_dict().items()}
 
     metrics = trainer.train_step()  # samples from the real buffer
     assert trainer.step_num == 1
@@ -105,9 +102,7 @@ def test_real_optimizer_update_changes_parameters_and_counters(toy_world):
         if not torch.equal(v.detach(), weights_before[k])
     ]
     assert changed, "a successful optimizer update must change model parameters"
-    momentum_buffers = [
-        s for s in trainer.optimizer.state.values() if "momentum_buffer" in s
-    ]
+    momentum_buffers = [s for s in trainer.optimizer.state.values() if "momentum_buffer" in s]
     assert momentum_buffers, "SGD momentum state must exist after a real update"
 
     lr_after_one_step = trainer.scheduler.get_lr(1)

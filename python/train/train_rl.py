@@ -218,8 +218,8 @@ def inspect_rl_checkpoint(path: Union[str, Path]) -> Optional[Dict[str, Any]]:
         # Resume-selection inputs (findings CKP-01/CKP-08): a weights-only
         # container in the RL directory must never be picked as a resume point,
         # and a checkpoint that records a failed run must not silently look
-        # like a clean one.
-        "checkpoint_type": ckpt.get("checkpoint_type"),
+        # like a clean one. ``checkpoint_type`` (stamped above, audit SR-03)
+        # participates in that gate too.
         "optimizer_type_stamp": ckpt.get("_optimizer_type"),
         "run_state": ledger.get("run_state") if isinstance(ledger, dict) else None,
         "run_id": ledger.get("run_id") if isinstance(ledger, dict) else None,
@@ -249,6 +249,8 @@ def is_resumable_candidate(info: Dict[str, Any]) -> tuple[bool, str]:
             "(weights-only container; must not become a resume point)",
         )
     return False, f"optimizer state is {opt} (foreign/poisoned — not resumable by an SGD trainer)"
+
+
 class RLTrainer:
     """Continuous RL trainer for self-play experience.
 
@@ -602,7 +604,13 @@ class RLTrainer:
         # Domain-level gates first (architecture, then optimizer family): these
         # produce the specific diagnostics users act on. The schema contract is
         # enforced immediately afterwards, before ANY state is adopted.
-        _validate_arch(ckpt, self.model, getattr(self.model, "num_blocks", 12), getattr(self.model, "num_filters", 128), path_str)
+        _validate_arch(
+            ckpt,
+            self.model,
+            getattr(self.model, "num_blocks", 12),
+            getattr(self.model, "num_filters", 128),
+            path_str,
+        )
         _validate_checkpoint_optimizer_compatibility(ckpt, path_str, warm_start=reset_step)
 
         verdict = validate_checkpoint_schema(
@@ -615,9 +623,7 @@ class RLTrainer:
         for warning in verdict.warnings:
             logger.warning("[SCHEMA] %s: %s", Path(path_str).name, warning)
         ledger = ckpt.get("run_metadata")
-        for warning in validate_run_metadata(
-            ledger, path=path_str, required=not verdict.is_legacy
-        ):
+        for warning in validate_run_metadata(ledger, path=path_str, required=not verdict.is_legacy):
             logger.warning("[RUN-STATUS] %s: %s", Path(path_str).name, warning)
         logger.info(
             "[RUN-STATUS] %s predecessor: %s", Path(path_str).name, describe_run_status(ledger)
@@ -634,7 +640,9 @@ class RLTrainer:
         saved_dataset = None
         if isinstance(ledger, dict) and isinstance(ledger.get("dataset"), dict):
             saved_dataset = ledger.get("dataset")
-        elif isinstance(ckpt.get("provenance"), dict) and isinstance(ckpt["provenance"].get("dataset"), dict):
+        elif isinstance(ckpt.get("provenance"), dict) and isinstance(
+            ckpt["provenance"].get("dataset"), dict
+        ):
             saved_dataset = ckpt["provenance"].get("dataset")
 
         buf = getattr(self, "replay_buffer", None) or getattr(self, "buffer", None)
@@ -667,11 +675,7 @@ class RLTrainer:
             seed=self.run_metadata.get("seed"),
             config=self.run_metadata.get("config"),
             parent_checkpoint=self._resume_parent_identity,
-            extra=(
-                {"predecessor_run": predecessor_ledger}
-                if predecessor_ledger
-                else {}
-            ),
+            extra=({"predecessor_run": predecessor_ledger} if predecessor_ledger else {}),
         )
         if reset_step:
             self.run_metadata["warm_start"] = path_str
@@ -995,7 +999,9 @@ class RLTrainer:
         if live is None:
             live = {
                 "write_head": int(getattr(self.replay_buffer, "write_head", 0) or 0),
-                "size": int(len(self.replay_buffer)) if hasattr(self.replay_buffer, "__len__") else 0,
+                "size": int(len(self.replay_buffer))
+                if hasattr(self.replay_buffer, "__len__")
+                else 0,
                 "total_added": int(getattr(self.replay_buffer, "total_added", 0) or 0),
                 "capacity": int(getattr(self.replay_buffer, "capacity", 0) or 0),
                 "generation": getattr(self.replay_buffer, "buffer_generation", None),
@@ -1100,8 +1106,10 @@ class RLTrainer:
                 "acknowledge starting from the live buffer as-is, or restore the matching buffer."
             )
 
-        if live["size"] == 0 and live["total_added"] == 0 and (
-            saved["size"] > 0 or saved["total_added"] > 0
+        if (
+            live["size"] == 0
+            and live["total_added"] == 0
+            and (saved["size"] > 0 or saved["total_added"] > 0)
         ):
             decision["decision"] = "refused_live_buffer_empty"
             self.run_metadata["buffer_resume_decision"] = decision
@@ -1436,7 +1444,13 @@ class RLTrainer:
             "optimizer": self.optimizer.state_dict(),
             "scheduler": getattr(self.scheduler, "state_dict", lambda: {})(),
             "step": self.step_num,
-            "model_version": int(getattr(self.direct_server, "model_version", getattr(self.model, "model_version", self.model_version))),
+            "model_version": int(
+                getattr(
+                    self.direct_server,
+                    "model_version",
+                    getattr(self.model, "model_version", self.model_version),
+                )
+            ),
             "num_blocks": arch[0],
             "num_filters": arch[1],
             "policy_target_temp": self.policy_target_temp,
@@ -1455,7 +1469,9 @@ class RLTrainer:
             # save generation. Consumed by both resume stages; the live
             # buffer's own meta stays authoritative.
             "buffer_state": self._buffer_snapshot(),
-            "buffer_size": int(len(self.replay_buffer)) if hasattr(self.replay_buffer, "__len__") else None,
+            "buffer_size": int(len(self.replay_buffer))
+            if hasattr(self.replay_buffer, "__len__")
+            else None,
             "buffer_write_head": getattr(self.replay_buffer, "write_head", None),
             "last_push_step": self.last_push_step,
             "tactical_pool_size": getattr(self.replay_buffer, "tactical_pool_size", None),
@@ -1501,7 +1517,9 @@ class RLTrainer:
                 try:
                     from python.common.cleanup import prune_checkpoints
 
-                    prune_checkpoints(ckpt_path.parent, keep_last_n=keep_last_n, extra_keep=(ckpt_path.name,))
+                    prune_checkpoints(
+                        ckpt_path.parent, keep_last_n=keep_last_n, extra_keep=(ckpt_path.name,)
+                    )
                 except (OSError, ValueError):
                     logger.debug("RL checkpoint prune skipped", exc_info=True)
 
@@ -1658,9 +1676,7 @@ class RLTrainer:
             full_visits = visits[full_mask].float()
 
             with torch.no_grad():
-                p_target_norm = full_visits / full_visits.sum(dim=-1, keepdim=True).clamp_min(
-                    1e-8
-                )
+                p_target_norm = full_visits / full_visits.sum(dim=-1, keepdim=True).clamp_min(1e-8)
                 target_entropy_t = (
                     -(p_target_norm * (p_target_norm + 1e-12).log()).sum(dim=-1).mean()
                 )
@@ -1687,11 +1703,7 @@ class RLTrainer:
         # WDL cross-entropy over every sampled position. Handles both class
         # probability targets (N, 3) and class index targets (N,) or (N, 1);
         # ignore_index=255 guards OUTCOME_UNAVAILABLE rows in tactical/human data.
-        if (
-            outcomes.is_floating_point()
-            and outcomes.ndim >= 2
-            and outcomes.shape[-1] == 3
-        ):
+        if outcomes.is_floating_point() and outcomes.ndim >= 2 and outcomes.shape[-1] == 3:
             wdl_loss = F.cross_entropy(wdl_logits.float(), outcomes)
         else:
             outcomes_idx = outcomes.long()
@@ -1706,9 +1718,7 @@ class RLTrainer:
                     "Syzygy 5-class outcomes must be remapped to 3-class via remap_syzygy_outcomes."
                 )
             if (outcomes_idx != 255).any():
-                wdl_loss = F.cross_entropy(
-                    wdl_logits.float(), outcomes_idx, ignore_index=255
-                )
+                wdl_loss = F.cross_entropy(wdl_logits.float(), outcomes_idx, ignore_index=255)
             else:
                 wdl_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
 

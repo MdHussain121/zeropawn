@@ -21,7 +21,9 @@ from python.model.checkpoint_registry import (
 from python.selfplay.inference_server import InferenceServer
 
 
-def _write_full_trainer_state(path: Path, num_blocks: int = 12, num_filters: int = 128, step: int = 5) -> Path:
+def _write_full_trainer_state(
+    path: Path, num_blocks: int = 12, num_filters: int = 128, step: int = 5
+) -> Path:
     model = ChessNet(num_blocks=num_blocks, num_filters=num_filters)
     torch.save(
         {
@@ -180,10 +182,14 @@ def test_bundled_registry_matches_disk_when_artifacts_present():
     # Artifacts live in the main checkout; probe both the worktree and the
     # canonical main worktree path.
     candidates = [repo_root, Path(r"C:\Users\<user>\Music\chess\chess-rl")]
-    artifact_root = next((c for c in candidates if (c / "models" / "manifest.json").is_file()), None)
+    artifact_root = next(
+        (c for c in candidates if (c / "models" / "manifest.json").is_file()), None
+    )
     if artifact_root is None:
         pytest.skip("models/ artifacts not present on this checkout")
-    registry = json.loads((repo_root / "docs" / "checkpoint_registry.json").read_text(encoding="utf-8"))
+    registry = json.loads(
+        (repo_root / "docs" / "checkpoint_registry.json").read_text(encoding="utf-8")
+    )
     verified = [r for r in registry["checkpoints"] if r.get("status") == "verified"]
     assert verified, "registry must certify at least one on-disk artifact"
     for rec in verified:

@@ -145,7 +145,7 @@ def elo_confidence_interval(
 
     score = (wins + 0.5 * draws) / n
     elo_diff = score_to_elo(score)
-    is_shutout = (score <= 0.0 or score >= 1.0)
+    is_shutout = score <= 0.0 or score >= 1.0
 
     if method == "agresti_caffo":
         lo, hi = agresti_caffo_elo_ci(wins, draws, losses, confidence=confidence)

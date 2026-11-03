@@ -141,7 +141,9 @@ def merge_unified_dataset(
         }
         conflict_examples: List[Dict[str, Any]] = []
 
-        def _record_conflict_example(kind: str, kept: Dict[str, Any], dropped: Dict[str, Any]) -> None:
+        def _record_conflict_example(
+            kind: str, kept: Dict[str, Any], dropped: Dict[str, Any]
+        ) -> None:
             if len(conflict_examples) < 50:
                 conflict_examples.append(
                     {"kind": kind, "split": split, "kept": kept, "dropped": dropped}
@@ -192,7 +194,12 @@ def merge_unified_dataset(
                         split_tactics_count += 1
                         _record_conflict_example(
                             kind,
-                            {"source": s_info["name"], "row": i, "move": cur_move, "outcome": cur_outcome},
+                            {
+                                "source": s_info["name"],
+                                "row": i,
+                                "move": cur_move,
+                                "outcome": cur_outcome,
+                            },
                             {
                                 "source": sources_data[prev["s_idx"]]["name"],
                                 "row": prev["sample_idx"],
@@ -211,7 +218,12 @@ def merge_unified_dataset(
                                 "move": prev["move"],
                                 "outcome": prev["outcome"],
                             },
-                            {"source": s_info["name"], "row": i, "move": cur_move, "outcome": cur_outcome},
+                            {
+                                "source": s_info["name"],
+                                "row": i,
+                                "move": cur_move,
+                                "outcome": cur_outcome,
+                            },
                         )
                     if kind == "target_conflict":
                         split_stats["target_conflicts"] += 1
@@ -383,9 +395,7 @@ def merge_unified_dataset(
         import csv as _csv
 
         def _tactics_gid(puzzle_id: str) -> int:
-            return int(
-                hashlib.sha256(f"tactics_{puzzle_id}".encode("utf-8")).hexdigest()[:16], 16
-            )
+            return int(hashlib.sha256(f"tactics_{puzzle_id}".encode("utf-8")).hexdigest()[:16], 16)
 
         benchmark_gids: set[int] = set()
         benchmark_rows = 0
@@ -405,9 +415,11 @@ def merge_unified_dataset(
                     shape=(summary["total_samples"],),
                 )
             )
-            leaked_by_split[split] = int(
-                np.isin(np.int64(gids), np.int64(list(benchmark_gids))).sum()
-            ) if benchmark_gids else 0
+            leaked_by_split[split] = (
+                int(np.isin(np.int64(gids), np.int64(list(benchmark_gids))).sum())
+                if benchmark_gids
+                else 0
+            )
         total_leaked = sum(leaked_by_split.values())
         evaluation_independence = {
             "benchmark_file": str(benchmark_path),

@@ -50,7 +50,9 @@ def main() -> int:
     state = ck["model"] if isinstance(ck, dict) and "model" in ck else ck
     num_blocks = ck.get("num_blocks", 12) if isinstance(ck, dict) else 12
     num_filters = ck.get("num_filters", 128) if isinstance(ck, dict) else 128
-    model = ChessNet(in_channels=19, num_filters=num_filters, num_blocks=num_blocks, num_actions=4672)
+    model = ChessNet(
+        in_channels=19, num_filters=num_filters, num_blocks=num_blocks, num_actions=4672
+    )
     model.load_state_dict(state)
     model = model.to(device).eval()
 
@@ -124,9 +126,7 @@ def main() -> int:
         "wdl_ce_admitted": round(sum_wdl_ce / max(1, n_wdl), 4),
         "wdl_admitted_rows": n_wdl,
         "per_class_ce": {
-            ["win", "draw", "loss"][c]: (
-                round(class_ce[c] / class_n[c], 4) if class_n[c] else None
-            )
+            ["win", "draw", "loss"][c]: (round(class_ce[c] / class_n[c], 4) if class_n[c] else None)
             for c in range(3)
         },
         "per_class_rows": {["win", "draw", "loss"][c]: class_n[c] for c in range(3)},

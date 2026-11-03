@@ -450,7 +450,15 @@ def test_run_match_interrupt_preserves_completed_games(tmp_path, monkeypatch):
     # Patch out the instance bound method (workers call self._play_game_worker).
     slow = threading.Event()
 
-    def fake_play(opening_fen, engine_is_white, ctx, max_plies=150, game_seed=None, move_log=None, info_log=None):  # noqa: E501 - RL-20 adds the info_log channel
+    def fake_play(
+        opening_fen,
+        engine_is_white,
+        ctx,
+        max_plies=150,
+        game_seed=None,
+        move_log=None,
+        info_log=None,
+    ):  # noqa: E501 - RL-20 adds the info_log channel
         if opening_fen == fens[1]:
             # Deterministic interrupt: openings 0 and 2 finish well before this
             # one raises.
@@ -465,9 +473,7 @@ def test_run_match_interrupt_preserves_completed_games(tmp_path, monkeypatch):
 
     persisted: list[dict] = []
     pgn_path = tmp_path / "match.pgn"
-    result = runner.run_match(
-        num_openings=3, pgn_path=pgn_path, on_game_result=persisted.append
-    )
+    result = runner.run_match(num_openings=3, pgn_path=pgn_path, on_game_result=persisted.append)
     slow.set()
 
     assert result["interrupted"] is True
@@ -475,9 +481,7 @@ def test_run_match_interrupt_preserves_completed_games(tmp_path, monkeypatch):
     assert result["completed_games"] == 4
     # No fabricated full-match tally: total_games reflects only played games.
     assert result["total_games"] == 4
-    assert (
-        result["engine_wins"] + result["engine_draws"] + result["engine_losses"] == 4
-    )
+    assert result["engine_wins"] + result["engine_draws"] + result["engine_losses"] == 4
     assert len(persisted) == 4
     # Incremental PGN survived the interruption.
     pgn_text = pgn_path.read_text(encoding="utf-8")
@@ -522,9 +526,40 @@ def test_orchestrator_eval_persistence_helpers(tmp_path):
         }
     )
     orch._append_eval_row(
-        [1.0, 0.1, 7, 3, dummy_ckpt.name, 0.5, 5, 10, 0.75, 3, 1, 0, 0.25, 4, 0,
-         "cfg", "serial", 0, -381.7, -500.0, -250.0, "abc123", "sf123", "testcommit", 0,
-         "stockfish", 1500, 1, 200, 4, 10, 0.4]
+        [
+            1.0,
+            0.1,
+            7,
+            3,
+            dummy_ckpt.name,
+            0.5,
+            5,
+            10,
+            0.75,
+            3,
+            1,
+            0,
+            0.25,
+            4,
+            0,
+            "cfg",
+            "serial",
+            0,
+            -381.7,
+            -500.0,
+            -250.0,
+            "abc123",
+            "sf123",
+            "testcommit",
+            0,
+            "stockfish",
+            1500,
+            1,
+            200,
+            4,
+            10,
+            0.4,
+        ]
     )
 
     # eval_history: header + one row, with the partial/provenance columns.

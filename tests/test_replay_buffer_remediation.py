@@ -316,9 +316,7 @@ def test_checkpoint_consistency_classification(tmp_path):
     assert buf.checkpoint_consistency({})[0] == "mismatch"  # no snapshot at all
     # A rolled-back pointer (checkpoint "ahead" of live) is never a match.
     assert (
-        buf.checkpoint_consistency(
-            {**snap, "size": 12, "write_head": 12, "total_added": 12}
-        )[0]
+        buf.checkpoint_consistency({**snap, "size": 12, "write_head": 12, "total_added": 12})[0]
         == "mismatch"
     )
     # Legacy snapshot (no total_added): equality is required, 'ahead' impossible.

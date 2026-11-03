@@ -63,8 +63,16 @@ def load_openings(path: str, n: int) -> list[str]:
 class PlayerContext:
     """Per-thread pair of engines (own model copies + own MCTS trees)."""
 
-    def __init__(self, ckpt_a: str, ckpt_b: str, device: str, sims: int, c_puct: float,
-                 fpu_a: float, fpu_b: float):
+    def __init__(
+        self,
+        ckpt_a: str,
+        ckpt_b: str,
+        device: str,
+        sims: int,
+        c_puct: float,
+        fpu_a: float,
+        fpu_b: float,
+    ):
         self.model_a = load_model(ckpt_a, device)
         self.model_b = load_model(ckpt_b, device)
         self.device = device
@@ -190,8 +198,19 @@ def main() -> int:
 
     with open(games_csv, "w", newline="", encoding="utf-8") as f:
         csv.writer(f).writerow(
-            ["timestamp", "opening_idx", "a_is_white", "result_board", "a_result",
-             "outcome_class", "termination_reason", "seed", "sims", "fpu_a", "fpu_b"]
+            [
+                "timestamp",
+                "opening_idx",
+                "a_is_white",
+                "result_board",
+                "a_result",
+                "outcome_class",
+                "termination_reason",
+                "seed",
+                "sims",
+                "fpu_a",
+                "fpu_b",
+            ]
         )
 
     sha_a = compute_sha256(args.engine_a)
@@ -229,8 +248,13 @@ def main() -> int:
 
     def first_ctx():
         return PlayerContext(
-            args.engine_a, args.engine_b, device, args.sims, args.c_puct,
-            args.fpu_a, args.fpu_b,
+            args.engine_a,
+            args.engine_b,
+            device,
+            args.sims,
+            args.c_puct,
+            args.fpu_a,
+            args.fpu_b,
         )
 
     import concurrent.futures
@@ -247,8 +271,19 @@ def main() -> int:
                 with lock:
                     pairs_results[idx] = []
                     for a_is_white, board_res, a_res, outcome_class, term_reason, seed in results:
-                        row = [time.time(), idx, int(a_is_white), board_res, a_res,
-                               outcome_class, term_reason, seed, args.sims, args.fpu_a, args.fpu_b]
+                        row = [
+                            time.time(),
+                            idx,
+                            int(a_is_white),
+                            board_res,
+                            a_res,
+                            outcome_class,
+                            term_reason,
+                            seed,
+                            args.sims,
+                            args.fpu_a,
+                            args.fpu_b,
+                        ]
                         rows.append(row)
                         with open(games_csv, "a", newline="", encoding="utf-8") as f:
                             csv.writer(f).writerow(row)
@@ -272,7 +307,7 @@ def main() -> int:
                     print(
                         f"Progress {n:3d}/{total} | A: +{tally['a_wins']} ={tally['draws']} "
                         f"-{tally['b_wins']} (capped={tally['capped']}, fail={tally['failures']}) | "
-                        f"score {score*100:.1f}% | {time.time()-start:.0f}s"
+                        f"score {score * 100:.1f}% | {time.time() - start:.0f}s"
                     )
         except KeyboardInterrupt:
             print("Interrupted; partial tally returned")
@@ -304,9 +339,14 @@ def main() -> int:
         "engine_a": {"path": args.engine_a, "sha256": sha_a, "fpu": args.fpu_a},
         "engine_b": {"path": args.engine_b, "sha256": sha_b, "fpu": args.fpu_b},
         "settings": {
-            "sims": args.sims, "c_puct": args.c_puct, "openings_file": args.openings,
-            "num_openings": args.num_openings, "seed": args.seed, "device": device,
-            "noise": False, "temperature": "greedy (argmax visits)",
+            "sims": args.sims,
+            "c_puct": args.c_puct,
+            "openings_file": args.openings,
+            "num_openings": args.num_openings,
+            "seed": args.seed,
+            "device": device,
+            "noise": False,
+            "temperature": "greedy (argmax visits)",
         },
         "completed_games": n,
         "effective_games": n_eff,
@@ -318,8 +358,10 @@ def main() -> int:
         "engine_failures": tally["failures"],
         "a_score": round(score, 4),
         "elo_diff": round(elo_diff, 1) if not math.isinf(elo_diff) else None,
-        "elo_diff_a_minus_b_95ci": [round(lo, 1) if not math.isinf(lo) else None,
-                                    round(hi, 1) if not math.isinf(hi) else None],
+        "elo_diff_a_minus_b_95ci": [
+            round(lo, 1) if not math.isinf(lo) else None,
+            round(hi, 1) if not math.isinf(hi) else None,
+        ],
         "pairing_analysis": paired_analysis,
         "games_csv": str(games_csv),
     }

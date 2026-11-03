@@ -146,7 +146,9 @@ def test_valid_outcomes_decode_and_sentinel_rows_masked(dataset_pair):
         assert targets.shape == (len(MASTER_OUTCOMES), 3)
         for idx, outcome in enumerate(MASTER_OUTCOMES):
             np.testing.assert_allclose(
-                targets[idx], _expected_onehot(outcome), atol=1e-6,
+                targets[idx],
+                _expected_onehot(outcome),
+                atol=1e-6,
                 err_msg=f"row {idx} (stored outcome {outcome}) decoded wrongly",
             )
     finally:
@@ -161,12 +163,16 @@ def test_tactics_concat_preserves_master_labels_and_masks_tactics(dataset_pair):
         assert loader.num_samples == len(MASTER_OUTCOMES) + 4
         for idx, outcome in enumerate(MASTER_OUTCOMES):
             np.testing.assert_allclose(
-                targets[idx], _expected_onehot(outcome), atol=1e-6,
+                targets[idx],
+                _expected_onehot(outcome),
+                atol=1e-6,
                 err_msg=f"master row {idx} lost its label after tactics concat",
             )
         for idx in range(len(MASTER_OUTCOMES), loader.num_samples):
             np.testing.assert_allclose(
-                targets[idx], [0.0, 0.0, 0.0], atol=1e-6,
+                targets[idx],
+                [0.0, 0.0, 0.0],
+                atol=1e-6,
                 err_msg=f"tactics row {idx} must carry a masked (zero) value target",
             )
     finally:
@@ -210,9 +216,7 @@ def test_binary_dataset_source_immutability_and_label_semantics(dataset_pair):
         sample = ds[idx]
         if outcome == OUTCOME_UNAVAILABLE:
             assert int(sample["outcome"]) == -1
-            torch.testing.assert_close(
-                sample["value_target"], torch.zeros(3, dtype=torch.float32)
-            )
+            torch.testing.assert_close(sample["value_target"], torch.zeros(3, dtype=torch.float32))
             assert bool(sample["is_tactical"]) is True
         else:
             assert int(sample["outcome"]) == int(outcome)
@@ -226,14 +230,13 @@ def test_binary_dataset_source_immutability_and_label_semantics(dataset_pair):
 
 
 def test_non_tactical_dataset_without_outcomes_fails_closed(tmp_path):
-    shard = _write_dataset(tmp_path / "master", MASTER_OUTCOMES, kind="master-games",
-                           with_outcomes=False)
+    shard = _write_dataset(
+        tmp_path / "master", MASTER_OUTCOMES, kind="master-games", with_outcomes=False
+    )
     before = _snapshot_tree(shard)
 
     with pytest.raises(FileNotFoundError):
-        GpuResidentDataLoader(
-            shard, batch_size=2, device="cpu", storage_dtype=torch.float32
-        )
+        GpuResidentDataLoader(shard, batch_size=2, device="cpu", storage_dtype=torch.float32)
     with pytest.raises(ValueError):
         BinaryChessDataset(shard)
 
@@ -242,8 +245,7 @@ def test_non_tactical_dataset_without_outcomes_fails_closed(tmp_path):
 
 def test_tactical_dataset_without_outcomes_loads_masked_in_memory(tmp_path):
     """Tactical shards may lack outcome labels entirely: mask in memory, never write."""
-    shard = _write_dataset(tmp_path / "tactics", [0] * 4, kind="tactics",
-                           with_outcomes=False)
+    shard = _write_dataset(tmp_path / "tactics", [0] * 4, kind="tactics", with_outcomes=False)
     before = _snapshot_tree(shard)
 
     loader = GpuResidentDataLoader(

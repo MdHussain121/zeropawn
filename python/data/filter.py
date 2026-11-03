@@ -354,7 +354,11 @@ def run_filter(
     print(f"Min rating:       {min_rating}")
     print(f"Min plies:        {min_plies}")
     print(f"Min TC sec:       {min_tc_seconds}s")
-    print(f"Min base sec:     {min_base_seconds}s" if min_base_seconds is not None else "Min base sec:     none")
+    print(
+        f"Min base sec:     {min_base_seconds}s"
+        if min_base_seconds is not None
+        else "Min base sec:     none"
+    )
     print(f"Purge BOTs:       {purge_bots}")
     print(TIME_CONTROL_JUSTIFICATION)
     print("=" * 60)
@@ -488,7 +492,11 @@ def main() -> None:
                 ("min_rating", args.min_rating, "user" if args.min_rating != 2200 else "default"),
                 ("min_plies", args.min_plies, "user" if args.min_plies != 20 else "default"),
                 ("min_tc", args.min_tc, "user" if args.min_tc != 180 else "default"),
-                ("min_base_seconds", args.min_base_seconds, "user" if args.min_base_seconds is not None else "default"),
+                (
+                    "min_base_seconds",
+                    args.min_base_seconds,
+                    "user" if args.min_base_seconds is not None else "default",
+                ),
                 ("purge_bots", args.purge_bots, "user" if args.purge_bots else "default"),
                 ("max_kept", args.max_kept, "user" if args.max_kept is not None else "default"),
                 (

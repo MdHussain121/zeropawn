@@ -273,7 +273,6 @@ def quarantine_verdict(path: Path, index: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-
 class Phase4Orchestrator:
     """Orchestrates Phase 4 self-play + RL training run with 6-hour evaluations and stop conditions."""
 
@@ -793,7 +792,12 @@ class Phase4Orchestrator:
             self._active_checkpoint_sha256 = None
         # Auto-detect Syzygy tablebase if not explicitly disabled
         if self.tablebase_path is None:
-            for candidate in (str(_repo_root / "data" / "syzygy"), "data/syzygy", "syzygy", "/usr/share/syzygy"):
+            for candidate in (
+                str(_repo_root / "data" / "syzygy"),
+                "data/syzygy",
+                "syzygy",
+                "/usr/share/syzygy",
+            ):
                 p = Path(candidate)
                 if p.is_dir():
                     files = [
@@ -995,9 +999,7 @@ class Phase4Orchestrator:
                 seed=self.seed,
                 run_id=self.run_id,
                 config=dict(self.trainer.run_metadata.get("config") or {}),
-                parent_checkpoint=(
-                    dict(ws) if base_checkpoint and ws else None
-                ),
+                parent_checkpoint=(dict(ws) if base_checkpoint and ws else None),
                 extra={
                     "warm_start": str(base_checkpoint) if base_checkpoint else "random_init",
                     "warm_start_sha256": ws.get("sha256", "unverified"),
@@ -1394,9 +1396,7 @@ class Phase4Orchestrator:
                 "size": self.buffer.size,
                 "write_head": self.buffer.write_head,
                 "total_added": self.buffer.total_added,
-                "selfplay_sampling_policy": getattr(
-                    self.buffer, "selfplay_sampling_policy", None
-                ),
+                "selfplay_sampling_policy": getattr(self.buffer, "selfplay_sampling_policy", None),
             },
             "config": {
                 "max_hours": self.max_hours,
@@ -1458,9 +1458,7 @@ class Phase4Orchestrator:
                 "failed_eval_requests": int(
                     getattr(self.worker.aggregator, "failed_eval_requests", 0)
                 ),
-                "staleness_fallbacks": int(
-                    getattr(self.buffer, "staleness_fallback_count", 0)
-                ),
+                "staleness_fallbacks": int(getattr(self.buffer, "staleness_fallback_count", 0)),
             },
             "trainer": {
                 "rl_steps": int(getattr(self.trainer, "step_num", 0)),
@@ -1514,7 +1512,9 @@ class Phase4Orchestrator:
             f.flush()
             os.fsync(f.fileno())
 
-    def _promotion_gate(self, match_res: dict, puzzle_rate: Optional[float] = None) -> tuple[bool, str]:
+    def _promotion_gate(
+        self, match_res: dict, puzzle_rate: Optional[float] = None
+    ) -> tuple[bool, str]:
         """Strength gate for best_eval.pt promotion (R-07, hardened per EV-01/EV-04).
 
         A 100-game match has an Elo confidence interval of roughly ±90-140 Elo, and the
@@ -2702,7 +2702,10 @@ class Phase4Orchestrator:
                         f"[TRAIN ERROR] step failed ({self._consecutive_train_failures}/{self._max_consecutive_train_failures}): {exc}",
                         exc_info=True,
                     )
-                    self._event("TRAIN_STEP_FAILED", f"error={exc} consecutive={self._consecutive_train_failures}")
+                    self._event(
+                        "TRAIN_STEP_FAILED",
+                        f"error={exc} consecutive={self._consecutive_train_failures}",
+                    )
                     if self._consecutive_train_failures >= self._max_consecutive_train_failures:
                         raise RuntimeError(
                             f"Phase 4 trainer encountered {self._consecutive_train_failures} consecutive train_step failures; stopping: {exc}"
@@ -2926,11 +2929,29 @@ class Phase4Orchestrator:
             # F-15: Ensure at least one telemetry row is logged and durably flushed before close
             if getattr(self, "metrics_tracker", None) is not None:
                 step_val = int(getattr(self.trainer, "step_num", 0) or 0)
-                buf_size = len(self.buffer) if hasattr(self, "buffer") and self.buffer is not None else 0
-                buf_total = getattr(self.buffer, "total_added", 0) if hasattr(self, "buffer") and self.buffer is not None else 0
-                buf_head = getattr(self.buffer, "write_head", 0) if hasattr(self, "buffer") and self.buffer is not None else 0
-                buf_schema = getattr(self.buffer, "schema_version", None) if hasattr(self, "buffer") and self.buffer is not None else None
-                m_ver = getattr(self.server, "model_version", 0) if hasattr(self, "server") and self.server is not None else 0
+                buf_size = (
+                    len(self.buffer) if hasattr(self, "buffer") and self.buffer is not None else 0
+                )
+                buf_total = (
+                    getattr(self.buffer, "total_added", 0)
+                    if hasattr(self, "buffer") and self.buffer is not None
+                    else 0
+                )
+                buf_head = (
+                    getattr(self.buffer, "write_head", 0)
+                    if hasattr(self, "buffer") and self.buffer is not None
+                    else 0
+                )
+                buf_schema = (
+                    getattr(self.buffer, "schema_version", None)
+                    if hasattr(self, "buffer") and self.buffer is not None
+                    else None
+                )
+                m_ver = (
+                    getattr(self.server, "model_version", 0)
+                    if hasattr(self, "server") and self.server is not None
+                    else 0
+                )
                 self.metrics_tracker.flush_final(
                     step=step_val,
                     buffer_size=buf_size,
@@ -2938,12 +2959,21 @@ class Phase4Orchestrator:
                     buffer_total_added=buf_total,
                     buffer_write_head=buf_head,
                     buffer_schema_version=buf_schema,
-                    games_aborted=getattr(self.worker, "aborted_games", 0) + getattr(self, "_aborted_games_seen", 0),
-                    games_invalid=getattr(self.worker, "invalid_games", 0) + getattr(self, "_invalid_games_seen", 0),
-                    records_rejected=getattr(self.buffer, "rejected_records", 0) + getattr(self, "_records_rejected", 0) if hasattr(self, "buffer") and self.buffer is not None else 0,
-                    checkpoint_file=getattr(self, "_last_saved_ckpt_name", None) or getattr(self, "_last_final_ckpt", None),
+                    games_aborted=getattr(self.worker, "aborted_games", 0)
+                    + getattr(self, "_aborted_games_seen", 0),
+                    games_invalid=getattr(self.worker, "invalid_games", 0)
+                    + getattr(self, "_invalid_games_seen", 0),
+                    records_rejected=getattr(self.buffer, "rejected_records", 0)
+                    + getattr(self, "_records_rejected", 0)
+                    if hasattr(self, "buffer") and self.buffer is not None
+                    else 0,
+                    checkpoint_file=getattr(self, "_last_saved_ckpt_name", None)
+                    or getattr(self, "_last_final_ckpt", None),
                 )
-                logger.info("[TELEMETRY] flush_final completed (total rows written: %d)", getattr(self.metrics_tracker, "rows_written", 0))
+                logger.info(
+                    "[TELEMETRY] flush_final completed (total rows written: %d)",
+                    getattr(self.metrics_tracker, "rows_written", 0),
+                )
         except Exception as exc:
             logger.error("Telemetry final flush failed during shutdown: %s", exc)
         try:

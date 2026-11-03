@@ -72,9 +72,7 @@ def test_upsert_registry_entry_inserts_and_updates(tmp_path):
 def test_bundled_registry_declares_the_unattributed_container_disqualified():
     """CKP-08 registry decision: the stray weights-only container is governed."""
     repo_root = Path(__file__).resolve().parent.parent
-    reg = json.loads(
-        (repo_root / "docs" / "checkpoint_registry.json").read_text(encoding="utf-8")
-    )
+    reg = json.loads((repo_root / "docs" / "checkpoint_registry.json").read_text(encoding="utf-8"))
     matches = [
         c
         for c in reg["checkpoints"]
@@ -92,7 +90,11 @@ def test_disqualified_container_is_refused_from_every_path(tmp_path):
     """Both the registered path and a copy of it are refused as a warm start."""
     artifact = tmp_path / "phase4_weights_only.pt"
     torch.save(
-        {"model": ChessNet(num_blocks=12, num_filters=128).state_dict(), "num_blocks": 12, "num_filters": 128},
+        {
+            "model": ChessNet(num_blocks=12, num_filters=128).state_dict(),
+            "num_blocks": 12,
+            "num_filters": 128,
+        },
         artifact,
     )
     (tmp_path / "docs").mkdir()
@@ -380,4 +382,7 @@ def test_runs_recover_never_suggests_a_non_checkpoint(tmp_path, monkeypatch, cap
     args = type("A", (), {"run_id": str(run_dir)})()
     assert runs_cli.run_runs_recover(args) == 0
     out = capsys.readouterr().out
-    assert "phase4_ckpt_v5_step997.pt" in out
+    # Rich console hard-wraps the rendered line at the console width, which can
+    # split the printed absolute path (and the filename inside it) across
+    # lines on deep checkouts; compare with the wrap newlines removed.
+    assert "phase4_ckpt_v5_step997.pt" in out.replace("\n", "")

@@ -12,7 +12,7 @@ import json
 import shutil
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 
@@ -85,9 +85,7 @@ def merge_datasets(selection: list[dict], merge_dir: Path) -> tuple[Path, Path]:
             ("masks.bin", np.uint8, lambda n: (n, (4672 + 7) // 8)),
             ("stm.bin", np.uint8, lambda n: (n,)),
         ):
-            inputs_with = [
-                ds for ds in selection if (ds["dir"] / split / fname).is_file()
-            ]
+            inputs_with = [ds for ds in selection if (ds["dir"] / split / fname).is_file()]
             if inputs_with and len(inputs_with) != len(selection):
                 raise ValueError(
                     f"merge aborted: {fname} exists on only {len(inputs_with)}/{len(selection)} "
@@ -118,9 +116,7 @@ def merge_datasets(selection: list[dict], merge_dir: Path) -> tuple[Path, Path]:
                 )
             else:
                 shape = schema2_files[fname][1](total) if fname in schema2_files else (total,)
-                out_mm = np.memmap(
-                    merge_dir / split / fname, dtype=dtype, mode="w+", shape=shape
-                )
+                out_mm = np.memmap(merge_dir / split / fname, dtype=dtype, mode="w+", shape=shape)
             offset = 0
             for ds in selection:
                 src = ds["dir"] / split / fname
@@ -129,9 +125,7 @@ def merge_datasets(selection: list[dict], merge_dir: Path) -> tuple[Path, Path]:
                 if fname == "planes.bin":
                     in_mm = np.memmap(src, dtype=dtype, mode="r", shape=(n, 19, 8, 8))
                 elif fname in schema2_files:
-                    in_mm = np.memmap(
-                        src, dtype=dtype, mode="r", shape=schema2_files[fname][1](n)
-                    )
+                    in_mm = np.memmap(src, dtype=dtype, mode="r", shape=schema2_files[fname][1](n))
                 else:
                     in_mm = np.memmap(src, dtype=dtype, mode="r", shape=(n,))
                 out_mm[offset : offset + n] = in_mm[:]

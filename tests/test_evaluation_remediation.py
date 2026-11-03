@@ -62,7 +62,7 @@ class TestF01CapScoringRemediation:
         """Mock games: verify capped games are excluded from primary WDL tally and score."""
         mock_model = MagicMock()
         mock_model.parameters.return_value = [MagicMock()]
-        
+
         runner = MatchRunner(
             model=mock_model,
             device="cpu",
@@ -72,21 +72,82 @@ class TestF01CapScoringRemediation:
         )
 
         mock_games = [
-            {"game_idx": 1, "engine_color": "white", "result": "1-0", "outcome_class": "decisive", "termination_reason": "checkmate", "material_balance_engine": 5},
-            {"game_idx": 2, "engine_color": "black", "result": "0-1", "outcome_class": "decisive", "termination_reason": "checkmate", "material_balance_engine": 3},
-            {"game_idx": 3, "engine_color": "white", "result": "0-1", "outcome_class": "decisive", "termination_reason": "checkmate", "material_balance_engine": -4},
-            {"game_idx": 4, "engine_color": "black", "result": "1-0", "outcome_class": "decisive", "termination_reason": "checkmate", "material_balance_engine": -6},
-            {"game_idx": 5, "engine_color": "white", "result": "1/2-1/2", "outcome_class": "genuine_draw", "termination_reason": "stalemate", "material_balance_engine": 0},
-            {"game_idx": 6, "engine_color": "black", "result": "1/2-1/2", "outcome_class": "genuine_draw", "termination_reason": "threefold_repetition", "material_balance_engine": 0},
-            {"game_idx": 7, "engine_color": "white", "result": "*", "outcome_class": "capped", "termination_reason": "max_plies_cap", "material_balance_engine": -3},
-            {"game_idx": 8, "engine_color": "black", "result": "*", "outcome_class": "capped", "termination_reason": "max_plies_cap", "material_balance_engine": 4},
+            {
+                "game_idx": 1,
+                "engine_color": "white",
+                "result": "1-0",
+                "outcome_class": "decisive",
+                "termination_reason": "checkmate",
+                "material_balance_engine": 5,
+            },
+            {
+                "game_idx": 2,
+                "engine_color": "black",
+                "result": "0-1",
+                "outcome_class": "decisive",
+                "termination_reason": "checkmate",
+                "material_balance_engine": 3,
+            },
+            {
+                "game_idx": 3,
+                "engine_color": "white",
+                "result": "0-1",
+                "outcome_class": "decisive",
+                "termination_reason": "checkmate",
+                "material_balance_engine": -4,
+            },
+            {
+                "game_idx": 4,
+                "engine_color": "black",
+                "result": "1-0",
+                "outcome_class": "decisive",
+                "termination_reason": "checkmate",
+                "material_balance_engine": -6,
+            },
+            {
+                "game_idx": 5,
+                "engine_color": "white",
+                "result": "1/2-1/2",
+                "outcome_class": "genuine_draw",
+                "termination_reason": "stalemate",
+                "material_balance_engine": 0,
+            },
+            {
+                "game_idx": 6,
+                "engine_color": "black",
+                "result": "1/2-1/2",
+                "outcome_class": "genuine_draw",
+                "termination_reason": "threefold_repetition",
+                "material_balance_engine": 0,
+            },
+            {
+                "game_idx": 7,
+                "engine_color": "white",
+                "result": "*",
+                "outcome_class": "capped",
+                "termination_reason": "max_plies_cap",
+                "material_balance_engine": -3,
+            },
+            {
+                "game_idx": 8,
+                "engine_color": "black",
+                "result": "*",
+                "outcome_class": "capped",
+                "termination_reason": "max_plies_cap",
+                "material_balance_engine": 4,
+            },
         ]
 
         total = len(mock_games)
-        wins = sum(1 for g in mock_games if g["result"] in ("1-0", "0-1") and (
-            (g["result"] == "1-0" and g["engine_color"] == "white") or 
-            (g["result"] == "0-1" and g["engine_color"] == "black")
-        ))
+        wins = sum(
+            1
+            for g in mock_games
+            if g["result"] in ("1-0", "0-1")
+            and (
+                (g["result"] == "1-0" and g["engine_color"] == "white")
+                or (g["result"] == "0-1" and g["engine_color"] == "black")
+            )
+        )
         genuine_draws = sum(1 for g in mock_games if g.get("outcome_class") == "genuine_draw")
         capped = sum(1 for g in mock_games if g.get("outcome_class") == "capped")
         losses = 2
@@ -132,7 +193,11 @@ class TestF02CliPersistenceAndInterruption:
         _append_match_ledger(entry2, str(ledger_file))
 
         assert ledger_file.exists()
-        lines = [json.loads(line) for line in ledger_file.read_text(encoding="utf-8").splitlines() if line]
+        lines = [
+            json.loads(line)
+            for line in ledger_file.read_text(encoding="utf-8").splitlines()
+            if line
+        ]
         assert len(lines) == 2
         assert lines[0]["match_status"] == "COMPLETED"
         assert lines[1]["match_status"] == "INTERRUPTED"
@@ -235,7 +300,7 @@ class TestF07HeadToHeadFailureAsLoss:
 
     def test_play_game_forfeit_on_search_failure(self):
         from scripts.run_head_to_head import PlayerContext
-        
+
         ctx = PlayerContext.__new__(PlayerContext)
         ctx.sims = 10
         ctx.c_puct = 2.0
@@ -269,7 +334,7 @@ class TestF08SprtProvenanceAndDefaults:
 
     def test_sprt_provenance_helpers(self, tmp_path):
         from scripts.run_sprt import _file_sha256, _git_commit
-        
+
         dummy_file = tmp_path / "test.txt"
         dummy_file.write_text("ZeroPawn Audit Remediation", encoding="utf-8")
         h = _file_sha256(dummy_file)
@@ -330,7 +395,9 @@ class TestF11Phase4PromotionGate:
         else:
             promotion_allowed = True
 
-        assert promotion_allowed is False, "Promotion must be rejected when SPRT disabled and unverified promotion not allowed"
+        assert promotion_allowed is False, (
+            "Promotion must be rejected when SPRT disabled and unverified promotion not allowed"
+        )
 
 
 class TestF12ColorBalancing:
@@ -373,9 +440,15 @@ class TestF15EvalConfigHashSensitivity:
     """F-15: eval_config_hash changes when fpu, book, seed, or max_plies change."""
 
     def test_config_hash_changes_on_parameters(self):
-        hash1 = eval_config_hash(1000, 50, 2.0, "data/openings/eval_openings_50.epd", 4, fpu_reduction=0.2, max_plies=150)
-        hash2 = eval_config_hash(1000, 50, 2.0, "data/openings/eval_openings_50.epd", 4, fpu_reduction=0.0, max_plies=150)
-        hash3 = eval_config_hash(1000, 50, 2.0, "data/openings/eval_openings_50.epd", 4, fpu_reduction=0.2, max_plies=200)
+        hash1 = eval_config_hash(
+            1000, 50, 2.0, "data/openings/eval_openings_50.epd", 4, fpu_reduction=0.2, max_plies=150
+        )
+        hash2 = eval_config_hash(
+            1000, 50, 2.0, "data/openings/eval_openings_50.epd", 4, fpu_reduction=0.0, max_plies=150
+        )
+        hash3 = eval_config_hash(
+            1000, 50, 2.0, "data/openings/eval_openings_50.epd", 4, fpu_reduction=0.2, max_plies=200
+        )
 
         assert hash1 != hash2
         assert hash1 != hash3

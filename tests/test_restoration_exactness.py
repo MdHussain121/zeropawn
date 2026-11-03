@@ -118,9 +118,7 @@ def test_rl_restores_model_optimizer_scheduler_and_rng_bitwise(tmp_path):
     assert np_now[2] == saved["numpy_rng_state"][2]
     assert np_now[3] == saved["numpy_rng_state"][3]
     assert np_now[4] == pytest.approx(saved["numpy_rng_state"][4], abs=0.0)
-    assert np.array_equal(
-        np_now[1], np.asarray(saved["numpy_rng_state"][1], dtype=np.uint32)
-    )
+    assert np.array_equal(np_now[1], np.asarray(saved["numpy_rng_state"][1], dtype=np.uint32))
     # python: the full Mersenne state matches.
     assert random.getstate() == saved["python_rng_state"]
 
@@ -199,8 +197,15 @@ def test_supervised_restores_model_adamw_and_scheduler(tmp_path):
         optimizer.zero_grad(set_to_none=True)
     ckpt = tmp_path / "sup.pt"
     save_checkpoint(
-        ckpt, model, optimizer, scheduler, step=2, epoch=0, best_val_loss=1.0,
-        num_blocks=2, num_filters=32,
+        ckpt,
+        model,
+        optimizer,
+        scheduler,
+        step=2,
+        epoch=0,
+        best_val_loss=1.0,
+        num_blocks=2,
+        num_filters=32,
     )
     saved = torch.load(ckpt, weights_only=False, map_location="cpu")
 

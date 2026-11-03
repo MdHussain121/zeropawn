@@ -206,9 +206,7 @@ def test_warm_start_validation_survives_null_registry_entries(tmp_path):
             {"path": "models/q.pt", "sha256": None, "status": "quarantined"},
         ],
     }
-    (repo / "docs" / "checkpoint_registry.json").write_text(
-        json.dumps(registry), encoding="utf-8"
-    )
+    (repo / "docs" / "checkpoint_registry.json").write_text(json.dumps(registry), encoding="utf-8")
 
     # Unregistered + no override -> the documented clear error, not a crash.
     with pytest.raises(WarmStartValidationError):

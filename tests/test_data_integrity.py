@@ -83,9 +83,13 @@ def make_split(
     moves_arr.tofile(split_dir / "moves.bin")
     out_arr = np.asarray(outcomes, dtype=np.uint8)
     out_arr.tofile(split_dir / "outcomes.bin")
-    gids_arr = np.asarray(gids if gids is not None else [1000 + i for i in range(n)], dtype=np.uint64)
+    gids_arr = np.asarray(
+        gids if gids is not None else [1000 + i for i in range(n)], dtype=np.uint64
+    )
     gids_arr.tofile(split_dir / "game_ids.bin")
-    plies_arr = np.asarray(plies if plies is not None else [10 + i for i in range(n)], dtype=np.int16)
+    plies_arr = np.asarray(
+        plies if plies is not None else [10 + i for i in range(n)], dtype=np.int16
+    )
     plies_arr.tofile(split_dir / "plies.bin")
     if value_targets is not None:
         value_targets.tofile(split_dir / "value_targets.bin")
@@ -152,9 +156,7 @@ def test_wdl_required_all_masked_fails(tmp_path):
         require_validated_dataset(d, expected_role="games_wdl", allow_uncertified=True)
 
     # Explicit policy-only declaration is the documented escape hatch.
-    gate = require_validated_dataset(
-        d, expected_role="policy_tactics", allow_uncertified=True
-    )
+    gate = require_validated_dataset(d, expected_role="policy_tactics", allow_uncertified=True)
     assert gate.certified is False  # no receipt
     assert gate.masked_fraction == 1.0
 
@@ -173,9 +175,7 @@ def test_policy_only_declared_masked_passes(tmp_path):
     )
     report = validate_split(d, scan_planes="off")
     assert not report.has_fail
-    gate = require_validated_dataset(
-        d, expected_role="policy_tactics", allow_uncertified=True
-    )
+    gate = require_validated_dataset(d, expected_role="policy_tactics", allow_uncertified=True)
     assert gate.role is not None and gate.role.name == "policy_tactics"
 
     # With a full validation receipt the same dataset certifies cleanly.
@@ -423,7 +423,11 @@ class FakeResponse:
 
 
 def _patch_download(
-    monkeypatch, body: bytes, status: int = 200, headers: dict | None = None, remote_size: int | None = None
+    monkeypatch,
+    body: bytes,
+    status: int = 200,
+    headers: dict | None = None,
+    remote_size: int | None = None,
 ):
     import python.data.download as dl
 
@@ -434,7 +438,11 @@ def _patch_download(
         return FakeResponse(body, status=status, headers=headers)
 
     monkeypatch.setattr(dl.urllib.request, "urlopen", fake_urlopen)
-    monkeypatch.setattr(dl, "get_remote_file_size", lambda url, timeout=10.0: remote_size if remote_size is not None else len(body))
+    monkeypatch.setattr(
+        dl,
+        "get_remote_file_size",
+        lambda url, timeout=10.0: remote_size if remote_size is not None else len(body),
+    )
     return calls
 
 
@@ -638,9 +646,7 @@ def test_gpu_loader_does_not_mutate_outcomes_file(tmp_path):
             "kind": "tactics-fullline",
         },
     )
-    before = {
-        p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in master.glob("*.bin")
-    }
+    before = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in master.glob("*.bin")}
     loader = GpuResidentDataLoader(
         master,
         batch_size=2,

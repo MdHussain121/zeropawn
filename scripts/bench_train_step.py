@@ -30,13 +30,9 @@ def make_batch():
     rng = np.random.default_rng(123)
     return {
         "planes": torch.from_numpy(rng.standard_normal((N, 19, 8, 8), dtype=np.float32)),
-        "visits": torch.from_numpy(
-            rng.random((N, 4672), dtype=np.float32)
-        ),
+        "visits": torch.from_numpy(rng.random((N, 4672), dtype=np.float32)),
         "outcomes": torch.from_numpy(rng.integers(0, 3, N).astype(np.int64)),
-        "is_full_search": torch.from_numpy(
-            (rng.random(N) < FULL_FRAC).astype(np.bool_)
-        ),
+        "is_full_search": torch.from_numpy((rng.random(N) < FULL_FRAC).astype(np.bool_)),
     }
 
 
@@ -65,7 +61,9 @@ def run_arm(trainer, batch, tag):
 def main():
     buf = ReplayBuffer(buffer_dir="tmp_bench/buf_m1", capacity=4096, create_new=True)
     batch = make_batch()
-    print(f"N={N} full_frac={FULL_FRAC} warmup={WARMUP} timed={TIMED} rounds={ROUNDS} (interleaved)")
+    print(
+        f"N={N} full_frac={FULL_FRAC} warmup={WARMUP} timed={TIMED} rounds={ROUNDS} (interleaved)"
+    )
 
     def fresh_trainer(use_bf16):
         torch.manual_seed(0)
@@ -88,17 +86,23 @@ def main():
 
     bf16_sps, fp32_sps, bf16_peak, fp32_peak = [], [], [], []
     for r in range(ROUNDS):
-        s, p = run_arm(t_bf16, batch, f"[r{r+1}] bf16    ")
+        s, p = run_arm(t_bf16, batch, f"[r{r + 1}] bf16    ")
         bf16_sps.append(s)
         bf16_peak.append(p)
-        s, p = run_arm(t_fp32, batch, f"[r{r+1}] fp32    ")
+        s, p = run_arm(t_fp32, batch, f"[r{r + 1}] fp32    ")
         fp32_sps.append(s)
         fp32_peak.append(p)
 
     b_med, f_med = statistics.median(bf16_sps), statistics.median(fp32_sps)
-    print(f"bf16: median {b_med:.1f} steps/s (runs {[f'{x:.1f}' for x in bf16_sps]}), peak VRAM median {statistics.median(bf16_peak):.0f} MB")
-    print(f"fp32: median {f_med:.1f} steps/s (runs {[f'{x:.1f}' for x in fp32_sps]}), peak VRAM median {statistics.median(fp32_peak):.0f} MB")
-    print(f"autocast restoration speedup: {b_med / f_med:.2f}x | peak VRAM change: {(statistics.median(bf16_peak) - statistics.median(fp32_peak)) / statistics.median(fp32_peak) * 100:+.0f}%")
+    print(
+        f"bf16: median {b_med:.1f} steps/s (runs {[f'{x:.1f}' for x in bf16_sps]}), peak VRAM median {statistics.median(bf16_peak):.0f} MB"
+    )
+    print(
+        f"fp32: median {f_med:.1f} steps/s (runs {[f'{x:.1f}' for x in fp32_sps]}), peak VRAM median {statistics.median(fp32_peak):.0f} MB"
+    )
+    print(
+        f"autocast restoration speedup: {b_med / f_med:.2f}x | peak VRAM change: {(statistics.median(bf16_peak) - statistics.median(fp32_peak)) / statistics.median(fp32_peak) * 100:+.0f}%"
+    )
 
 
 if __name__ == "__main__":

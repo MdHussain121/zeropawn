@@ -85,8 +85,7 @@ def main() -> int:
         print(f"[OK] {rec['id']}: sha256={sha[:16]}... step={info.step}")
 
     print(
-        f"\nRegistry: {verified} verified on disk, {len(missing)} missing, "
-        f"{len(failures)} failures"
+        f"\nRegistry: {verified} verified on disk, {len(missing)} missing, {len(failures)} failures"
     )
     for f_ in failures:
         print(f"FAIL: {f_}", file=sys.stderr)

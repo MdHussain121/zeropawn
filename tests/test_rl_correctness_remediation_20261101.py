@@ -26,7 +26,6 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-import torch
 
 torch = pytest.importorskip("torch")
 
@@ -106,7 +105,7 @@ def _synthetic_human_dataset(
     )
     planes = (np.random.rand(n, 19, 8, 8) < 0.5).astype(np.float32)
     planes.tofile(path / "planes.bin")
-    moves = (np.arange(n, dtype=np.int16) % 4672)
+    moves = np.arange(n, dtype=np.int16) % 4672
     moves.tofile(path / "moves.bin")
     outcomes = np.full(n, outcome, dtype=np.uint8)
     outcomes.tofile(path / "outcomes.bin")
@@ -152,9 +151,7 @@ def _stub_server():
         def __init__(self, *a, **k):
             # The orchestrator copies this state_dict into a real 12x128
             # trainer model, so the stub must carry the production shape.
-            self.model = ChessNet(
-                in_channels=19, num_filters=128, num_blocks=12, num_actions=4672
-            )
+            self.model = ChessNet(in_channels=19, num_filters=128, num_blocks=12, num_actions=4672)
             self.model_version = 0
 
     return _StubServer
@@ -411,7 +408,7 @@ def test_rl10_masked_human_rows_through_the_cache_path(tmp_path):
     # Inject a CPU human cache directly: outcomes are all the 255 sentinel.
     n = 32
     buf._human_cache_planes = (np.random.rand(n, 19, 8, 8) < 0.5).astype(np.float32)
-    buf._human_cache_moves = (np.arange(n, dtype=np.int64) % 4672)
+    buf._human_cache_moves = np.arange(n, dtype=np.int64) % 4672
     buf._human_cache_outcomes = np.full(n, 255, dtype=np.int64)
     buf._human_cache_size = n
     buf.human_dataset = object()  # non-None: the mix is requested
@@ -512,9 +509,7 @@ def test_rl13_stale_tactical_pool_size_yields_exact_batch(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_rl21_match_games_header_matches_rows_and_upgrades_header_only(
-    tmp_path, monkeypatch
-):
+def test_rl21_match_games_header_matches_rows_and_upgrades_header_only(tmp_path, monkeypatch):
     _install_orchestrator_stubs(monkeypatch)
     orch = run_phase4_rl.Phase4Orchestrator(**_orchestrator_kwargs(tmp_path, None))
     csv_path = Path(orch.match_games_csv_path)
@@ -599,9 +594,7 @@ def test_rl22_failed_push_does_not_record_last_push_step(tmp_path):
     assert trainer.push_failure_count == 1
 
 
-def test_rl22_serverless_disk_sync_failure_does_not_record_last_push_step(
-    tmp_path, monkeypatch
-):
+def test_rl22_serverless_disk_sync_failure_does_not_record_last_push_step(tmp_path, monkeypatch):
     """Audit S2-04 (RL-22 residual): with no direct server attached, a failed
     disk-sync write must count and raise like every other push failure — a
     server-less run must neither swallow the error nor record ``last_push_step``
@@ -776,7 +769,7 @@ def test_rl40_single_source_short_batch_is_shuffled_safely(tmp_path):
     n = 3
     buf.human_dataset = object()
     buf._human_cache_planes = (np.random.rand(n, 19, 8, 8) < 0.5).astype(np.float32)
-    buf._human_cache_moves = (np.arange(n, dtype=np.int64) % 4672)
+    buf._human_cache_moves = np.arange(n, dtype=np.int64) % 4672
     buf._human_cache_outcomes = np.full(n, 1, dtype=np.int64)
     buf._human_cache_size = n
     batch, _mix = buf.sample_batch_tensors(batch_size=8, step=0, device="cpu")

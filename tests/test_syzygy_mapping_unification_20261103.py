@@ -104,7 +104,12 @@ def test_remapped_values_stay_inside_trainer_domain_gate():
     """The RL trainer's DI-06 domain gate requires post-remap values in
     {0, 1, 2, 255}; SY-02 must keep satisfying it."""
     ids = np.asarray(remap_syzygy_outcomes(np.array(FIVE_CLASS_VECTOR, dtype=np.int64)))
-    assert set(np.unique(ids).tolist()) <= {OUTCOME_WIN, OUTCOME_DRAW, OUTCOME_LOSS, OUTCOME_UNAVAILABLE}
+    assert set(np.unique(ids).tolist()) <= {
+        OUTCOME_WIN,
+        OUTCOME_DRAW,
+        OUTCOME_LOSS,
+        OUTCOME_UNAVAILABLE,
+    }
 
 
 def test_retired_di06_mapping_is_not_resurrected():

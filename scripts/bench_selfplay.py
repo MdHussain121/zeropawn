@@ -200,8 +200,10 @@ def _resolve_bench_checkpoint(
         RuntimeError: when resolution fails and ``allow_random_init`` is not
             set. The message names the recovery actions.
     """
-    is_default = checkpoint_path is None or checkpoint_path == "default" or (
-        isinstance(checkpoint_path, str) and checkpoint_path.strip() == ""
+    is_default = (
+        checkpoint_path is None
+        or checkpoint_path == "default"
+        or (isinstance(checkpoint_path, str) and checkpoint_path.strip() == "")
     )
     if is_default:
         from python.cli.common import get_default_checkpoint_path

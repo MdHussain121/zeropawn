@@ -187,8 +187,13 @@ def _write_dataset_split(split_dir: Path, samples: List[Dict[str, Any]], split_n
 
     try:
         from python.data.dataset_validation import validate_split, write_receipt
-        has_build_rec = (split_dir / "build_record.json").is_file() or (split_dir.parent / "build_record.json").is_file()
-        rep = validate_split(split_dir, scan_planes="full", compute_hashes=True, check_build_record=has_build_rec)
+
+        has_build_rec = (split_dir / "build_record.json").is_file() or (
+            split_dir.parent / "build_record.json"
+        ).is_file()
+        rep = validate_split(
+            split_dir, scan_planes="full", compute_hashes=True, check_build_record=has_build_rec
+        )
         write_receipt(split_dir, {split_name: rep}, overall=rep.overall)
     except Exception as e:
         logger.debug("Receipt generation skipped for %s: %s", split_dir, e)

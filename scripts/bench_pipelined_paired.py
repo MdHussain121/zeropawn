@@ -27,6 +27,7 @@ def get_default_benchmark_checkpoint() -> str:
     """Resolve the canonical default checkpoint, or fall back safely (audit F-13/F-14)."""
     try:
         from python.cli.common import get_default_checkpoint_path
+
         return str(get_default_checkpoint_path())
     except Exception:
         fallback = REPO_ROOT / "models" / "checkpoints_baseline_20261031" / "best_model.pt"
@@ -55,18 +56,30 @@ def run_window(args, arm: str, pair_idx: int, root: Path) -> dict:
     cmd = [
         sys.executable,
         str(REPO_ROOT / "scripts" / "bench_selfplay.py"),
-        "--mode", "selfplay",
-        "--warmup-sec", str(args.warmup_sec),
-        "--counted-sec", str(args.counted_sec),
-        "--trials", "1",
-        "--concurrency", str(args.concurrency),
-        "--full-sims", str(args.full_sims),
-        "--fast-sims", str(args.fast_sims),
-        "--full-search-prob", "0.35",
-        "--max-wait-ms", "1.5",
-        "--checkpoint-path", args.checkpoint_path,
-        "--output-dir", str(out_dir),
-        "--base-seed", str(args.base_seed + pair_idx),
+        "--mode",
+        "selfplay",
+        "--warmup-sec",
+        str(args.warmup_sec),
+        "--counted-sec",
+        str(args.counted_sec),
+        "--trials",
+        "1",
+        "--concurrency",
+        str(args.concurrency),
+        "--full-sims",
+        str(args.full_sims),
+        "--fast-sims",
+        str(args.fast_sims),
+        "--full-search-prob",
+        "0.35",
+        "--max-wait-ms",
+        "1.5",
+        "--checkpoint-path",
+        args.checkpoint_path,
+        "--output-dir",
+        str(out_dir),
+        "--base-seed",
+        str(args.base_seed + pair_idx),
     ]
     if arm == "pipelined":
         cmd.append("--pipelined")
@@ -148,7 +161,9 @@ def main() -> int:
     print(f"sync:      median {s_med:.0f} sims/s  runs {[f'{x:.0f}' for x in sync_sps]}")
     print(f"pipelined: median {p_med:.0f} sims/s  runs {[f'{x:.0f}' for x in pipe_sps]}")
     print(f"per-pair deltas: {[f'{d:+.1f}%' for d in deltas]}")
-    print(f"median paired delta: {statistics.median(deltas):+.1f}%  (median-of-medians {(p_med/s_med-1)*100:+.1f}%)")
+    print(
+        f"median paired delta: {statistics.median(deltas):+.1f}%  (median-of-medians {(p_med / s_med - 1) * 100:+.1f}%)"
+    )
 
     report = {
         "recorded_at": datetime.now().isoformat(timespec="seconds"),

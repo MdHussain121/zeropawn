@@ -167,7 +167,11 @@ def _legacy_supervised_payload(
     assert payload.get("checkpoint_type") == "supervised"
     payload["run_metadata"] = ckpt10_shaped_ledger()
     torch.save(payload, path)
-    return path, {"geometry": dict(geometry), "step": step, "scheduler_current_step": scheduler_current_step}
+    return path, {
+        "geometry": dict(geometry),
+        "step": step,
+        "scheduler_current_step": scheduler_current_step,
+    }
 
 
 # ── Validator-level behavior ─────────────────────────────────────────────────
@@ -302,7 +306,11 @@ def test_weights_only_call_shape_accepts_ckpt10_shape(tmp_path):
     path, _ = _legacy_supervised_payload(tmp_path)
     ckpt = torch.load(path, map_location="cpu", weights_only=True)
     verdict = validate_checkpoint_schema(
-        ckpt, path=str(path), expected_family="supervised", allow_legacy=True, require_full_state=False
+        ckpt,
+        path=str(path),
+        expected_family="supervised",
+        allow_legacy=True,
+        require_full_state=False,
     )
     assert verdict.is_legacy is True
     warnings = validate_run_metadata(
@@ -345,12 +353,18 @@ def test_current_format_artifact_with_pre_schema_ledger_is_refused():
         "run_metadata": ckpt10_shaped_ledger(),  # pre-schema ledger in a new file
     }
     verdict = validate_checkpoint_schema(
-        ckpt, path="new.pt", expected_family="supervised", allow_legacy=True, require_full_state=False
+        ckpt,
+        path="new.pt",
+        expected_family="supervised",
+        allow_legacy=True,
+        require_full_state=False,
     )
     assert verdict.is_legacy is False  # current format...
     with pytest.raises(CheckpointSchemaError, match="pre-schema legacy ledger"):
         validate_run_metadata(
-            ckpt.get("run_metadata"), path="new.pt", required=not verdict.is_legacy  # ...required=True
+            ckpt.get("run_metadata"),
+            path="new.pt",
+            required=not verdict.is_legacy,  # ...required=True
         )
 
 
@@ -428,7 +442,9 @@ def test_supervised_resume_from_pre_schema_ckpt10_shape_adopts_state(
 ):
     """The previously-crashing operation: supervised --resume from a ckpt-10-shaped artifact."""
     ts = stubbed_supervised_env
-    fixture_path, fixture = _legacy_supervised_payload(tmp_path / "fixture", step=5, scheduler_current_step=5)
+    fixture_path, fixture = _legacy_supervised_payload(
+        tmp_path / "fixture", step=5, scheduler_current_step=5
+    )
 
     with caplog.at_level("WARNING", logger="python.train.train_supervised"):
         result = ts.train_supervised(
@@ -500,7 +516,9 @@ def test_repeated_resume_chain_from_pre_schema_origin(tmp_path, stubbed_supervis
     """Resume from the ckpt-10-shaped artifact, then resume AGAIN from the
     artifact the first resume produced (current-format ledger this time)."""
     ts = stubbed_supervised_env
-    fixture_path, _ = _legacy_supervised_payload(tmp_path / "fixture", step=5, scheduler_current_step=5)
+    fixture_path, _ = _legacy_supervised_payload(
+        tmp_path / "fixture", step=5, scheduler_current_step=5
+    )
 
     ts.train_supervised(
         train_dir=tmp_path / "train",
@@ -556,7 +574,9 @@ def test_repeated_resume_chain_from_pre_schema_origin(tmp_path, stubbed_supervis
 def test_weights_only_resume_from_pre_schema_ckpt10_shape(tmp_path, stubbed_supervised_env):
     """--resume ckpt-10 --resume-weights-only: weights adopted, fresh optimizer."""
     ts = stubbed_supervised_env
-    fixture_path, _ = _legacy_supervised_payload(tmp_path / "fixture", step=5, scheduler_current_step=5)
+    fixture_path, _ = _legacy_supervised_payload(
+        tmp_path / "fixture", step=5, scheduler_current_step=5
+    )
     fixture_state = torch.load(fixture_path, map_location="cpu", weights_only=True)["model"]
 
     ts.train_supervised(

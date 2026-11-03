@@ -444,9 +444,7 @@ class UCIEngine:
             logger.debug("Opening book initialization skipped: %s", e)
             self.opening_book = None
 
-    def search_and_respond(
-        self, sims: int, deadline_ms: Optional[float] = None
-    ) -> str:
+    def search_and_respond(self, sims: int, deadline_ms: Optional[float] = None) -> str:
         """Run MCTS search on current game state and output bestmove.
 
         ``deadline_ms`` is a monotonic-clock timestamp; when set, the search
@@ -609,9 +607,7 @@ class UCIEngine:
         # in-search abort predicate (the event object is already installed).
         self._stop_event = threading.Event()
         self._bestmove_emitted = False
-        thread = threading.Thread(
-            target=self._search_worker, args=(sims, deadline_ms), daemon=True
-        )
+        thread = threading.Thread(target=self._search_worker, args=(sims, deadline_ms), daemon=True)
         self._search_thread = thread
         thread.start()
 
@@ -821,9 +817,7 @@ class UCIEngine:
             # white to move is (N-1)*2 plies deep, black to move (N-1)*2 + 1.
             # This reflects the FEN's move number without inventing history;
             # replayed moves are added on top at book-lookup time.
-            base_ply = (new_game.full_move_number() - 1) * 2 + (
-                0 if new_game.side_to_move() else 1
-            )
+            base_ply = (new_game.full_move_number() - 1) * 2 + (0 if new_game.side_to_move() else 1)
 
             new_moves: List[str] = []
             if moves_idx is not None:

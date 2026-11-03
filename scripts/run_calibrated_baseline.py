@@ -66,9 +66,15 @@ def main() -> int:
     ap.add_argument("--smoke", action="store_true")
     ap.add_argument("--stockfish", default="tools/stockfish.exe")
     ap.add_argument("--book", default=None, help="Path to curated opening book JSON")
-    ap.add_argument("--no-book", action="store_true", default=True, help="Disable opening book (default: True)")
-    ap.add_argument("--enable-book", dest="no_book", action="store_false", help="Enable opening book")
-    ap.add_argument("--cap-policy", default="exclude", choices=["exclude", "draw", "loss", "adjudicate"])
+    ap.add_argument(
+        "--no-book", action="store_true", default=True, help="Disable opening book (default: True)"
+    )
+    ap.add_argument(
+        "--enable-book", dest="no_book", action="store_false", help="Enable opening book"
+    )
+    ap.add_argument(
+        "--cap-policy", default="exclude", choices=["exclude", "draw", "loss", "adjudicate"]
+    )
     args = ap.parse_args()
 
     n_open = 5 if args.smoke else args.openings

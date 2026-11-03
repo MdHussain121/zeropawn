@@ -19,7 +19,11 @@ import numpy as np
 import pytest
 import torch
 
-from python.model.checkpoint_registry import compute_sha256, verify_checkpoint_identity, write_registry
+from python.model.checkpoint_registry import (
+    compute_sha256,
+    verify_checkpoint_identity,
+    write_registry,
+)
 from python.model.checkpoint_schema import (
     RUN_STATE_COMPLETED,
     advance_run_state_inplace,
