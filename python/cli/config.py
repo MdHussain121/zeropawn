@@ -12,6 +12,21 @@ Precedence Rules (highest wins):
 
 Every configuration field records its type, allowed values, description,
 applicable workflows, runtime destination, and tracks provenance.
+
+SA1-01 / SA1-02 (2026-11-05 pre-push audit): config-file/preset/env values
+are pushed back onto the command's argparse namespace by
+``propagate_resolved_to_args`` with two guarantees:
+
+* Per-command namespace isolation — a record only reaches a command whose
+  base name is in the field's ``applicable_workflows`` (or which the field
+  explicitly lists in ``propagate_attrs``), so a flag name shared by two
+  parsers with different meanings (``--batch-size`` on train vs match) can
+  never leak a value across tiers.
+* Inversion-correct targeting — fields may pin per-command propagation
+  targets; ``eval.use_book`` writes the INVERTED boolean into the match
+  parser's ``no_book`` store_true dest (the handler derives
+  ``use_book = not args.no_book``) and never touches ``book`` (the
+  ``eval.book_path`` path dest).
 """
 
 from __future__ import annotations
@@ -70,6 +85,18 @@ class ConfigField:
     min_val: Optional[Union[int, float]] = None
     max_val: Optional[Union[int, float]] = None
     choices: Optional[List[str]] = None
+    # SA1-01/SA1-02 (2026-11-05): per-command propagation targets used by
+    # propagate_resolved_to_args() to write config-file/preset/env values back
+    # onto a command's argparse namespace.  Maps a command base name (or "*"
+    # fallback) to an ordered ((attr_name, transform), ...) tuple with
+    # transform in {"set", "negate"}; "negate" writes `not value` for
+    # store_true negation flags whose dest carries the inverted semantic
+    # (--no-book -> dest no_book).  An entry for a command also AUTHORIZES
+    # propagation onto that command even when the command is absent from
+    # applicable_workflows (which governs display and CLI-tier detection).
+    # When None, targets are derived from (alias, key, flag-derived dests)
+    # in registry order, all with the "set" transform.
+    propagate_attrs: Optional[Dict[str, Tuple[Tuple[str, str], ...]]] = None
 
     def validate(self, val: Any) -> Tuple[bool, Optional[str]]:
         """Validate value against type and constraints."""
@@ -153,6 +180,10 @@ CONFIG_REGISTRY: Dict[str, ConfigField] = {
         applicable_workflows=["train", "supervised", "match", "bench", "eval", "puzzles", "uci"],
         cli_flags=["--device"],
         runtime_dest="resolve_device() -> torch.device",
+        # SA1-02 companion: the `search` command consumes --device too but is
+        # absent from the display list (S5-01 test pins that absence), so the
+        # env/config propagation authorization is pinned here instead.
+        propagate_attrs={"search": (("device", "set"),)},
     ),
     "system.train_device": ConfigField(
         key="system.train_device",
@@ -227,6 +258,13 @@ CONFIG_REGISTRY: Dict[str, ConfigField] = {
         applicable_workflows=["train", "match", "eval", "puzzles", "bench", "models", "uci"],
         cli_flags=["--checkpoint", "-c", "--weights"],
         runtime_dest="load_engine_model()",
+        # `supervised` (weights-only warm start) and `search` consume the same
+        # model-checkpoint concept but are not on the display list; keep their
+        # env/config propagation authorized explicitly (SA1-02 companion).
+        propagate_attrs={
+            "supervised": (("checkpoint", "set"),),
+            "search": (("checkpoint", "set"),),
+        },
     ),
     # ── RL Training & Orchestration ──
     "training.max_hours": ConfigField(
@@ -252,6 +290,10 @@ CONFIG_REGISTRY: Dict[str, ConfigField] = {
         applicable_workflows=["train", "supervised", "finetune"],
         cli_flags=["--batch-size"],
         runtime_dest="RLTrainer.batch_size / SupervisedTrainer.batch_size",
+        # SA1-02: the --batch-size flag is ALSO the MCTS/match inference flag
+        # (mcts.batch_size).  Propagation stays restricted to the training
+        # workflows above, so a config/env training batch size can never leak
+        # into a match/uci/puzzles/search namespace.
     ),
     "training.micro_batch_size": ConfigField(
         key="training.micro_batch_size",
@@ -312,6 +354,9 @@ CONFIG_REGISTRY: Dict[str, ConfigField] = {
         applicable_workflows=["train", "supervised"],
         cli_flags=["--warmup-steps"],
         runtime_dest="WarmupCosineDecayScheduler.warmup_steps",
+        # `finetune` shares the scheduler warmup concept; keep its env/config
+        # propagation authorized (SA1-02 companion).
+        propagate_attrs={"finetune": (("warmup_steps", "set"),)},
     ),
     "training.epochs": ConfigField(
         key="training.epochs",
@@ -324,6 +369,9 @@ CONFIG_REGISTRY: Dict[str, ConfigField] = {
         applicable_workflows=["supervised", "finetune"],
         cli_flags=["--epochs"],
         runtime_dest="train_supervised(epochs=...)",
+        # `train --mode supervised` consumes the same epochs concept; keep its
+        # env/config propagation authorized (SA1-02 companion).
+        propagate_attrs={"train": (("epochs", "set"),)},
     ),
     "training.eval_interval_sec": ConfigField(
         key="training.eval_interval_sec",
@@ -500,6 +548,9 @@ CONFIG_REGISTRY: Dict[str, ConfigField] = {
         applicable_workflows=["train", "match", "eval", "puzzles", "uci"],
         cli_flags=["--c-puct"],
         runtime_dest="zeropawn_cpp.MCTSConfig.c_puct",
+        # `search` consumes --c-puct as well; keep its env/config propagation
+        # authorized explicitly (SA1-02 companion).
+        propagate_attrs={"search": (("c_puct", "set"),)},
     ),
     # NOTE (S3-03 remediation): the previously declared fields
     # mcts.dirichlet_alpha, mcts.dirichlet_weight, mcts.virtual_loss and
@@ -523,6 +574,10 @@ CONFIG_REGISTRY: Dict[str, ConfigField] = {
         applicable_workflows=["match", "uci", "puzzles", "search", "bench"],
         cli_flags=["--search-mode", "--mode"],
         runtime_dest="MatchRunner.search_mode / UCIEngine.search_mode",
+        # SA1-02 companion: NO propagate_attrs entry for `train` on purpose —
+        # the train parser's --mode selects rl|supervised, a DIFFERENT setting
+        # that the blind propagation loop used to corrupt with values like
+        # "batched".  mcts.search_mode must never reach it.
     ),
     "mcts.batch_size": ConfigField(
         key="mcts.batch_size",
@@ -533,6 +588,21 @@ CONFIG_REGISTRY: Dict[str, ConfigField] = {
         applicable_workflows=["match", "uci", "puzzles", "search", "bench"],
         cli_flags=["--batch-size", "--mcts-batch-size", "-b"],
         runtime_dest="resolve_batch_size()",
+        # SA1-02: --batch-size is shared with training.batch_size at the
+        # parser level, so the propagation target is command-dependent.  On
+        # match/search/uci the search-side dest IS `batch_size`; on `puzzles`
+        # the `batch_size` dest is the policy-eval batch (a DIFFERENT
+        # setting) and only the dedicated `mcts_batch_size` dest may receive
+        # this field.  No entry for train/supervised/finetune: the training
+        # side must never see this string-typed value.
+        propagate_attrs={
+            "match": (("batch_size", "set"),),
+            "search": (("batch_size", "set"),),
+            "uci": (("batch_size", "set"),),
+            "bench": (("batch_size", "set"),),
+            "puzzles": (("mcts_batch_size", "set"),),
+            "*": (("mcts_batch_size", "set"), ("batch_size", "set")),
+        },
     ),
     "mcts.reuse_tree": ConfigField(
         key="mcts.reuse_tree",
@@ -568,6 +638,14 @@ CONFIG_REGISTRY: Dict[str, ConfigField] = {
         applicable_workflows=["match", "eval", "puzzles"],
         cli_flags=["--mcts-sims", "--sims"],
         runtime_dest="MatchRunner.mcts_sims",
+        # `search`/`uci`/`bench` consume --sims with the same MCTS-budget
+        # semantic but are absent from the display list (the S5-01 test pins
+        # that absence); authorize their env/config propagation explicitly.
+        propagate_attrs={
+            "search": (("mcts_sims", "set"), ("sims", "set")),
+            "uci": (("mcts_sims", "set"), ("sims", "set")),
+            "bench": (("mcts_sims", "set"), ("sims", "set")),
+        },
     ),
     "eval.stockfish_nodes": ConfigField(
         key="eval.stockfish_nodes",
@@ -580,6 +658,10 @@ CONFIG_REGISTRY: Dict[str, ConfigField] = {
         applicable_workflows=["match", "eval"],
         cli_flags=["--stockfish-nodes"],
         runtime_dest="MatchRunner.stockfish_nodes",
+        # `train` runs periodic Stockfish baseline evals and exposes the same
+        # setting; keep its env/config propagation authorized (SA1-02
+        # companion).
+        propagate_attrs={"train": (("stockfish_nodes", "set"),)},
     ),
     "eval.stockfish_path": ConfigField(
         key="eval.stockfish_path",
@@ -620,8 +702,18 @@ CONFIG_REGISTRY: Dict[str, ConfigField] = {
         default=True,
         description="Enable curated opening book lookup during match evaluation and play",
         applicable_workflows=["match", "uci"],
-        cli_flags=["--book", "--no-book"],
+        # SA1-01: `--book` sets the book PATH and belongs to eval.book_path
+        # (claiming it here is what let the old blind propagation write a
+        # boolean into the path dest).  The only CLI toggle for book USAGE is
+        # the negated store_true flag.
+        cli_flags=["--no-book"],
         runtime_dest="MatchRunner.use_book / UCIEngine.use_book",
+        # The match parser encodes book usage as dest `no_book` (store_true)
+        # and its handler derives use_book = not args.no_book.  Propagation
+        # must therefore write the INVERTED boolean into `no_book` and never
+        # touch `book`.  (Config-file/env use_book=false -> args.no_book=True
+        # -> book disabled; use_book=true -> args.no_book=False -> enabled.)
+        propagate_attrs={"*": (("use_book", "set"), ("no_book", "negate"))},
     ),
     "eval.book_path": ConfigField(
         key="eval.book_path",
@@ -1020,6 +1112,139 @@ def validate_config_dict(data: Dict[str, Any]) -> List[str]:
 # ── The 5-Tier Configuration Resolution Engine ──
 
 
+# Sentinel: no candidate attribute carried a CLI-tier value.
+_NO_CLI_VALUE = object()
+
+
+def _candidate_attrs(cf: ConfigField) -> Tuple[Tuple[str, str], ...]:
+    """Ordered (attr_name, transform) candidates for a field's parser dests.
+
+    Alias and canonical key first, then each CLI flag's derived dest name in
+    registry order.  A flag spelled ``--no-*`` maps to a store_true negation
+    dest and carries the "negate" transform.
+    """
+    candidates: List[Tuple[str, str]] = []
+    seen: Set[str] = set()
+    for name in (cf.alias, cf.key):
+        if name not in seen:
+            seen.add(name)
+            candidates.append((name, "set"))
+    for flag in cf.cli_flags:
+        derived = flag.lstrip("-").replace("-", "_")
+        if derived in seen:
+            continue
+        seen.add(derived)
+        candidates.append((derived, "negate" if flag.startswith("--no-") else "set"))
+    return tuple(candidates)
+
+
+def _cli_tier_value(cf: ConfigField, cli_dict: Dict[str, Any]) -> Any:
+    """Extract the CLI-tier value for ``cf`` from a parsed-namespace dict.
+
+    Positive candidates resolve to the first non-None attribute (alias, key,
+    then flag-derived dests).  A matched negated store_true flag (``--no-*``)
+    contributes an INVERTED value: when its dest is truthy the field's CLI
+    value is False.  (SA1-01: ``match run --no-book`` encodes
+    eval.use_book=False; reading the truthy ``no_book`` dest directly would
+    claim book usage was ENABLED, and the pre-fix code masked this by
+    accident — it coerced eval.book_path's unrelated path string instead.)
+    Returns ``_NO_CLI_VALUE`` when no candidate carries a value.
+    """
+    negated_hit = False
+    for attr, transform in _candidate_attrs(cf):
+        if attr not in cli_dict or cli_dict[attr] is None:
+            continue
+        if transform == "negate":
+            if cli_dict[attr]:
+                negated_hit = True
+            continue
+        return cli_dict[attr]
+    if negated_hit:
+        return False
+    return _NO_CLI_VALUE
+
+
+def _canonical_command_name(parser: argparse.ArgumentParser, base: str) -> str:
+    """Map a typed command token (aliases like 'mcts', 'tr', 'p') to the
+    canonical registered subcommand name using the parser's own registry.
+
+    ``_SubParsersAction.choices`` maps every registered name (canonical and
+    aliases) to the same parser object in registration order, so the FIRST
+    name seen for a parser object is its canonical name.
+    """
+    for action in getattr(parser, "_actions", []):
+        if not isinstance(action, argparse._SubParsersAction):
+            continue
+        canonical_by_id: Dict[int, str] = {}
+        for name, sub in action.choices.items():
+            canonical_by_id.setdefault(id(sub), name)
+        target = action.choices.get(base)
+        if target is not None:
+            return canonical_by_id.get(id(target), base)
+    return base
+
+
+def _propagation_targets(cf: ConfigField, command_base: str) -> Tuple[Tuple[str, str], ...]:
+    """Resolve the (attr, transform) targets for writing ``cf`` onto a
+    command's namespace (SA1-01/SA1-02 per-command disambiguation)."""
+    if cf.propagate_attrs:
+        spec = cf.propagate_attrs.get(command_base)
+        if spec is None:
+            spec = cf.propagate_attrs.get("*")
+        if spec is not None:
+            return spec
+    return _candidate_attrs(cf)
+
+
+def propagate_resolved_to_args(
+    resolved: "ResolvedConfiguration",
+    args: argparse.Namespace,
+    parser: Optional[argparse.ArgumentParser] = None,
+) -> None:
+    """Propagate resolved non-CLI-tier values back onto the args namespace.
+
+    Only config_file / preset / env tier records are written: an explicitly
+    passed CLI flag already owns its attribute (S5-01).  Two guarantees were
+    added for SA1-01/SA1-02 (2026-11-05 pre-push audit):
+
+    * Per-command namespace isolation — a record only reaches a command whose
+      canonical base name is in the field's applicable_workflows list (or is
+      explicitly authorized via the field's propagate_attrs map).  A flag
+      name shared by two parsers with different meanings therefore cannot
+      leak a value across tiers: training.batch_size never reaches a
+      match/uci/puzzles/search namespace and mcts.batch_size never reaches
+      train/supervised/finetune.
+    * Inversion-correct targeting — fields may pin per-command targets;
+      eval.use_book writes the INVERTED boolean into the match parser's
+      ``no_book`` store_true dest and never touches ``book``.
+    """
+    command_base = (resolved.command_name or "").split()[0]
+    if command_base and parser is not None:
+        command_base = _canonical_command_name(parser, command_base)
+
+    for canon_key, rec in resolved.records.items():
+        if rec.source not in ("config_file", "preset", "env"):
+            continue
+        cf = rec.field_spec
+        if command_base:
+            workflows = cf.applicable_workflows
+            authorized = (
+                command_base in workflows
+                or "all" in workflows
+                or (cf.propagate_attrs is not None and command_base in cf.propagate_attrs)
+            )
+            if not authorized:
+                continue
+        effective = rec.effective_value
+        for attr, transform in _propagation_targets(cf, command_base):
+            if not hasattr(args, attr):
+                continue
+            if transform == "negate":
+                setattr(args, attr, not effective)
+            else:
+                setattr(args, attr, effective)
+
+
 def resolve_configuration(
     command_name: str = "",
     cli_args: Optional[Union[argparse.Namespace, Dict[str, Any]]] = None,
@@ -1116,7 +1341,9 @@ def resolve_configuration(
         # below those tiers (that demotion silently let env/file values
         # overwrite the parsed argument during main.py's propagation); the
         # list only governs whether the resolved-config display shows the row
-        # (see ResolvedConfiguration.summary_table).
+        # (see ResolvedConfiguration.summary_table) and whether a non-CLI-tier
+        # record is propagated back onto a command namespace (see
+        # propagate_resolved_to_args for the SA1-01/SA1-02 isolation rules).
         #
         # Detection is token-based on the raw argv: any ``--flag`` or
         # ``--flag=value`` token (aliases, short forms, and the derived
@@ -1136,26 +1363,20 @@ def resolve_configuration(
                     matched = True
 
             if matched:
-                for flag_key in [cf.alias, cf.key] + [
-                    f.lstrip("-").replace("-", "_") for f in cf.cli_flags
-                ]:
-                    if flag_key in cli_dict and cli_dict[flag_key] is not None:
-                        effective_val = cf.coerce(cli_dict[flag_key])
-                        source = "cli"
-                        is_override = True
-                        break
+                cli_val = _cli_tier_value(cf, cli_dict)
+                if cli_val is not _NO_CLI_VALUE:
+                    effective_val = cf.coerce(cli_val)
+                    source = "cli"
+                    is_override = True
         elif not is_cli_namespace and cli_dict:
             # Explicit dictionary passed directly (e.g. in tests).  Every
             # non-None entry is by construction an explicit value, so the same
             # S5-01 rule applies: no applicable_workflows demotion.
-            for flag_key in [cf.alias, cf.key] + [
-                f.lstrip("-").replace("-", "_") for f in cf.cli_flags
-            ]:
-                if flag_key in cli_dict and cli_dict[flag_key] is not None:
-                    effective_val = cf.coerce(cli_dict[flag_key])
-                    source = "cli"
-                    is_override = True
-                    break
+            cli_val = _cli_tier_value(cf, cli_dict)
+            if cli_val is not _NO_CLI_VALUE:
+                effective_val = cf.coerce(cli_val)
+                source = "cli"
+                is_override = True
 
         records[canon_key] = ProvenanceRecord(
             key=canon_key,

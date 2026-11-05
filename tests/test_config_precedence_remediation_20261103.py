@@ -80,15 +80,12 @@ def _resolve(argv, tmp_path, monkeypatch=None, env=None, preset_dict=None):
 
 
 def _propagate(resolved, args):
-    """Replicate main.py's parse→resolve→propagation loop verbatim."""
-    for canon_key, rec in resolved.records.items():
-        if rec.source in ("config_file", "preset", "env"):
-            attr_names = [rec.field_spec.alias, rec.field_spec.key]
-            for f in rec.field_spec.cli_flags:
-                attr_names.append(f.lstrip("-").replace("-", "_"))
-            for attr in attr_names:
-                if hasattr(args, attr):
-                    setattr(args, attr, rec.effective_value)
+    """Run main.py's REAL propagation loop (SA1-01/SA1-02 remediation moved
+    it out of main() into config.propagate_resolved_to_args; this helper now
+    delegates so the tests exercise the production code, not a stale copy)."""
+    from python.cli.config import propagate_resolved_to_args
+
+    propagate_resolved_to_args(resolved, args, parser=build_parser())
     return args
 
 

@@ -899,7 +899,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         # Always resolve configuration to honor strict 5-tier precedence:
         # Defaults < Config file < Presets < Environment variables < Explicit CLI overrides
-        from python.cli.config import resolve_configuration
+        from python.cli.config import propagate_resolved_to_args, resolve_configuration
 
         preset_dict = None
         preset_id = getattr(args, "preset", None)
@@ -929,15 +929,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
         setattr(args, "_resolved_config", resolved)
 
-        # Propagate resolved non-default values back to args attributes if not explicitly passed
-        for canon_key, rec in resolved.records.items():
-            if rec.source in ("config_file", "preset", "env"):
-                attr_names = [rec.field_spec.alias, rec.field_spec.key]
-                for f in rec.field_spec.cli_flags:
-                    attr_names.append(f.lstrip("-").replace("-", "_"))
-                for attr in attr_names:
-                    if hasattr(args, attr):
-                        setattr(args, attr, rec.effective_value)
+        # Propagate resolved non-default values back to args attributes if not
+        # explicitly passed.  SA1-01/SA1-02 (2026-11-05): the loop now lives in
+        # config.propagate_resolved_to_args and disambiguates per command — a
+        # shared flag name (--batch-size on train vs match, --book/--no-book on
+        # match) can no longer leak a value across tiers or invert a store_true
+        # negation dest.
+        propagate_resolved_to_args(resolved, args, parser=parser)
 
         if getattr(args, "print_resolved", False):
             table = resolved.summary_table()
