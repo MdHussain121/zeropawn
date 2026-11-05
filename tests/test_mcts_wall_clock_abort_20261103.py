@@ -25,6 +25,7 @@ zeropawn_cpp = pytest.importorskip("zeropawn_cpp")
 
 def _slow_uniform_evaluator(delay_sec: float):
     """Uniform-policy evaluator that burns `delay_sec` per call (CPU sleep)."""
+
     def evaluate(game):
         time.sleep(delay_sec)
         policy = np.full(4672, 1.0 / 4672, dtype=np.float32)

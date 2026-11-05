@@ -70,7 +70,7 @@
       "path": "models/checkpoints_rl/phase4_ckpt_v5_step997.pt",
       "sha256": "d8223ca150ee96c626e82bcea91f8f3fa37ea9b0502a2a3e0d2dd0c803dde547",
       "size_bytes": 69124715,
-      "status": "verified",
+      "status": "missing",
       "role": "rl_training_checkpoint",
       "step": 997,
       "model_version": 5,
@@ -82,7 +82,8 @@
       "designated_warm_start": false,
       "verified_at": "2026-10-29",
       "id": "ckpt-03-rl_training_checkpoint",
-      "file": "models/checkpoints_rl/phase4_ckpt_v5_step997.pt"
+      "file": "models/checkpoints_rl/phase4_ckpt_v5_step997.pt",
+      "removal_note_20261103": "Artifact removed from local deployment on 2026-11-03 by the same explicit operator-authorized cleanup that removed ckpt-10: the entire models/checkpoints_rl tree (66 MB of RL checkpoints and quarantines) was deleted, retaining only the GitHub release supervised models and the training data. The RL resume lineage via this healthy step-997 trainer state is no longer locally available; RL recovery is retraining (pipeline unblocked, fail-closed default resolution unaffected). Historical provenance and the remediation report (audit-reports/post-merge-production-readiness-20261103/) remain the record."
     },
     {
       "path": "models/checkpoints_rl/phase4_final_checkpoint.pt",

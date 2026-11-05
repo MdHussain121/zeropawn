@@ -62,7 +62,31 @@ def test_catalog_matches_registry_records():
         assert spec["designated"] == bool(rec.get("designated_warm_start"))
 
 
-def test_designated_baseline_is_local_only():
+def _patch_registry_with_designated_baseline(monkeypatch):
+    """Fixture: the registry state the S6-02 catalog logic was written against
+    — a designated, verified local baseline (ckpt-10) — injected so the
+    baseline-local-only contract is tested deterministically instead of
+    depending on the live registry's post-cleanup state (ckpt-10 was removed
+    from local deployment by the operator-authorized cleanup of 2026-11-03,
+    commit 7099019, and is status=missing there)."""
+    registry = {
+        "version": 1,
+        "checkpoints": [
+            {
+                "id": "ckpt-10-supervised_baseline_20261031",
+                "sha256": "01cead16a445f5a228e78ec85da6f1e68bcf1e6de15c1f3219edda3b544b74ef",
+                "status": "verified",
+                "designated_warm_start": True,
+                "path": "models/checkpoints_baseline_20261031/best_model.pt",
+                "file": "models/checkpoints_baseline_20261031/best_model.pt",
+            },
+        ],
+    }
+    monkeypatch.setattr("python.model.checkpoint_registry.load_registry", lambda _root: registry)
+
+
+def test_designated_baseline_is_local_only(monkeypatch):
+    _patch_registry_with_designated_baseline(monkeypatch)
     catalog = build_model_catalog()
     assert "baseline" in catalog, "designated baseline entry missing from catalog"
     spec = catalog["baseline"]
@@ -75,7 +99,8 @@ def test_designated_baseline_is_local_only():
     assert "filename" not in spec, "baseline must not expose a release filename"
 
 
-def test_baseline_download_refused(tmp_path: Path, capsys):
+def test_baseline_download_refused(tmp_path: Path, capsys, monkeypatch):
+    _patch_registry_with_designated_baseline(monkeypatch)
     args = argparse.Namespace(
         model="baseline",
         output=str(tmp_path / "baseline.pt"),

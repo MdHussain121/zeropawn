@@ -14,8 +14,10 @@ import torch
 
 from python.model.chess_net import ChessNet
 from python.model.checkpoint_registry import (
+    DefaultCheckpointError,
     WarmStartValidationError,
     compute_sha256,
+    resolve_default_checkpoint,
     validate_warm_start,
 )
 from python.selfplay.inference_server import InferenceServer
@@ -174,8 +176,11 @@ def test_inference_server_init_fails_closed_on_missing_checkpoint(tmp_path):
 
 
 def test_bundled_registry_matches_disk_when_artifacts_present():
-    """The committed registry's verified entries must match the actual artifacts
-    (skipped on checkouts without the gitignored models/ directory)."""
+    """Every committed registry entry marked verified must match the actual
+    artifact on disk, and when the registry certifies no verified artifact
+    (the post-cleanup state since commit 7099019) default checkpoint
+    resolution must fail closed instead of silently substituting.
+    (Skipped on checkouts without the gitignored models/ directory.)"""
     import os
 
     repo_root = Path(__file__).resolve().parent.parent
@@ -191,7 +196,6 @@ def test_bundled_registry_matches_disk_when_artifacts_present():
         (repo_root / "docs" / "checkpoint_registry.json").read_text(encoding="utf-8")
     )
     verified = [r for r in registry["checkpoints"] if r.get("status") == "verified"]
-    assert verified, "registry must certify at least one on-disk artifact"
     for rec in verified:
         f = artifact_root / rec["file"]
         assert f.is_file(), f"{rec['file']} registered verified but missing on disk"
@@ -199,6 +203,12 @@ def test_bundled_registry_matches_disk_when_artifacts_present():
         assert rec.get("designated_warm_start") is False or rec.get("designation_evidence"), (
             f"{rec['file']} designated without evidence"
         )
+    if not verified:
+        # Post-cleanup governance (2026-11-03): no verified artifact remains
+        # locally — the fail-closed resolver must refuse, naming the absent
+        # designated baseline, rather than fall back to a disqualified asset.
+        with pytest.raises(DefaultCheckpointError):
+            resolve_default_checkpoint(repo_root)
 
 
 def test_inference_server_empty_checkpoint_path_means_random_init():
