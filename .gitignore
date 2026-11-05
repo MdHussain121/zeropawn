@@ -3,8 +3,6 @@ build*/
 _build/
 cmake-build-*/
 tools/
-# ...but the re-runnable audit evidence tools are deliverables, not build output
-!audit-reports/**/tools/
 *.o
 *.obj
 *.exe
@@ -103,3 +101,10 @@ stdout*.txt
 stderr*.txt
 tests_output*.txt
 quarantine/
+
+# ── Agent Tooling Artifacts (not project code) ───────────────────────────────
+# graphify knowledge graph: outputs, semantic cache, saved Q&A, query tool
+graphify-out/
+.graphify_*
+# Mimosa security scanner state / reports / hook ledger
+.mimosa/
