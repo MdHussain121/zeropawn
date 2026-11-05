@@ -9,6 +9,11 @@ Key Invariants:
 - Supports both single-move cross-entropy and multi-move distribution targets.
 - Preserves existing checkpoints: NEVER overwrites models/checkpoints_scaled/best_model.pt.
 - Supports mixed data training (interleaving opening batches with general dataset batches).
+- Fail-closed resume provenance (audit SA3-03): the default resume checkpoint
+  is the registry-designated verified baseline (never a hardcoded superseded
+  artifact), the resume checkpoint's registry standing is validated before
+  any load, and every run persists a ``run_manifest.json`` that a later
+  resume must match (see python/train/opening_run_manifest.py).
 """
 
 from __future__ import annotations
@@ -32,6 +37,7 @@ if str(_repo_root) not in sys.path:
 
 import python  # noqa: F401  (ensures zeropawn_cpp + DLL paths)
 from python.cli.common import (
+    REPO_ROOT,
     load_engine_model,
     resolve_device,
     setup_environment,
@@ -193,7 +199,7 @@ def train_opening_policy(
     opening_data_dir: Union[str, Path],
     general_data_dir: Optional[Union[str, Path]] = None,
     extra_data_dirs: Optional[List[Union[str, Path]]] = None,
-    resume_checkpoint: Union[str, Path] = "models/checkpoints_scaled/best_model.pt",
+    resume_checkpoint: Optional[Union[str, Path]] = None,
     output_checkpoint_dir: Union[str, Path] = "models/checkpoints_opening",
     epochs: int = 3,
     batch_size: int = 64,
@@ -205,8 +211,22 @@ def train_opening_policy(
     seed: int = 42,
     device_name: Optional[str] = None,
     allow_uncertified_data: bool = False,
+    repo_root: Optional[Union[str, Path]] = None,
+    allow_superseded_resume: bool = False,
+    allow_resume_config_drift: bool = False,
+    allow_missing_run_manifest: bool = False,
 ) -> Dict[str, Any]:
-    """Execute opening policy fine-tuning."""
+    """Execute opening policy fine-tuning.
+
+    Resume provenance (audit SA3-03): ``resume_checkpoint=None`` resolves the
+    registry-designated, verified baseline fail-closed (no hardcoded fallback
+    artifact). An explicit path is the operator's choice, but its registry
+    standing is validated before any load, and resuming from an artifact a
+    previous opening-policy run produced requires that run's manifest to
+    match this invocation's dataset identity, architecture, and
+    configuration. The ``allow_*`` flags keep each refusal explicitly
+    reachable; every override is logged.
+    """
     setup_environment()
     random.seed(seed)
     np.random.seed(seed)
@@ -214,29 +234,82 @@ def train_opening_policy(
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
+    from python.train.opening_run_manifest import (
+        build_run_manifest,
+        finalize_run_manifest,
+        receipt_files_digest,
+        read_run_manifest,
+        require_manifest_for_resume_artifact,
+        resolve_resume_checkpoint,
+        validate_manifest_for_resume,
+        validate_resume_provenance,
+        write_run_manifest,
+    )
+
+    root = Path(repo_root) if repo_root is not None else Path(REPO_ROOT)
+
     device = torch.device(resolve_device(device_name))
     output_dir = Path(output_checkpoint_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # SA3-03 step 1: resolve the resume checkpoint to an exact identity and
+    # validate its registry standing BEFORE any load path runs. This closes
+    # the old hole where the raw torch.load fallback bypassed provenance.
+    provenance = resolve_resume_checkpoint(resume_checkpoint, repo_root=root)
+    # Both gates always run: an unregistered-path warning (or a superseded
+    # override) must not short-circuit the missing-manifest gate, or a
+    # manifest-less trainer-output artifact would resume without its own
+    # explicit --allow-missing-run-manifest override.
+    provenance_warnings = [
+        validate_resume_provenance(provenance, allow_superseded=allow_superseded_resume),
+        require_manifest_for_resume_artifact(
+            provenance.path, allow_missing=allow_missing_run_manifest
+        ),
+    ]
+    resume_warning = "; ".join(w for w in provenance_warnings if w) or None
+    if resume_warning:
+        logger.warning("%s", resume_warning)
+
     # Safety check: Never overwrite original baseline
-    res_path = Path(resume_checkpoint).resolve()
+    res_path = provenance.path
     target_best = (output_dir / "best_opening_model.pt").resolve()
     if target_best == res_path:
         raise ValueError("Output checkpoint cannot be identical to resume_checkpoint")
 
     # Load base model
     try:
-        model, model_info = load_engine_model(resume_checkpoint, device=str(device))
+        model, model_info = load_engine_model(provenance.path, device=str(device))
     except Exception as e:
         logger.info("Direct checkpoint load fallback: %s", e)
         model = ChessNet(num_blocks=num_blocks, num_filters=num_filters).to(device)
-        ckpt = torch.load(resume_checkpoint, map_location=device, weights_only=True)
+        ckpt = torch.load(provenance.path, map_location=device, weights_only=True)
         st = ckpt.get("model", ckpt)
         model.load_state_dict(st)
     model.train()
 
     # DI-21: Require validated dataset before consumption
     from python.data.dataset_validation import require_validated_dataset
+
+    # SA3-03 step 2: bind every consumed split's identity (resolved directory
+    # + tamper-evident validation-receipt digest) into the run manifest, so a
+    # later resume can prove it continues the same data.
+    dataset_identity: Dict[str, Dict[str, Any]] = {}
+
+    def _gated(split_dir: Path, label: str) -> None:
+        gate = require_validated_dataset(
+            split_dir,
+            allow_uncertified=allow_uncertified_data,
+            consumer=f"opening-policy-trainer[{label}]",
+        )
+        try:
+            resolved_dir = str(Path(split_dir).resolve())
+        except OSError:
+            resolved_dir = str(split_dir)
+        dataset_identity[label] = {
+            "data_dir": resolved_dir,
+            "certified": bool(gate.certified),
+            "receipt_files_digest": receipt_files_digest(gate.receipt),
+        }
 
     # Load opening datasets (and optional extra datasets such as tactical puzzles or Syzygy endgames)
     train_datasets = []
@@ -245,37 +318,21 @@ def train_opening_policy(
     op_train_dir = Path(opening_data_dir) / "train"
     op_val_dir = Path(opening_data_dir) / "val"
     if op_train_dir.is_dir():
-        require_validated_dataset(
-            op_train_dir,
-            allow_uncertified=allow_uncertified_data,
-            consumer="opening-policy-trainer[train]",
-        )
+        _gated(op_train_dir, "train")
         train_datasets.append(BinaryChessDataset(op_train_dir))
     if op_val_dir.is_dir():
-        require_validated_dataset(
-            op_val_dir,
-            allow_uncertified=allow_uncertified_data,
-            consumer="opening-policy-trainer[val]",
-        )
+        _gated(op_val_dir, "val")
         val_datasets.append(BinaryChessDataset(op_val_dir))
 
     if extra_data_dirs:
-        for ed in extra_data_dirs:
+        for ed_idx, ed in enumerate(extra_data_dirs):
             if ed:
                 ed_path = Path(ed)
                 if (ed_path / "train").is_dir():
-                    require_validated_dataset(
-                        ed_path / "train",
-                        allow_uncertified=allow_uncertified_data,
-                        consumer="opening-policy-trainer[extra_train]",
-                    )
+                    _gated(ed_path / "train", f"extra_train[{ed_idx}]")
                     train_datasets.append(BinaryChessDataset(ed_path / "train"))
                 if (ed_path / "val").is_dir():
-                    require_validated_dataset(
-                        ed_path / "val",
-                        allow_uncertified=allow_uncertified_data,
-                        consumer="opening-policy-trainer[extra_val]",
-                    )
+                    _gated(ed_path / "val", f"extra_val[{ed_idx}]")
                     val_datasets.append(BinaryChessDataset(ed_path / "val"))
 
     if not train_datasets:
@@ -357,17 +414,63 @@ def train_opening_policy(
     gen_train_loader = None
     if general_data_dir and (Path(general_data_dir) / "train").is_dir():
         gen_train_path = Path(general_data_dir) / "train"
-        require_validated_dataset(
-            gen_train_path,
-            allow_uncertified=allow_uncertified_data,
-            consumer="opening-policy-trainer[general_train]",
-        )
+        _gated(gen_train_path, "general_train")
         gen_train_ds = BinaryChessDataset(gen_train_path)
         gen_train_loader = DataLoader(
             gen_train_ds, batch_size=batch_size, shuffle=True, drop_last=True
         )
         gen_iter = iter(gen_train_loader)
         logger.info("Mixed training active: %d general samples loaded", len(gen_train_ds))
+
+    # SA3-03 step 3: resuming from a previous opening-policy run's artifact
+    # must match that run's manifest (dataset identity, architecture,
+    # configuration) before any output of this run is written.
+    config_record: Dict[str, Any] = {
+        "opening_data_dir": str(Path(opening_data_dir).resolve()),
+        "general_data_dir": (str(Path(general_data_dir).resolve()) if general_data_dir else None),
+        "extra_data_dirs": (
+            [str(Path(d).resolve()) for d in extra_data_dirs if d] if extra_data_dirs else []
+        ),
+        "epochs": epochs,
+        "batch_size": batch_size,
+        "lr": lr,
+        "mixing_ratio_opening": mixing_ratio_opening,
+        "max_steps": max_steps,
+        "num_blocks": num_blocks,
+        "num_filters": num_filters,
+        "seed": seed,
+        "device_name": device_name,
+        "allow_uncertified_data": allow_uncertified_data,
+    }
+    previous_manifest = read_run_manifest(provenance.path.parent)
+    if previous_manifest is not None:
+        manifest_warning = validate_manifest_for_resume(
+            previous_manifest,
+            manifest_dir=provenance.path.parent,
+            dataset_identity=dataset_identity,
+            config=config_record,
+            resume_provenance=provenance,
+            allow_config_drift=allow_resume_config_drift,
+            allow_superseded=allow_superseded_resume,
+        )
+        if manifest_warning:
+            logger.warning("%s", manifest_warning)
+
+    # SA3-03 step 4: persist the run manifest (status "running"). Written only
+    # after every validation gate passed, so an invalid resume never rotates
+    # away the previous run's provenance record.
+    from python.data.dataset_contract import detect_git_commit
+
+    manifest_path = write_run_manifest(
+        output_dir,
+        build_run_manifest(
+            config=config_record,
+            dataset_identity=dataset_identity,
+            resume_provenance=provenance,
+            output_dir=output_dir,
+            git_commit=detect_git_commit(),
+        ),
+    )
 
     # Optimizer & Scheduler
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
@@ -476,9 +579,15 @@ def train_opening_policy(
         final_path,
     )
 
+    # SA3-03 step 5: finalize the manifest with the SHA-256 of every
+    # generated checkpoint, so a later resume can prove the artifact it loads
+    # is the one this run produced.
+    finalize_run_manifest(output_dir)
+
     return {
         "final_step": step,
         "best_val_loss": best_val_loss,
         "best_checkpoint": str(target_best if target_best.exists() else final_path),
         "history": metrics_history,
+        "run_manifest": str(manifest_path),
     }

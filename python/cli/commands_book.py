@@ -111,14 +111,38 @@ def register_parser(subparsers: argparse._SubParsersAction) -> None:
     p_train.add_argument(
         "--resume",
         type=str,
-        default="models/checkpoints_scaled/best_model.pt",
-        help="Baseline checkpoint to load",
+        default=None,
+        help="Baseline checkpoint to load (default: the registry-designated verified "
+        "baseline, resolved fail-closed from docs/checkpoint_registry.json; a path "
+        "inside a previous book-train output directory is validated against that "
+        "run's run_manifest.json)",
     )
     p_train.add_argument(
         "--checkpoint-dir",
         type=str,
         default="models/checkpoints_opening",
         help="Output checkpoint directory",
+    )
+    p_train.add_argument(
+        "--allow-superseded-resume",
+        action="store_true",
+        help="Permit resuming from a checkpoint the registry marks quarantined/"
+        "disqualified/missing/hash-mismatched, or whose bytes no longer match the "
+        "previous run's manifest (logged override; default: refuse)",
+    )
+    p_train.add_argument(
+        "--allow-resume-config-drift",
+        action="store_true",
+        help="Permit resuming a previous book-train run with changed hyperparameters "
+        "(epochs/batch-size/lr/max-steps/seed/mixing) vs its run_manifest.json "
+        "(logged override; default: refuse)",
+    )
+    p_train.add_argument(
+        "--allow-missing-run-manifest",
+        action="store_true",
+        help="Permit resuming from an opening-policy output artifact whose directory "
+        "has no run_manifest.json (legacy interrupted run; logged override; "
+        "default: refuse)",
     )
     p_train.add_argument("--epochs", type=int, default=2, help="Training epochs")
     p_train.add_argument("--batch-size", type=int, default=64, help="Batch size")
@@ -360,6 +384,8 @@ def run_book_inspect(args: argparse.Namespace) -> int:
 
 def run_book_train(args: argparse.Namespace) -> int:
     setup_environment()
+    from python.model.checkpoint_registry import DefaultCheckpointError
+    from python.train.opening_run_manifest import OpeningRunProvenanceError
     from python.train.train_opening_policy import train_opening_policy
 
     print_banner("Training Supervised Policy (Openings + Endgames + Tactics)")
@@ -372,17 +398,30 @@ def run_book_train(args: argparse.Namespace) -> int:
         d for d in [getattr(args, "puzzle_data", None), getattr(args, "syzygy_data", None)] if d
     ]
 
-    res = train_opening_policy(
-        opening_data_dir=dataset_dir,
-        general_data_dir=getattr(args, "general_data", None),
-        extra_data_dirs=extra_dirs,
-        resume_checkpoint=args.resume,
-        output_checkpoint_dir=args.checkpoint_dir,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        lr=args.lr,
-        max_steps=args.max_steps,
-    )
+    try:
+        res = train_opening_policy(
+            opening_data_dir=dataset_dir,
+            general_data_dir=getattr(args, "general_data", None),
+            extra_data_dirs=extra_dirs,
+            resume_checkpoint=args.resume,
+            output_checkpoint_dir=args.checkpoint_dir,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            lr=args.lr,
+            max_steps=args.max_steps,
+            allow_superseded_resume=bool(getattr(args, "allow_superseded_resume", False)),
+            allow_resume_config_drift=bool(getattr(args, "allow_resume_config_drift", False)),
+            allow_missing_run_manifest=bool(getattr(args, "allow_missing_run_manifest", False)),
+        )
+    except DefaultCheckpointError as e:
+        print_error(f"No trustworthy default resume checkpoint: {e}")
+        return 1
+    except OpeningRunProvenanceError as e:
+        print_error(f"Resume provenance check failed: {e}")
+        return 1
+    except FileNotFoundError as e:
+        print_error(str(e))
+        return 1
     print_success(
         f"Supervised training complete! Best checkpoint: {res['best_checkpoint']} (val_loss={res['best_val_loss']:.4f})"
     )
