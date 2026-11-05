@@ -41,6 +41,26 @@ def test_benchmark_runner_dry_run(tmp_path):
     (``allow_random_init=True``). The old ``checkpoint_path=""`` relied on the
     removed silent fallback to an untrained model.
     """
+    # SA2-01 (2026-11-05 pre-push remediation): when the local production
+    # dataset carries a validation receipt that predates masks.bin receipt
+    # binding, the replay-buffer fail-closed gate refuses the dataset with a
+    # DatasetContractError naming the exact remedy. The gate itself is pinned
+    # by tests/test_sa2_remediation_20261106.py; this harness-mechanics dry
+    # run skips loudly instead of failing on the environment's receipt state
+    # (tests never modify anything under data/ or models/).
+    local_dataset = Path(__file__).resolve().parent.parent / "data" / "dataset_training"
+    masks_path = local_dataset / "train" / "masks.bin"
+    if masks_path.is_file():
+        from python.data.dataset_validation import verify_receipt
+
+        bound, reasons, _ = verify_receipt(local_dataset, deep=False)
+        if not bound and any("masks.bin" in r for r in reasons):
+            pytest.skip(
+                "local data/dataset_training receipt predates masks.bin receipt "
+                "binding, so the fail-closed replay-buffer gate refuses it "
+                "(DatasetContractError); re-run 'zeropawn data validate --dir "
+                "data/dataset_training --write-receipt' outside the test suite"
+            )
     runner = BenchmarkRunner(
         mode="selfplay",
         warmup_sec=1.0,
