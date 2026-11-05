@@ -1,11 +1,13 @@
 """Honest paired A/B of the UCI serial leaf callback: slow (FEN round-trip + .tolist())
 vs fast (direct encode + contiguous f32), interleaved in one process, fresh tree+MCTS
-per search. Usage: python tmp_bench/bench_uci_callback_ab.py
+per search. Usage: python scripts/bench_uci_callback_ab.py
 """
 
+import os
 import statistics
 import sys
 import time
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -15,7 +17,13 @@ sys.path.insert(0, ".")
 from python.uci.uci_engine import UCIEngine
 import zeropawn_cpp
 
-CKPT = r"C:/Users/<user>/Music/chess/chess-rl/models/checkpoints_scaled/latest_checkpoint.pt"
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+CKPT = Path(
+    os.environ.get(
+        "ZEROPAWN_CHECKPOINT",
+        _REPO_ROOT / "models" / "checkpoints_scaled" / "latest_checkpoint.pt",
+    )
+)
 SIMS = 400
 PAIRS = 6
 

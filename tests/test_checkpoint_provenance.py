@@ -184,9 +184,13 @@ def test_bundled_registry_matches_disk_when_artifacts_present():
     import os
 
     repo_root = Path(__file__).resolve().parent.parent
-    # Artifacts live in the main checkout; probe both the worktree and the
-    # canonical main worktree path.
-    candidates = [repo_root, Path(r"C:\Users\<user>\Music\chess\chess-rl")]
+    # Artifacts live in the gitignored models/ tree. On the canonical checkout
+    # repo_root itself contains it; for linked-worktree runs an alternate root
+    # can be supplied via ZEROPAWN_MAIN_WORKTREE instead of a hardcoded path.
+    candidates = [repo_root]
+    main_tree = os.environ.get("ZEROPAWN_MAIN_WORKTREE")
+    if main_tree:
+        candidates.append(Path(main_tree))
     artifact_root = next(
         (c for c in candidates if (c / "models" / "manifest.json").is_file()), None
     )
