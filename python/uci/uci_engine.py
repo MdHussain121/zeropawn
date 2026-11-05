@@ -4,6 +4,16 @@ Provides standard UCI protocol compliance for ZeroPawn to play against chess GUI
 such as Arena, Lucas Chess, cutechess-cli, and standard chess tools.
 
 Protocol notes (audits S8-01 / S8-02 / S5-09.4):
+- Readiness contract (pre-push audit 2026-11-05, Low): ``isready`` emits
+  ``readyok`` only after the initialization required by the configured mode
+  has completed. A designated-but-unavailable model is an initialization
+  failure surfaced as ``info string engine initialization failed: ...`` with
+  NO readyok (a later isready retries the load); a ``go`` on such an engine
+  fails closed with ``info string engine not initialized: ...`` and
+  ``bestmove 0000``. Model-less configurations (no checkpoint designated) are
+  ready immediately — readiness for them is book-only readiness. Any search
+  reply move is always legal; a 0-simulation or failed search announces its
+  legal fallback move via ``info string`` before ``bestmove``.
 - OwnBook short-circuit: when ``OwnBook`` is on and the current position is in
   book, ``go`` budgets (``nodes``/``movetime``/clock) are NOT honored — the
   reply is the book move, emitted instantly as ``info string book move <uci>``
@@ -113,6 +123,16 @@ class UCIEngine:
         )
         self.model: Optional[ChessNet] = None
         self.model_info: dict[str, Any] = {}
+        # Readiness contract (pre-push audit 2026-11-05, Low): ``isready``
+        # answers ``readyok`` only after the initialization required by the
+        # configured mode has completed. ``_model_required`` is True exactly
+        # when a checkpoint was designated (explicit path or a resolvable
+        # registry default); model-less configurations (``checkpoint_path``
+        # None, including the explicit "" signal) are ready by construction —
+        # for them readiness means book-only readiness.
+        self._model_required: bool = self.checkpoint_path is not None
+        self._init_done: bool = False
+        self._init_error: Optional[str] = None
 
         # MCTS Config
         self.mcts_config = self.zeropawn_cpp.MCTSConfig()
@@ -168,9 +188,18 @@ class UCIEngine:
         self._stall_timeout: float = 10.0
         self._search_stalled: bool = False
 
-        # Load model if checkpoint exists
-        if self.checkpoint_path and Path(self.checkpoint_path).is_file():
-            self._load_model(self.checkpoint_path)
+        # Required initialization (readiness contract): a designated model is
+        # loaded here; the OUTCOME — not the attempt — decides readiness. A
+        # missing or failing checkpoint keeps the engine NOT ready: isready
+        # retries the load (recovery path) and must not emit readyok until it
+        # succeeds. Model-less configurations are ready immediately.
+        if self._model_required:
+            if Path(self.checkpoint_path).is_file():
+                self._load_model(self.checkpoint_path)
+            else:
+                self._init_error = f"checkpoint file not found: {self.checkpoint_path}"
+        else:
+            self._init_done = True
 
     # ------------------------------------------------------------------
     # Time management (F-3)
@@ -357,6 +386,8 @@ class UCIEngine:
             self.model = new_model
             self.model_info = new_info
             self.checkpoint_path = path
+            self._init_done = True
+            self._init_error = None
             if hasattr(self, "mcts") and self.mcts is not None:
                 self.mcts.clear()
             self.last_engine_action = None
@@ -365,8 +396,51 @@ class UCIEngine:
             logger.info("Loaded checkpoint %s on %s", path, self.device)
             return True
         except Exception as e:
+            # Single-line reason for the stdout info string (readiness
+            # contract); full detail stays on the stderr log.
+            self._init_error = " ".join(f"{type(e).__name__}: {e}".split())
             logger.error("Failed to load model from %s: %s", path, e)
             return False
+
+    def _ensure_initialized(self, context: str) -> bool:
+        """Guarantee required initialization completed before readiness.
+
+        Readiness contract (pre-push audit 2026-11-05, Low): ``isready`` must
+        only announce ``readyok`` once the initialization required by the
+        configured mode has completed, and a failed initialization must NOT
+        announce readiness at all.
+
+        - Model-less configuration (no checkpoint designated): ready by
+          construction — book-only readiness.
+        - Designated model already loaded: ready.
+        - Designated model not loaded yet: attempt the (re)load now, guarded
+          by :meth:`_wait_for_running_search` (the load clears the MCTS tree,
+          F-03). On success the engine becomes ready; on failure the reason
+          is surfaced on stdout as an ``info string`` (logs go to stderr) and
+          False is returned so the caller withholds ``readyok`` / fails the
+          ``go`` request closed.
+
+        The caller (the single-threaded stdio read loop) blocks for the
+        duration of the load attempt, which is bounded by the load itself —
+        the loop never deadlocks: it keeps reading afterwards, and a later
+        ``isready`` retries the load (recovery path once the artifact is
+        fixed). Never raises.
+        """
+        if self._init_done:
+            return True
+        if not self._model_required:
+            self._init_done = True
+            return True
+        if not self._wait_for_running_search():
+            self._init_error = "previous search has not finished; model load refused"
+            return False
+        if self._load_model(self.checkpoint_path):
+            logger.info("Required model initialization completed (%s)", context)
+            return True
+        reason = self._init_error or "unknown initialization error"
+        sys.stdout.write(f"info string engine initialization failed: {reason}\n")
+        sys.stdout.flush()
+        return False
 
     def _eval_callback(self, game: Any) -> Tuple[Any, float]:
         if self.model is None:
@@ -516,8 +590,27 @@ class UCIEngine:
         )
         best_action = res.best_action
         best_move = self.game.action_to_string(best_action)
+        actual_sims = int(getattr(res, "new_simulations", sims))
+        self._last_actual_sims = actual_sims
+        # Honest fallback (pre-push audit 2026-11-05, Low): an abort at the
+        # wall-clock deadline can complete ZERO simulations (the native
+        # SearchResult then carries best_action = -1), and a non-empty tree
+        # can still fail to yield a legal root move. The reply move must be
+        # LEGAL no matter what, and the substitution must be announced —
+        # never a silent downgrade to the first legal move.
+        fallback_reason: Optional[str] = None
         if not best_move or best_move not in legal_moves:
-            best_move = legal_moves[0] if legal_moves else "0000"
+            fallback_move = legal_moves[0] if legal_moves else "0000"
+            if actual_sims == 0:
+                fallback_reason = (
+                    f"search aborted with 0 completed simulations; "
+                    f"legal fallback move {fallback_move}"
+                )
+            else:
+                fallback_reason = (
+                    f"search produced no legal root move; legal fallback move {fallback_move}"
+                )
+            best_move = fallback_move
             try:
                 best_action = self.game.string_to_action(best_move)
             except Exception:
@@ -526,8 +619,6 @@ class UCIEngine:
         self.last_engine_action = best_action
         self.last_engine_move = best_move
 
-        actual_sims = int(getattr(res, "new_simulations", sims))
-        self._last_actual_sims = actual_sims
         elapsed = time.perf_counter() - start
         self._update_rate_estimate(actual_sims, elapsed)
 
@@ -537,6 +628,8 @@ class UCIEngine:
         # search depth, so the previous hardcoded "depth 10" was false.
         # Report the honest constant depth 1 (consistent with the book-move
         # info line above); the completed simulation count travels as nodes.
+        if fallback_reason:
+            sys.stdout.write(f"info string {fallback_reason}\n")
         sys.stdout.write(f"info depth 1 nodes {actual_sims} score cp {score_cp} pv {best_move}\n")
         sys.stdout.write(f"bestmove {best_move}\n")
         sys.stdout.flush()
@@ -573,6 +666,13 @@ class UCIEngine:
                         fallback = legal[0]
                 except Exception:
                     pass
+                # Honest fallback (pre-push audit 2026-11-05, Low): a failed
+                # search must still answer (a GUI never waits forever), the
+                # move must be legal, and the degradation must be announced.
+                reason = " ".join(str(e).split()) or "unknown error"
+                sys.stdout.write(
+                    f"info string search failed: {reason}; legal fallback move {fallback}\n"
+                )
                 sys.stdout.write(f"bestmove {fallback}\n")
                 sys.stdout.flush()
                 self._bestmove_emitted = True
@@ -658,15 +758,18 @@ class UCIEngine:
             sys.stdout.flush()
 
         elif cmd == "isready":
-            if self.model is None and self.checkpoint_path:
-                # Model load clears the MCTS tree; refuse it while a search is
-                # still running (F-03). readyok is still emitted so the GUI's
-                # handshake proceeds; the engine simply stays without weights
-                # until a later isready.
-                if self._wait_for_running_search():
-                    self._load_model(self.checkpoint_path)
-                else:
-                    logger.error("Refusing model load during unfinished search (isready)")
+            # Readiness contract (pre-push audit 2026-11-05, Low): readyok is
+            # emitted only after the initialization required by the configured
+            # mode has completed. A designated model that fails to load keeps
+            # the engine NOT ready: the failure is surfaced as an info string
+            # (detail on the stderr log), NO readyok is emitted, and the read
+            # loop stays responsive — a later isready retries the load, so
+            # recovery works once the checkpoint artifact is fixed.
+            # Model-less configurations (no checkpoint designated) are ready
+            # here by construction: readiness for them is book-only readiness.
+            if not self._ensure_initialized("isready"):
+                logger.error("isready: initialization incomplete; readyok withheld")
+                return True
             sys.stdout.write("readyok\n")
             sys.stdout.flush()
 
@@ -892,6 +995,20 @@ class UCIEngine:
                     "Refusing 'go': previous search has not finished; its bestmove "
                     "will be emitted when it completes"
                 )
+                return True
+            # Readiness contract: a designated model must be initialized before
+            # a search runs (this also gives a GUI that skips isready one
+            # bounded recovery attempt). A failed initialization must never
+            # degrade into a silent uniform-policy search: fail closed with a
+            # clear info string and the UCI null move (0000 — the standard
+            # "no move" reply; no illegal move is ever produced). Model-less
+            # configurations search as documented (uniform-policy evaluator).
+            if not self._ensure_initialized("go"):
+                reason = self._init_error or "initialization incomplete"
+                logger.error("Refusing 'go': engine not initialized (%s)", reason)
+                sys.stdout.write(f"info string engine not initialized: {reason}\n")
+                sys.stdout.write("bestmove 0000\n")
+                sys.stdout.flush()
                 return True
             self._start_search(sims, deadline_ms)
 

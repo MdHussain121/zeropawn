@@ -28,7 +28,14 @@ def engine():
     # use_book=False keeps the stall scenario deterministic: an opening-book
     # answer for the start position would emit bestmove without ever reaching
     # the (blocked) evaluator.
-    eng = UCIEngine(checkpoint_path="nonexistent-checkpoint.pt", device="cpu", use_book=False)
+    # checkpoint_path="" is the explicit model-less configuration (S5-07):
+    # under the readiness contract (pre-push audit 2026-11-05) only an
+    # INITIALIZED engine may start a search — a designated-but-unavailable
+    # checkpoint fails 'go' closed (bestmove 0000) instead of silently
+    # searching a uniform-policy fallback, so the stall fixture must be a
+    # genuinely ready engine. Model-less is ready by construction and needs
+    # no artifacts.
+    eng = UCIEngine(checkpoint_path="", device="cpu", use_book=False)
     eng._stall_timeout = 0.2
     eng._stop_event = threading.Event()
     eng._search_thread = None
@@ -57,6 +64,13 @@ def _start_stalled_search(engine, release: threading.Event) -> threading.Event:
 
 
 def _finish_stalled_search(engine, release: threading.Event) -> None:
+    # 'stop' is the protocol-honest way to end a search: the in-search abort
+    # predicate fires once the evaluator returns. (Historically the old
+    # isready path stopped the search implicitly as a side effect of its
+    # model-load retry; under the corrected readiness contract an initialized
+    # engine's isready is non-intrusive — GUIs poll isready during searches —
+    # so the stop must be explicit.)
+    engine.handle_line("stop")
     release.set()
     thread = engine._search_thread
     thread.join(timeout=60)
@@ -132,14 +146,28 @@ def test_go_refused_while_search_stalled(engine):
     _finish_stalled_search(engine, release)
 
 
-def test_model_load_refused_while_search_stalled(engine):
+def test_isready_during_active_search_responsive_and_load_free(engine):
+    """An INITIALIZED engine answers isready during an active (stalled) search
+    without attempting any model load, without disturbing the running search,
+    and without blocking past the stall timeout.
+
+    Contract note (pre-push audit 2026-11-05): the not-ready side of isready
+    (designated-but-unavailable model -> NO readyok, error surfaced, loop
+    responsive) is pinned in tests/test_uci_cold_start_readiness.py. Here the
+    engine is model-less-by-design, i.e. initialized, so readyok is correct
+    and must NOT stop the search as a side effect (GUIs poll isready while a
+    search is running; the search is ended explicitly with 'stop' below).
+    """
     release = threading.Event()
     _start_stalled_search(engine, release)
 
     assert engine.model is None
     engine.checkpoint_path = "also-nonexistent.pt"
-    assert engine.handle_line("isready") is True  # still answers readyok
-    assert engine.model is None, "isready must not trigger a model load while stalled"
+    assert engine.handle_line("isready") is True
+    assert engine.model is None, "isready must not trigger a model load on an initialized engine"
+
+    # The isready above must have left the search untouched (non-intrusive).
+    assert engine._search_thread.is_alive(), "isready must not abort the running search"
 
     _finish_stalled_search(engine, release)
 
