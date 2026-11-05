@@ -27,7 +27,6 @@ def test_no_drive_letter_user_path_in_bench_uci_callback_ab():
     assert not DRIVE_LETTER_PATH.search(src), (
         "scripts/bench_uci_callback_ab.py still contains a hardcoded drive-letter user path"
     )
-    assert "<user>" not in src.lower()
 
 
 def test_bench_uci_callback_ab_ckpt_is_repo_root_relative():

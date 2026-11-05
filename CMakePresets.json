@@ -7,29 +7,62 @@
   },
   "configurePresets": [
     {
-      "name": "default",
-      "displayName": "Default Release",
-      "description": "Standard Release build in build/cmake-default",
-      "binaryDir": "${sourceDir}/build/cmake-default",
+      "name": "base",
+      "hidden": true,
       "generator": "Ninja",
-      "configurationTypes": ["Release"],
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release",
         "ZEROPAWN_BUILD_PYTHON": "ON",
         "ZEROPAWN_BUILD_TESTS": "ON"
       }
     },
     {
+      "name": "base-release",
+      "hidden": true,
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "base-debug",
+      "hidden": true,
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "default",
+      "displayName": "Default Release",
+      "description": "Standard Release build in build/cmake-default (Ninja is single-config: build type via CMAKE_BUILD_TYPE)",
+      "inherits": "base-release",
+      "binaryDir": "${sourceDir}/build/cmake-default"
+    },
+    {
+      "name": "default-debug",
+      "displayName": "Default Debug",
+      "description": "Standard Debug build in build/cmake-default-debug (Ninja is single-config: build type via CMAKE_BUILD_TYPE)",
+      "inherits": "base-debug",
+      "binaryDir": "${sourceDir}/build/cmake-default-debug"
+    },
+    {
       "name": "windows-mingw",
       "displayName": "Windows MinGW Release",
       "description": "Windows build using MinGW/GCC and Ninja in build/cmake-windows-mingw",
+      "inherits": "base-release",
       "binaryDir": "${sourceDir}/build/cmake-windows-mingw",
-      "generator": "Ninja",
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release",
-        "ZEROPAWN_BUILD_PYTHON": "ON",
-        "ZEROPAWN_BUILD_TESTS": "ON"
-      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    },
+    {
+      "name": "windows-mingw-debug",
+      "displayName": "Windows MinGW Debug",
+      "description": "Windows Debug build using MinGW/GCC and Ninja in build/cmake-windows-mingw-debug",
+      "inherits": "base-debug",
+      "binaryDir": "${sourceDir}/build/cmake-windows-mingw-debug",
       "condition": {
         "type": "equals",
         "lhs": "${hostSystemName}",
@@ -40,13 +73,20 @@
       "name": "linux-gcc",
       "displayName": "Linux GCC Release",
       "description": "Linux build using GCC and Ninja in build/cmake-linux-gcc",
+      "inherits": "base-release",
       "binaryDir": "${sourceDir}/build/cmake-linux-gcc",
-      "generator": "Ninja",
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release",
-        "ZEROPAWN_BUILD_PYTHON": "ON",
-        "ZEROPAWN_BUILD_TESTS": "ON"
-      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      }
+    },
+    {
+      "name": "linux-gcc-debug",
+      "displayName": "Linux GCC Debug",
+      "description": "Linux Debug build using GCC and Ninja in build/cmake-linux-gcc-debug",
+      "inherits": "base-debug",
+      "binaryDir": "${sourceDir}/build/cmake-linux-gcc-debug",
       "condition": {
         "type": "equals",
         "lhs": "${hostSystemName}",
@@ -57,13 +97,20 @@
       "name": "macos-clang",
       "displayName": "macOS Clang Release",
       "description": "macOS build using Apple Clang and Ninja in build/cmake-macos-clang",
+      "inherits": "base-release",
       "binaryDir": "${sourceDir}/build/cmake-macos-clang",
-      "generator": "Ninja",
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release",
-        "ZEROPAWN_BUILD_PYTHON": "ON",
-        "ZEROPAWN_BUILD_TESTS": "ON"
-      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      }
+    },
+    {
+      "name": "macos-clang-debug",
+      "displayName": "macOS Clang Debug",
+      "description": "macOS Debug build using Apple Clang and Ninja in build/cmake-macos-clang-debug",
+      "inherits": "base-debug",
+      "binaryDir": "${sourceDir}/build/cmake-macos-clang-debug",
       "condition": {
         "type": "equals",
         "lhs": "${hostSystemName}",
@@ -77,16 +124,62 @@
       "configurePreset": "default"
     },
     {
+      "name": "default-debug",
+      "configurePreset": "default-debug"
+    },
+    {
       "name": "windows-mingw",
-      "configurePreset": "windows-mingw"
+      "configurePreset": "windows-mingw",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    },
+    {
+      "name": "windows-mingw-debug",
+      "configurePreset": "windows-mingw-debug",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
     },
     {
       "name": "linux-gcc",
-      "configurePreset": "linux-gcc"
+      "configurePreset": "linux-gcc",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      }
+    },
+    {
+      "name": "linux-gcc-debug",
+      "configurePreset": "linux-gcc-debug",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      }
     },
     {
       "name": "macos-clang",
-      "configurePreset": "macos-clang"
+      "configurePreset": "macos-clang",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      }
+    },
+    {
+      "name": "macos-clang-debug",
+      "configurePreset": "macos-clang-debug",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      }
     }
   ],
   "testPresets": [
@@ -95,6 +188,85 @@
       "configurePreset": "default",
       "output": {
         "outputOnFailure": true
+      }
+    },
+    {
+      "name": "default-debug",
+      "configurePreset": "default-debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "windows-mingw",
+      "configurePreset": "windows-mingw",
+      "output": {
+        "outputOnFailure": true
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    },
+    {
+      "name": "windows-mingw-debug",
+      "configurePreset": "windows-mingw-debug",
+      "output": {
+        "outputOnFailure": true
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    },
+    {
+      "name": "linux-gcc",
+      "configurePreset": "linux-gcc",
+      "output": {
+        "outputOnFailure": true
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      }
+    },
+    {
+      "name": "linux-gcc-debug",
+      "configurePreset": "linux-gcc-debug",
+      "output": {
+        "outputOnFailure": true
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      }
+    },
+    {
+      "name": "macos-clang",
+      "configurePreset": "macos-clang",
+      "output": {
+        "outputOnFailure": true
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      }
+    },
+    {
+      "name": "macos-clang-debug",
+      "configurePreset": "macos-clang-debug",
+      "output": {
+        "outputOnFailure": true
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
       }
     }
   ]

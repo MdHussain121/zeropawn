@@ -12,7 +12,7 @@ Thank you for your interest in contributing to **ZeroPawn**! This document provi
   - **Windows:** MinGW-W64 GCC 11+ (recommended: WinLibs UCRT via `winget install BrechtSanders.WinLibs.POSIX.UCRT`) or MSVC 2019+
   - **Linux:** GCC 10+ or Clang 12+ (`sudo apt install build-essential ninja-build cmake`)
   - **macOS:** Xcode Command Line Tools (`xcode-select --install`)
-- **CMake & Ninja:** CMake 3.20+ and Ninja build system
+- **CMake & Ninja:** CMake 3.21+ (floor for CMakePresets v3) and Ninja build system
 - **Stockfish:** Recommended for evaluation benchmarks (placed in `tools/` or available on PATH)
 
 ### Quick Start: Environment Setup
@@ -41,14 +41,24 @@ pip install -e ".[dev]"
 You can build the pybind11 module (`zeropawn_cpp`) and unit tests using CMake presets or standard commands:
 
 ```bash
-# Using CMake Presets:
-cmake --preset default
+# Using CMake Presets (see `cmake --list-presets` for all options):
+cmake --preset default          # Release build in build/cmake-default
 cmake --build --preset default
+cmake --preset default-debug    # Debug build in build/cmake-default-debug
+
+# Platform presets (auto-selected by host OS): windows-mingw, linux-gcc,
+# macos-clang — each also has a `-debug` variant.
 
 # Or manual configuration:
 cmake -B build/cmake -S . -DCMAKE_BUILD_TYPE=Release
 cmake --build build/cmake --config Release -j
 ```
+
+All presets use the Ninja generator, which is single-config: the build
+configuration is selected with the `CMAKE_BUILD_TYPE` cache variable
+(`Release`/`Debug`), not with `CMAKE_CONFIGURATION_TYPES` or
+`configurationTypes` (the latter is only valid in build/test presets and only
+meaningful for multi-config generators such as Visual Studio or Xcode).
 
 ---
 

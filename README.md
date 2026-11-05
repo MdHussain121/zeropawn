@@ -87,6 +87,10 @@ ZeroPawn utilizes `pybind11` to link high-speed C++ search routines directly int
 cmake -B build/cmake -S . -DCMAKE_BUILD_TYPE=Release
 cmake --build build/cmake --config Release -j 4
 
+# Or via CMake presets (`cmake --list-presets` for all options):
+cmake --preset default
+cmake --build --preset default
+
 # Run native C++ unit test runner:
 ctest --test-dir build/cmake --output-on-failure
 ```
