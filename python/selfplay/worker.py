@@ -27,6 +27,7 @@ import numpy as np
 
 import zeropawn_cpp
 from python.constants import BOARD_SIZE, NUM_PLANES, STATE_SIZE
+from python.constants import FAST_SIMS, FULL_SEARCH_PROB, FULL_SIMS, RESIGN_THRESHOLD
 from python.selfplay.client import ShmInferenceClient
 from python.selfplay.ipc import SharedMemoryPool
 from python.selfplay.tb_adjudicate import TablebaseAdjudicator
@@ -658,9 +659,9 @@ class SelfPlayGame:
         game_type: str = "chess",
         full_search_sims: int = 400,
         fast_search_sims: int = 80,
-        full_search_prob: float = 0.25,
+        full_search_prob: float = FULL_SEARCH_PROB,
         temp_cutoff_range: Tuple[int, int] = (15, 30),
-        resign_threshold: float = -0.95,
+        resign_threshold: float = RESIGN_THRESHOLD,
         consecutive_resign_moves: int = 4,
         # Default 0.10 is the tool-path calibration (benchmarks/profiles); the
         # production RL launcher deliberately pins 0.15 (B2-era, as used for
@@ -1176,9 +1177,9 @@ class SelfPlayWorker:
         game_type: str = "chess",
         full_search_sims: int = 400,
         fast_search_sims: int = 80,
-        full_search_prob: float = 0.25,
+        full_search_prob: float = FULL_SEARCH_PROB,
         temp_cutoff_range: Tuple[int, int] = (15, 30),
-        resign_threshold: float = -0.95,
+        resign_threshold: float = RESIGN_THRESHOLD,
         consecutive_resign_moves: int = 4,
         disable_resign_prob: float = 0.10,
         dirichlet_alpha: float = 0.3,
@@ -1487,9 +1488,9 @@ def run_worker_process(
     stop_event: Any,
     num_concurrent_games: int = 24,
     game_type: str = "chess",
-    full_search_sims: int = 800,
-    fast_search_sims: int = 150,
-    full_search_prob: float = 0.25,
+    full_search_sims: int = FULL_SIMS,
+    fast_search_sims: int = FAST_SIMS,
+    full_search_prob: float = FULL_SEARCH_PROB,
 ) -> None:
     """LEGACY multiprocessing entry point for a self-play worker process.
 

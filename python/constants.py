@@ -9,7 +9,13 @@ PLANES_SHAPE: tuple = (NUM_PLANES, BOARD_SIZE, BOARD_SIZE)  # encode_state outpu
 
 FULL_SIMS: int = 800
 FAST_SIMS: int = 150
-FULL_P: float = 0.35
+# Probability that a self-play move uses the full-search simulation budget
+# (the fast-search budget is used otherwise). 0.25 is the live production
+# default (SelfPlayWorker / SelfPlayGame in python/selfplay/worker.py);
+# benchmark/measurement scripts deliberately override full_search_prob=0.35
+# for their runs. SA1-05: this replaces the dead, divergent FULL_P=0.35
+# constant (referenced nowhere; production default was 0.25).
+FULL_SEARCH_PROB: float = 0.25
 
 RESIGN_THRESHOLD: float = -0.95
 

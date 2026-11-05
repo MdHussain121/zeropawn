@@ -58,6 +58,7 @@ if os.path.isdir(_winlibs_bin):
         pass
 
 import zeropawn_cpp
+from python.constants import FAST_SIMS, FULL_SIMS
 from python.model.chess_net import ChessNet
 from python.selfplay.inference_server import InferenceServer
 from python.selfplay.client import DirectInferenceClient
@@ -320,8 +321,8 @@ class Phase4Orchestrator:
         tablebase_max_pieces: int = 5,
         min_buffer_fill: int = 0,
         max_reuse_ratio: int = 16,
-        full_search_sims: int = 800,
-        fast_search_sims: int = 150,
+        full_search_sims: int = FULL_SIMS,
+        fast_search_sims: int = FAST_SIMS,
         reset_buffer: bool = False,
         # ── Post-run janitor: delete junk that is not needed after a run ──
         cleanup_buffer_on_exit: bool = False,
@@ -333,6 +334,9 @@ class Phase4Orchestrator:
         # the worker's dispatcher uses its own default. The CLI flag is kept
         # for interface stability and documented as a no-op until a deliberate
         # decision threads it into the worker's aggregator (behavior change).
+        # SA5-02 remediation: the CLI/help surface (train parser, standalone
+        # launcher, config registry) now documents the no-op honestly, and
+        # tests/test_max_wait_ms_contract.py pins this contract.
         max_wait_ms: float = 1.0,
         watchdog_rss_gb: float = 7.5,
         watchdog_free_ram_gb: float = 2.0,
@@ -3269,7 +3273,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-wait-ms",
         type=float,
         default=1.0,
-        help="Dispatcher timeout in milliseconds (default: 1.0)",
+        help=(
+            "Accepted for compatibility; currently IGNORED (no-op — audit "
+            "S4-08/SA5-02): batch dispatch waiting is governed by the "
+            "self-play worker's internal dispatcher timeout (default: 1.0)"
+        ),
     )
     parser.add_argument(
         "--stockfish-nodes",

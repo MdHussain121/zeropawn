@@ -47,6 +47,7 @@ from rich.table import Table
 from python.cli.common import REPO_ROOT
 from python.cli.ui import COLOR_BORDER
 from python.common.env import get_env
+from python.constants import FAST_SIMS, FULL_SIMS
 from python.common.resource_paths import resolve_data_file
 
 # The config file the operator maintains lives in the repository checkout.
@@ -434,7 +435,7 @@ CONFIG_REGISTRY: Dict[str, ConfigField] = {
         key="selfplay.full_search_sims",
         alias="full_sims",
         type_name="int",
-        default=800,
+        default=FULL_SIMS,
         min_val=10,
         max_val=10000,
         description="MCTS simulation count for full playout cap moves (prob=0.25)",
@@ -446,7 +447,7 @@ CONFIG_REGISTRY: Dict[str, ConfigField] = {
         key="selfplay.fast_search_sims",
         alias="fast_sims",
         type_name="int",
-        default=150,
+        default=FAST_SIMS,
         min_val=1,
         max_val=2000,
         description="MCTS simulation count for fast playout cap moves (prob=0.75)",
@@ -521,10 +522,14 @@ CONFIG_REGISTRY: Dict[str, ConfigField] = {
         default=1.0,
         min_val=0.1,
         max_val=100.0,
-        description="Dispatcher aggregation timeout in milliseconds before flushing leaf batches",
+        description=(
+            "Accepted for compatibility; currently IGNORED (no-op — audit "
+            "S4-08/SA5-02).  Production batch dispatch waiting is governed by "
+            "the self-play worker's internal dispatcher timeout, not this flag"
+        ),
         applicable_workflows=["train", "bench"],
         cli_flags=["--max-wait-ms"],
-        runtime_dest="InferenceServer.max_wait_sec / WorkerBatchAggregator.max_wait_sec",
+        runtime_dest="Phase4Orchestrator.max_wait_ms (accepted, not consumed)",
     ),
     "selfplay.pipelined": ConfigField(
         key="selfplay.pipelined",

@@ -62,3 +62,37 @@ def test_wdl_convention_is_internally_consistent() -> None:
     # the scalar axis, three WDL labels.
     assert constants.WDL_WIN > constants.WDL_DRAW > constants.WDL_LOSS
     assert len(constants.WDL_LABELS) == 3
+
+
+def test_full_search_prob_is_the_live_worker_default() -> None:
+    # SA1-05: the old FULL_P=0.35 constant was dead (zero references) and
+    # divergent from the live 0.25 worker default. FULL_SEARCH_PROB now pins
+    # the live value and the worker classes derive their defaults from it.
+    import inspect
+
+    from python.selfplay.worker import SelfPlayGame, SelfPlayWorker
+
+    assert constants.FULL_SEARCH_PROB == 0.25
+    assert constants.RESIGN_THRESHOLD == -0.95
+    for cls in (SelfPlayGame, SelfPlayWorker):
+        params = inspect.signature(cls.__init__).parameters
+        assert params["full_search_prob"].default == constants.FULL_SEARCH_PROB
+        assert params["resign_threshold"].default == constants.RESIGN_THRESHOLD
+
+
+def test_dead_divergent_full_p_is_not_reintroduced() -> None:
+    # SA1-05 regression pin: FULL_P (0.35) diverged from the live 0.25
+    # default while being referenced by nothing. If this fails, the dead
+    # name is back — route any new constant through FULL_SEARCH_PROB.
+    assert not hasattr(constants, "FULL_P")
+
+
+def test_sim_counts_match_config_registry_defaults() -> None:
+    # SA1-05: FULL_SIMS / FAST_SIMS were defined-but-unreferenced; they are
+    # now the source of the canonical selfplay config defaults (800 / 150).
+    from python.cli.config import CONFIG_REGISTRY
+
+    assert constants.FULL_SIMS == 800
+    assert constants.FAST_SIMS == 150
+    assert CONFIG_REGISTRY["selfplay.full_search_sims"].default == constants.FULL_SIMS
+    assert CONFIG_REGISTRY["selfplay.fast_search_sims"].default == constants.FAST_SIMS

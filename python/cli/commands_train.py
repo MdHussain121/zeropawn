@@ -489,8 +489,12 @@ def register_parser(subparsers: argparse._SubParsersAction) -> None:
         default=1.0,
         metavar="MS",
         help=(
-            "Dispatcher timeout for the inference server in milliseconds.  "
-            "1.0 ms gives optimal throughput for 48-game concurrency (default: 1.0)"
+            "Accepted for compatibility; currently IGNORED (no-op).  Batch "
+            "dispatch waiting is governed by the self-play worker's internal "
+            "dispatcher timeout (WorkerBatchAggregator, 1.5 ms default); the "
+            "inference server's own wait knob is legacy-SHM-only (audit "
+            "S4-08/SA5-02).  The value is parsed and validated but has no "
+            "effect on runtime behavior (default: 1.0)"
         ),
     )
     parser.add_argument(
