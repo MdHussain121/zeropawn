@@ -42,7 +42,7 @@ from python.cli.common import (
     resolve_device,
     setup_environment,
 )
-from python.data.dataset import BinaryChessDataset, SourceAwareCombinedDataset
+from python.data.dataset import BinaryChessDataset, SourceAwareCombinedDataset, seed_worker
 from python.model.chess_net import ChessNet
 from python.train.train_supervised import (
     WarmupCosineScheduler,
@@ -233,6 +233,22 @@ def train_opening_policy(
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    # SA5-03: route the configured seed into the actual batch samplers instead
+    # of relying on wherever the process-global RNGs happen to be. Train-side
+    # loaders share one generator (reseeded to seed + epoch each epoch); the
+    # validation WeightedRandomSampler gets its own stream with a fixed offset
+    # so the val subsample order is stable across runs of the same seed and
+    # independent of how many draws the train loaders consumed.
+    loader_generator: Optional[torch.Generator] = None
+    val_sampler_generator: Optional[torch.Generator] = None
+    if seed is not None:
+        loader_generator = torch.Generator()
+        loader_generator.manual_seed(int(seed))
+        val_sampler_generator = torch.Generator()
+        val_sampler_generator.manual_seed(int(seed) + 1_000_003)
+    # Isolated mixing stream: the general-data mixing decision must not shift
+    # when any other consumer touches the global `random` module.
+    mixing_rng = random.Random(seed)
 
     from python.train.opening_run_manifest import (
         build_run_manifest,
@@ -391,12 +407,21 @@ def train_opening_policy(
             op_train_ds,
             batch_size=batch_size,
             shuffle=False,
-            sampler=op_train_ds.get_sampler(num_samples=total_train_samples),
+            sampler=op_train_ds.get_sampler(
+                num_samples=total_train_samples, generator=loader_generator
+            ),
+            generator=loader_generator,
+            worker_init_fn=seed_worker,
             drop_last=False,
         )
     else:
         op_train_loader = DataLoader(
-            op_train_ds, batch_size=batch_size, shuffle=True, drop_last=False
+            op_train_ds,
+            batch_size=batch_size,
+            shuffle=True,
+            generator=loader_generator,
+            worker_init_fn=seed_worker,
+            drop_last=False,
         )
 
     if isinstance(op_val_ds, SourceAwareCombinedDataset):
@@ -405,7 +430,9 @@ def train_opening_policy(
             op_val_ds,
             batch_size=batch_size,
             shuffle=False,
-            sampler=op_val_ds.get_sampler(num_samples=total_val_samples),
+            sampler=op_val_ds.get_sampler(
+                num_samples=total_val_samples, generator=val_sampler_generator
+            ),
         )
     else:
         op_val_loader = DataLoader(op_val_ds, batch_size=batch_size, shuffle=False)
@@ -417,7 +444,12 @@ def train_opening_policy(
         _gated(gen_train_path, "general_train")
         gen_train_ds = BinaryChessDataset(gen_train_path)
         gen_train_loader = DataLoader(
-            gen_train_ds, batch_size=batch_size, shuffle=True, drop_last=True
+            gen_train_ds,
+            batch_size=batch_size,
+            shuffle=True,
+            generator=loader_generator,
+            worker_init_fn=seed_worker,
+            drop_last=True,
         )
         gen_iter = iter(gen_train_loader)
         logger.info("Mixed training active: %d general samples loaded", len(gen_train_ds))
@@ -491,13 +523,17 @@ def train_opening_policy(
     metrics_history: List[Dict[str, Any]] = []
 
     for epoch in range(epochs):
+        # SA5-03: batch order for epoch e is a pure function of (seed, e);
+        # reseeding here keeps epochs decorrelated while staying reproducible.
+        if loader_generator is not None:
+            loader_generator.manual_seed(int(seed) + int(epoch))
         model.train()
         for batch in op_train_loader:
             if max_steps is not None and step >= max_steps:
                 break
 
             # If mixing with general data, occasionally train on general batch
-            if gen_train_loader and random.random() > mixing_ratio_opening:
+            if gen_train_loader and mixing_rng.random() > mixing_ratio_opening:
                 try:
                     mix_batch = next(gen_iter)
                 except StopIteration:
@@ -530,6 +566,11 @@ def train_opening_policy(
                 )
 
         # Validation at epoch end
+        if val_sampler_generator is not None:
+            # SA5-03: reset the val sampling stream each epoch so the val
+            # subsample (WeightedRandomSampler draws with replacement) is the
+            # same every epoch and across identical-seed runs.
+            val_sampler_generator.manual_seed(int(seed) + 1_000_003)
         val_res = evaluate_opening_policy(model, op_val_loader, device=device)
         logger.info(
             "Epoch %d Val: pol_loss=%.4f, top1=%.1f%%, top3=%.1f%%",

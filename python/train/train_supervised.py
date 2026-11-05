@@ -59,6 +59,7 @@ from python.data.dataset import (
     BinaryChessDataset,
     GpuResidentDataLoader,
     SourceAwareCombinedDataset,
+    seed_worker,
 )
 from python.model.chess_net import ChessNet
 
@@ -884,6 +885,16 @@ def train_supervised(
         torch.manual_seed(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
+    # SA5-03: the configured seed must reach the actual batch samplers, not
+    # just the process-global RNGs. This dedicated generator drives the train
+    # DataLoader's shuffle / WeightedRandomSampler and the worker base seeds;
+    # the training loop reseeds it to seed + epoch at the top of every epoch,
+    # making batch order a pure function of (seed, epoch) that a resumed run
+    # reproduces from the checkpointed epoch counter without extra state.
+    loader_generator: Optional[torch.Generator] = None
+    if seed is not None:
+        loader_generator = torch.Generator()
+        loader_generator.manual_seed(int(seed))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Resolve effective batch size and gradient accumulation steps
@@ -940,7 +951,10 @@ def train_supervised(
     if tactics_dir is not None and tactics_ratio is None:
         tactics_ratio = 0.3
 
-    if gpu_resident and device.type == "cuda":
+    # SA5-03: captured here (not re-derived with isinstance in the loop) so
+    # test doubles that substitute the loader classes stay valid.
+    using_gpu_resident_loader = gpu_resident and device.type == "cuda"
+    if using_gpu_resident_loader:
         print("Using high-throughput GpuResidentDataLoader (maximizing GPU VRAM over CPU/RAM)...")
         train_loader = GpuResidentDataLoader(
             train_dir,
@@ -952,6 +966,7 @@ def train_supervised(
             max_gpu_memory_gb=gpu_budget_gb,
             tactics_ratio=tactics_ratio,
             tactics_dir=tactics_dir,
+            seed=seed,
         )
         val_loader = GpuResidentDataLoader(
             val_dir,
@@ -988,7 +1003,9 @@ def train_supervised(
             # Epoch length under ratio sampling stays the historical master-row
             # count (audit SLQ-19: __len__ now reports the combined total, so
             # the sampler's num_samples must be passed explicitly).
-            sampler = combined_ds.get_sampler(num_samples=combined_ds.n_master)
+            sampler = combined_ds.get_sampler(
+                num_samples=combined_ds.n_master, generator=loader_generator
+            )
             train_ds = combined_ds
             shuffle = False
         elif tactics_ratio is not None:
@@ -1021,7 +1038,10 @@ def train_supervised(
                     w_master = (1.0 - tactics_ratio) / n_master
                     weights = np.where(tactics_mask, w_tactics, w_master).astype(np.float32)
                     sampler = WeightedRandomSampler(
-                        torch.from_numpy(weights), num_samples=len(train_ds), replacement=True
+                        torch.from_numpy(weights),
+                        num_samples=len(train_ds),
+                        replacement=True,
+                        generator=loader_generator,
                     )
                     shuffle = False
 
@@ -1031,6 +1051,12 @@ def train_supervised(
             shuffle=shuffle if sampler is None else False,
             sampler=sampler,
             num_workers=num_workers,
+            # SA5-03: the seeded generator (None when the run is unseeded)
+            # drives both the shuffle permutation and the per-worker base
+            # seeds; seed_worker propagates those base seeds into each
+            # worker's numpy/python RNGs.
+            generator=loader_generator,
+            worker_init_fn=seed_worker,
             pin_memory=(device.type == "cuda"),
             drop_last=True,
         )
@@ -1396,6 +1422,17 @@ def train_supervised(
 
     try:
         for epoch in range(start_epoch, epochs):
+            # SA5-03: align the batch-sampling stream with the epoch. Batch
+            # order for epoch e is a pure function of (seed, e), so a resumed
+            # run (start_epoch restored from the checkpoint) replays the exact
+            # order an uninterrupted run used for the same epochs — no extra
+            # sampler state needs to travel in the checkpoint. When seed is
+            # None both calls are inert and the historical unseeded behavior
+            # is preserved.
+            if loader_generator is not None:
+                loader_generator.manual_seed(int(seed) + int(epoch))
+            if using_gpu_resident_loader:
+                train_loader.set_epoch(epoch)
             model.train()
             epoch_samples = 0
             t_epoch_start = time.time()

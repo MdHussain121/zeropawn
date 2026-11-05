@@ -150,6 +150,12 @@ def register_parser(subparsers: argparse._SubParsersAction) -> None:
     p_train.add_argument(
         "--max-steps", type=int, default=100, help="Max training steps (for bounded runs)"
     )
+    p_train.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="RNG seed for reproducible batch sampling (SA5-03; default 42).",
+    )
     p_train.set_defaults(func=run_book_train)
 
     # 5. Build Puzzles Dataset
@@ -412,6 +418,7 @@ def run_book_train(args: argparse.Namespace) -> int:
             allow_superseded_resume=bool(getattr(args, "allow_superseded_resume", False)),
             allow_resume_config_drift=bool(getattr(args, "allow_resume_config_drift", False)),
             allow_missing_run_manifest=bool(getattr(args, "allow_missing_run_manifest", False)),
+            seed=getattr(args, "seed", None),
         )
     except DefaultCheckpointError as e:
         print_error(f"No trustworthy default resume checkpoint: {e}")

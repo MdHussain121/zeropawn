@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Optional, Union, Dict, Any
@@ -475,7 +476,9 @@ class SourceAwareCombinedDataset(Dataset):
         return sample
 
     def get_sampler(
-        self, num_samples: Optional[int] = None
+        self,
+        num_samples: Optional[int] = None,
+        generator: Optional[torch.Generator] = None,
     ) -> torch.utils.data.WeightedRandomSampler:
         n_samples = num_samples if num_samples is not None else len(self)
         weights = np.zeros(self.total_len, dtype=np.float32)
@@ -499,7 +502,28 @@ class SourceAwareCombinedDataset(Dataset):
             weights=torch.from_numpy(weights),
             num_samples=n_samples,
             replacement=True,
+            # SA5-03: an explicitly seeded generator makes the sampled index
+            # stream reproducible; without one the sampler draws its seed from
+            # the process-global torch RNG at every epoch, so batch order
+            # silently depends on whatever else consumed that RNG.
+            generator=generator,
         )
+
+
+def seed_worker(worker_id: int) -> None:
+    """DataLoader ``worker_init_fn``: derive each worker's RNGs from the loader.
+
+    PyTorch already gives every worker a distinct base seed derived from the
+    DataLoader's generator (``torch.initial_seed()`` == base seed + worker_id).
+    This propagates it into numpy's and python's process-global RNGs, so any
+    random transform inside ``Dataset.__getitem__`` is reproducible whenever
+    the loader itself was constructed with a seeded generator (audit SA5-03).
+    Without this, worker-side randomness is seeded from entropy and identical
+    runs diverge inside the workers even when the batch index order matches.
+    """
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
 class GpuResidentDataLoader:
@@ -529,6 +553,7 @@ class GpuResidentDataLoader:
         chunk_size: int = 100_000,
         tactics_ratio: Optional[float] = None,
         tactics_dir: Optional[Union[str, Path]] = None,
+        seed: Optional[int] = None,
     ) -> None:
         self.data_dir = Path(data_dir)
         self.batch_size = batch_size
@@ -539,6 +564,14 @@ class GpuResidentDataLoader:
         self.tactics_dir = Path(tactics_dir) if tactics_dir is not None else None
         self.tactics_ratio = tactics_ratio
         self.sample_weights: Optional[torch.Tensor] = None
+        # SA5-03: when a seed is given, the per-epoch permutation / weighted
+        # draw is a pure function of (seed, epoch) — call set_epoch() each
+        # training epoch so a resumed run reproduces the uninterrupted run's
+        # batch order from the checkpointed epoch counter alone. With
+        # seed=None the historical behavior (draw from the process-global
+        # torch RNG on the loader's device) is preserved.
+        self.seed = seed
+        self._epoch = 0
         self._memmaps: list[np.memmap] = []
 
         meta_path = self.data_dir / "metadata.json"
@@ -1046,13 +1079,41 @@ class GpuResidentDataLoader:
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         self.close()
 
+    def set_epoch(self, epoch: int) -> None:
+        """Align the seeded sampling stream with the training epoch (SA5-03).
+
+        Batch order for epoch ``e`` is derived from ``seed + e``; the trainer
+        calls this at the top of every epoch so an interrupted-then-resumed
+        run reconstructs the same order from the checkpointed epoch counter.
+        A no-op for the permutation itself when ``seed`` is None.
+        """
+        self._epoch = int(epoch)
+
     def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
         if self.sample_weights is not None:
-            perm = torch.multinomial(
-                self.sample_weights, num_samples=self.num_samples, replacement=True
-            )
+            if self.seed is not None:
+                gen = torch.Generator()
+                gen.manual_seed(int(self.seed) + int(self._epoch))
+                weights_cpu = self.sample_weights.detach().to("cpu")
+                perm = torch.multinomial(
+                    weights_cpu, num_samples=self.num_samples, replacement=True, generator=gen
+                ).to(self.device)
+            else:
+                perm = torch.multinomial(
+                    self.sample_weights, num_samples=self.num_samples, replacement=True
+                )
         elif self.shuffle:
-            perm = torch.randperm(self.num_samples, device=self.device)
+            if self.seed is None:
+                perm = torch.randperm(self.num_samples, device=self.device)
+            else:
+                # SA5-03: explicit CPU generator — the permutation is
+                # reproducible across identical runs and does not depend on
+                # whichever consumer touched the global torch (or CUDA) RNG
+                # last. CPU-side generation then a device transfer keeps the
+                # order identical between CUDA and CPU runs of the same seed.
+                gen = torch.Generator()
+                gen.manual_seed(int(self.seed) + int(self._epoch))
+                perm = torch.randperm(self.num_samples, generator=gen).to(self.device)
         else:
             perm = torch.arange(self.num_samples, device=self.device)
 

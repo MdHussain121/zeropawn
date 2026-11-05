@@ -310,6 +310,9 @@ def run_finetune(args: argparse.Namespace) -> int:
         gpu_budget_gb=args.gpu_budget,
         num_workers=int(args.workers),
         gpu_resident=not args.no_gpu_resident,
+        # SA5-03: forward the seed so the finetune path's DataLoader shuffle
+        # and weighted samplers are reproducible (None = unseeded, legacy).
+        seed=getattr(args, "seed", None),
         artifact_ticket=ticket,
     )
     print_success(
@@ -363,6 +366,12 @@ def register_parser(subparsers) -> None:
         default=0,
         help="DataLoader workers for CPU loading (default 0: "
         "Windows-safe; >0 often breaks on spawn).",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="RNG seed for reproducible batch sampling (SA5-03; default: None = unseeded).",
     )
     parser.add_argument(
         "--gpu-budget",

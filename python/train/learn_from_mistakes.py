@@ -281,12 +281,18 @@ class MistakeLearner:
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
         batch_size: int = 64,
         value_loss_weight: float = 0.0,
+        seed: Optional[int] = None,
     ) -> None:
         self.model = model
         self.device = device
         self.batch_size = batch_size
         self.value_loss_weight = value_loss_weight
         self.model.to(self.device)
+        # SA5-03: replay/anchor sampling and sample shuffling draw from this
+        # dedicated generator. A caller-provided seed (CLI --seed) makes the
+        # sampled training composition reproducible; without one the
+        # generator is entropy-seeded, matching the legacy unseeded behavior.
+        self._sample_rng: np.random.Generator = np.random.default_rng(seed)
 
         if optimizer is None:
             self.optimizer = torch.optim.AdamW(
@@ -378,7 +384,7 @@ class MistakeLearner:
             num_replay = min(
                 len(self.cumulative_replay_buffer), max(1, int(len(mistakes) * replay_ratio))
             )
-            replay_indices = np.random.choice(
+            replay_indices = self._sample_rng.choice(
                 len(self.cumulative_replay_buffer), size=num_replay, replace=False
             )
             training_mistakes.extend([self.cumulative_replay_buffer[i] for i in replay_indices])
@@ -396,14 +402,14 @@ class MistakeLearner:
             num_anchors = int(round(num_mistakes * anchor_ratio / (1.0 - anchor_ratio)))
             if num_anchors > 0:
                 replace = num_anchors > len(self.anchor_buffer)
-                anchor_indices = np.random.choice(
+                anchor_indices = self._sample_rng.choice(
                     len(self.anchor_buffer), size=num_anchors, replace=replace
                 )
                 for idx in anchor_indices:
                     training_samples.append(self.anchor_buffer[idx])
 
         # Interleave mistakes and anchors
-        np.random.shuffle(training_samples)
+        self._sample_rng.shuffle(training_samples)
 
         planes_np = np.stack([m[0] for m in training_samples])
         targets_np = np.array([m[1] for m in training_samples], dtype=np.int64)

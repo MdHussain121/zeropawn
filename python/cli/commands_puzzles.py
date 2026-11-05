@@ -415,6 +415,9 @@ def run_learn_puzzles(args: argparse.Namespace) -> int:
         lr=args.lr,
         device=device,
         batch_size=args.batch_size,
+        # SA5-03: the existing --seed flag (audit §10, D10) previously never
+        # reached the mistake/replay/anchor sampling inside MistakeLearner.
+        seed=getattr(args, "seed", None),
     )
 
     # ── Autonomous Curriculum Mode ──────────────────────────────────────────

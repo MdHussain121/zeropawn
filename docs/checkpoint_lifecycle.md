@@ -113,6 +113,34 @@ is **never** accepted as a full resume, and a weights-only file inside
 (`is_resumable_candidate`): a candidate must carry SGD state or declare
 `checkpoint_type: rl`.
 
+### 3.1 Sampling determinism and resume (SA5-03)
+
+What a `--seed` guarantees, stated honestly:
+
+- **Batch order.** For supervised training (disk-backed and `GpuResidentDataLoader`
+  paths), the opening-policy loaders, and the mistake-learner replay/anchor
+  sampling, the configured seed drives the actual samplers: a dedicated
+  `torch.Generator` (or `np.random.Generator`) is handed to the DataLoader
+  shuffle / `WeightedRandomSampler` / GPU-loader permutation, and
+  `seed_worker` derives each DataLoader worker's numpy/python RNGs from the
+  loader generator. Same seed + same platform + same worker count ⇒ the same
+  batch order; the order for epoch `e` is a pure function of `(seed, e)`.
+  Unseeded runs (`seed=None`) remain entropy-driven and are **not**
+  reproducible.
+- **Resume.** Batch order after resume matches the uninterrupted run for the
+  same epochs because it is derived from `(seed, epoch)` and the epoch counter
+  is checkpointed — no extra sampler state travels in the artifact. Limitation:
+  an epoch interrupted mid-way restarts from its beginning on resume; the
+  samples of the partially consumed epoch are not re-delivered.
+- **RL.** Selfplay workers are per-game seeded (`master_seed + game_id`), the
+  replay-cache composition uses a persistent seeded generator (RL-25), and
+  resume restores torch/numpy/python/CUDA RNG states — see
+  `python/selfplay/replay_buffer.py` header notes.
+- **What is NOT guaranteed.** Model update numerics: cuDNN benchmark mode,
+  TF32/bfloat16 reductions, fused-optimizer atomics, and GPU scheduling make
+  bitwise-identical weights across runs or machines impossible to promise.
+  This contract covers batch order and sampling composition only.
+
 ## 4. The checkpoint ↔ replay-buffer contract (CKP-05)
 
 A replay buffer is identified by a **generation** (`buffer_generation` in
