@@ -905,7 +905,12 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description="Convert filtered PGN to binary memmap dataset.")
     parser.add_argument("--pgn", type=str, required=True, help="Input filtered PGN file.")
-    parser.add_argument("--output-dir", type=str, default="data/dataset", help="Output directory.")
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        required=True,
+        help="Output directory (explicit target required; no production default, audit SA2-02).",
+    )
     parser.add_argument("--max-games", type=int, default=None, help="Max games to process.")
     parser.add_argument(
         "--force",
@@ -933,11 +938,7 @@ def main() -> None:
         parameters_table(
             [
                 ("pgn", args.pgn, "user"),
-                (
-                    "output_dir",
-                    args.output_dir,
-                    "user" if args.output_dir != "data/dataset" else "default",
-                ),
+                ("output_dir", args.output_dir, "user"),
                 ("max_games", args.max_games, "user" if args.max_games is not None else "default"),
                 ("force", args.force, "user" if args.force else "default"),
             ]

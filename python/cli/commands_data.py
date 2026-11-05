@@ -77,9 +77,24 @@ def register_parser(subparsers: argparse._SubParsersAction) -> None:
     )
     p_bd.add_argument("--pgn", type=str, default=default_build_pgn, help="Input PGN")
     p_bd.add_argument(
-        "--output-dir", type=str, default="data/dataset_training", help="Output directory"
+        "--output-dir",
+        type=str,
+        default=None,
+        help=(
+            "Output dataset directory. REQUIRED: there is deliberately no default target "
+            "(audit SA2-02) — omitting it fails closed instead of building into "
+            "data/dataset_training."
+        ),
     )
     p_bd.add_argument("--max-games", type=int, default=5000, help="Maximum games to convert")
+    p_bd.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Explicitly allow building into an existing non-empty dataset directory "
+            "(replaces its contents; certification-aware guard refuses without this flag)."
+        ),
+    )
     p_bd.set_defaults(func=run_build_dataset)
 
     # 4. Build Tactics
@@ -461,7 +476,91 @@ def run_filter(args: argparse.Namespace) -> int:
     )
 
 
+def _existing_dataset_entries(target: Path) -> list[str]:
+    """Enumerate entries of an existing target directory (empty list if absent/empty)."""
+    if not target.is_dir():
+        return []
+    return sorted(p.name for p in target.iterdir())
+
+
+def _describe_existing_dataset(target: Path) -> str:
+    """Human description of an existing target: certified / built / unknown contents."""
+    from python.data.dataset_contract import RECEIPT_NAME
+
+    receipt_path = target / RECEIPT_NAME
+    if not receipt_path.is_file() and (target / "train").is_dir():
+        receipt_path = target / "train" / RECEIPT_NAME
+    if receipt_path.is_file():
+        try:
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            overall = receipt.get("overall")
+            if overall == "pass":
+                return "a CERTIFIED dataset (validation receipt overall=pass)"
+            return f"a validated dataset (validation receipt overall={overall!r})"
+        except Exception:
+            return "a dataset with a malformed validation receipt"
+    if (target / "metadata.json").is_file() or any(target.glob("*.bin")):
+        return "a built dataset (array artifacts present, no validation receipt)"
+    return f"a non-empty directory ({len(_existing_dataset_entries(target))} entries)"
+
+
 def run_build_dataset(args: argparse.Namespace) -> int:
+    # ── Fail-closed target selection (audit SA2-02) ──────────────────────
+    # There is deliberately no default output directory: an invocation without
+    # an explicit target must not touch persistent datasets. Resolve relative
+    # targets the way the build subprocess will (its cwd is always REPO_ROOT).
+    raw_target = getattr(args, "output_dir", None)
+    if raw_target is None or not str(raw_target).strip():
+        console.print(
+            Panel(
+                "[bold red]No output directory specified.[/bold red]\n\n"
+                "'data build' has no default target (audit SA2-02 fail-closed): it will not\n"
+                "build into data/dataset_training or any other persistent directory implicitly.\n\n"
+                "[bold cyan]Re-run with an explicit target:[/bold cyan]\n"
+                "  [yellow]zeropawn data build --pgn <input.pgn> --output-dir <staging_dir>[/yellow]\n"
+                "  e.g. a scratch/staging path; pass --force to replace an existing dataset.",
+                title="[bold red]Missing Output Directory[/bold red]",
+                box=box.ROUNDED,
+                border_style="red",
+            )
+        )
+        return 1
+
+    target = Path(str(raw_target))
+    if not target.is_absolute():
+        target = REPO_ROOT / target
+
+    # Never a repository-critical directory, even with --force.
+    protected = {REPO_ROOT, REPO_ROOT / "data", REPO_ROOT / "models"}
+    if target.resolve() in {p.resolve() for p in protected}:
+        console.print(
+            f"[bold red]Refusing to build into {target}: repository-critical directory.[/bold red]"
+        )
+        return 1
+
+    if target.exists() and not target.is_dir():
+        console.print(f"[bold red]Output target exists and is not a directory: {target}[/bold red]")
+        return 1
+
+    existing_entries = _existing_dataset_entries(target)
+    if existing_entries and not getattr(args, "force", False):
+        console.print(
+            Panel(
+                f"[bold red]Refusing to build into {target}:[/bold red] it already contains "
+                f"{_describe_existing_dataset(target)}.\n\n"
+                "Building here would replace existing dataset bytes. Re-run with\n"
+                "[yellow]--force[/yellow] to explicitly overwrite, or choose a fresh staging "
+                "directory for [cyan]--output-dir[/cyan].\n\n"
+                "[dim]Certification note: overwriting a certified dataset invalidates its "
+                "validation receipt; re-run 'zeropawn data validate --dir <dataset> "
+                "--write-receipt' after any rebuild.[/dim]",
+                title="[bold red]Existing Dataset Target[/bold red]",
+                box=box.ROUNDED,
+                border_style="red",
+            )
+        )
+        return 1
+
     pgn_str = getattr(args, "pgn", None) or "data/filtered_2200.pgn"
     pgn_path = Path(pgn_str)
     if not pgn_path.is_absolute() and not pgn_path.exists() and (REPO_ROOT / pgn_path).exists():
@@ -528,6 +627,8 @@ def run_build_dataset(args: argparse.Namespace) -> int:
         "--max-games",
         str(args.max_games),
     ]
+    if getattr(args, "force", False):
+        cmd_args.append("--force")
     return execute_script_with_monitoring(
         script_rel_path="python/data/build_dataset.py",
         args=cmd_args,

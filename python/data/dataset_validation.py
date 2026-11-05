@@ -38,6 +38,7 @@ import numpy as np
 from python.constants import NUM_ACTIONS
 from python.data.dataset_contract import (
     BUILD_RECORD_NAME,
+    MASK_PACKED_BYTES,
     OUTCOME_UNAVAILABLE,
     PLANES_SHAPE,
     RECEIPT_NAME,
@@ -55,6 +56,10 @@ from python.data.dataset_contract import (
 
 logger = logging.getLogger(__name__)
 
+# masks.bin (audit SA2-01) is an optional array like the target files: when
+# present it is size-checked, hashed, and bound into the validation receipt.
+# Unlike the other optional arrays its exact byte size is not itemsize-scaled,
+# so _array_num_bytes special-cases it.
 ARRAY_DTYPES: Dict[str, str] = {
     "planes.bin": "float32",
     "moves.bin": "int16",
@@ -64,6 +69,7 @@ ARRAY_DTYPES: Dict[str, str] = {
     "value_targets.bin": "float32",
     "policy_targets.bin": "float32",
     "dtz_targets.bin": "float32",
+    "masks.bin": "uint8",
 }
 
 
@@ -75,6 +81,8 @@ def _array_num_bytes(name: str, num_samples: int) -> int:
         return num_samples * 3 * itemsize
     if name == "policy_targets.bin":
         return num_samples * NUM_ACTIONS * itemsize
+    if name == "masks.bin":
+        return num_samples * MASK_PACKED_BYTES
     return num_samples * itemsize
 
 
@@ -280,6 +288,23 @@ def validate_split(
                     f"{actual} bytes",
                 )
             )
+
+    # Audit SA2-01: masks.bin is part of the validated artifact set whenever
+    # it is present (the loaders consume it by existence). A split whose
+    # metadata declares a packed legal-mask stream but whose masks.bin is
+    # missing would be loaded silently WITHOUT legal masks — fail closed here.
+    if (
+        "dtype_masks" in metadata or "masks_shape" in metadata
+    ) and "masks.bin" not in present_files:
+        report.add(
+            CheckResult(
+                "masks_stream_present",
+                CheckStatus.FAIL,
+                "metadata declares a packed legal-mask stream (dtype_masks/masks_shape) "
+                f"but masks.bin is missing from {split_dir}; consumers would silently "
+                "train without legal-action masking",
+            )
+        )
 
     if report.has_fail:
         # Structural failures invalidate every later layer.
@@ -862,6 +887,25 @@ def verify_receipt(
         else:
             if not identity_matches(path, ident):
                 reasons.append(f"{rel}: size/mtime differ from receipt (stale receipt)")
+
+    # Audit SA2-01: a masks stream on disk must be cryptographically bound by
+    # the receipt. A receipt that predates mask binding (or one written from a
+    # validation that never hashed masks.bin) must not certify a dataset whose
+    # loaders would consume an unverified masks.bin.
+    if dataset_dir.name in ("train", "val", "test"):
+        mask_candidates = [(dataset_dir / "masks.bin", f"{dataset_dir.name}/masks.bin")]
+    else:
+        mask_candidates = [
+            (dataset_dir / split / "masks.bin", f"{split}/masks.bin")
+            for split in ("train", "val", "test")
+        ]
+    for mask_path, mask_rel in mask_candidates:
+        if mask_path.is_file() and mask_rel not in files:
+            reasons.append(
+                f"{mask_rel}: masks.bin present on disk but not bound by this receipt "
+                "(stale receipt predating masks.bin binding); re-run "
+                "'zeropawn data validate --dir <dataset> --write-receipt'"
+            )
     return (not reasons), reasons, receipt
 
 

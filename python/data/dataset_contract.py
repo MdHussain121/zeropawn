@@ -48,6 +48,12 @@ OUTCOME_SYZYGY_DOMAIN: tuple[int, ...] = (0, 1, 2, 3, 4)
 # mirrors cpp/include/zeropawn/encoder.hpp via python/constants.py.
 PLANES_SHAPE = (NUM_PLANES, BOARD_SIZE, BOARD_SIZE)
 
+# Schema-2 datasets store the per-position legal-action mask bit-packed over
+# NUM_ACTIONS actions (audit SA2-01: masks.bin is part of the validated and
+# receipt-bound artifact set, so its exact layout lives in this contract).
+# num_samples rows x MASK_PACKED_BYTES uint8 = the exact size of masks.bin.
+MASK_PACKED_BYTES: int = (NUM_ACTIONS + 7) // 8  # 4672 actions -> 584 bytes
+
 # Required array files for every split (the loader memory-maps all of these
 # unconditionally, so any loadable dataset must carry them).
 REQUIRED_ARRAYS: tuple[str, ...] = (

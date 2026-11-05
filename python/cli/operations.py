@@ -374,8 +374,9 @@ OPERATIONS_REGISTRY: List[OperationDef] = [
                 "output_dir",
                 "--output-dir",
                 "path",
-                "data/dataset_training",
-                "Destination dataset directory",
+                None,
+                "Destination dataset directory (explicit target required; audit SA2-02 "
+                "fail-closed: no default production directory)",
             ),
             OpArgument(
                 "max_games",

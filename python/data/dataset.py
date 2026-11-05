@@ -18,6 +18,7 @@ from torch.utils.data import Dataset
 
 from python.constants import NUM_ACTIONS, PLANES_SHAPE
 from python.data.build_dataset import OUTCOME_UNAVAILABLE
+from python.data.dataset_contract import MASK_PACKED_BYTES
 
 logger = logging.getLogger(__name__)
 
@@ -166,8 +167,6 @@ def _outcome_to_value_target(outcomes: np.ndarray, is_syzygy: bool) -> np.ndarra
 # Bit shift for big-endian (np.packbits-default) unpacking: bit i of a byte is
 # (byte >> shift[i]) & 1 with shift = [7, 6, ..., 0].
 _PACK_SHIFT = torch.tensor([7, 6, 5, 4, 3, 2, 1, 0], dtype=torch.uint8)
-
-MASK_PACKED_BYTES = (NUM_ACTIONS + 7) // 8  # 584 — NUM_ACTIONS actions bit-packed
 
 
 def decode_packed_masks(packed: torch.Tensor) -> torch.Tensor:
