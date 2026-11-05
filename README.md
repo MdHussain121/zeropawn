@@ -145,15 +145,15 @@ When launching the engine without an explicit `--checkpoint` flag, ZeroPawn reso
 > **zero** optimizer updates: it resumed from the supervised checkpoint (step 6000, an
 > inherited supervised counter — not RL progress), produced 96,067 self-play records
 > with the un-updated model (all records `model_version == 1`), and crashed on its first
-> optimizer step (`KeyError: 'momentum'`). See
-> `docs/audits/phase4-rl-momentum-keyerror-root-cause-v2.md`. The self-play/replay
+> optimizer step (`KeyError: 'momentum'`). The self-play/replay
 > infrastructure was subsequently remediated (2026-10-31); a future RL campaign is a
 > separate, separately-authorized step.
 >
 > RL resume is additionally fail-closed: only checkpoints with an RL type stamp (or
 > positive SGD optimizer-state evidence), an SGD-compatible optimizer, no quarantine
 > entry, and a buffer snapshot consistent with the live replay buffer are eligible for
-> automatic resume. See `audit-reports/selfplay-replay-integrity-remediation/`.
+> automatic resume. The gating rules are implemented in `python/train/train_rl.py`
+> and pinned by `tests/test_checkpoint_provenance.py`.
 
 ### Downloading Official Checkpoints
 

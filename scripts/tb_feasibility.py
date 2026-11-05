@@ -225,17 +225,35 @@ if __name__ == "__main__":
         )
     )
     try:
-        analyze_dataset(
-            str(_repo_root / "docs" / "resignfix" / "diagnosis_games.jsonl"),
-            "Warm-Start best_model.pt",
-            max_games=fargs.max_games,
-        )
-        analyze_dataset(
-            str(_repo_root / "docs" / "resignfix" / "diagnosis_step850_games.jsonl"),
-            "Step-850 phase4_final_checkpoint.pt",
-            max_games=fargs.max_games,
-        )
-        emit_report(summary_block("SUCCESS", time.time() - t0, 0, 0))
+        diagnostic_datasets = [
+            (
+                _repo_root / "docs" / "resignfix" / "diagnosis_games.jsonl",
+                "Warm-Start best_model.pt",
+            ),
+            (
+                _repo_root / "docs" / "resignfix" / "diagnosis_step850_games.jsonl",
+                "Step-850 phase4_final_checkpoint.pt",
+            ),
+        ]
+        ran_any = False
+        for path, name in diagnostic_datasets:
+            if not path.is_file():
+                # SY-07 contract: private diagnostic run artifacts are not part
+                # of the publication; skip uninformatively when absent.
+                emit_report(event_line("SKIP", f"{name}: diagnostic dataset not present: {path}"))
+                continue
+            analyze_dataset(
+                str(path),
+                name,
+                max_games=fargs.max_games,
+            )
+            ran_any = True
+        if ran_any:
+            emit_report(summary_block("SUCCESS", time.time() - t0, 0, 0))
+        else:
+            emit_report(
+                summary_block("SUCCESS (no diagnostic datasets present)", time.time() - t0, 0, 0)
+            )
     except KeyboardInterrupt:
         emit_report(summary_block("INTERRUPTED", time.time() - t0, 0, 130))
         raise

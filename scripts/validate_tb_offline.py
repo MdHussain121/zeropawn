@@ -338,17 +338,31 @@ def main(argv=None):
     try:
         datasets = [
             (
-                str(_repo_root / "docs" / "resignfix" / "diagnosis_games.jsonl"),
+                _repo_root / "docs" / "resignfix" / "diagnosis_games.jsonl",
                 "Warm-Start Checkpoint best_model.pt (100 Games)",
             ),
             (
-                str(_repo_root / "docs" / "resignfix" / "diagnosis_step850_games.jsonl"),
+                _repo_root / "docs" / "resignfix" / "diagnosis_step850_games.jsonl",
                 "Halted Run Step-850 Checkpoint (50 Games)",
             ),
         ]
+        run_datasets = []
+        for path, name in datasets:
+            if not path.is_file():
+                # SY-07 contract: diagnostic inputs absent from this checkout
+                # (private run artifacts are not part of the publication) must
+                # skip uninformatively, not fail the gate.
+                emit_report(event_line("SKIP", f"{name}: diagnostic dataset not present: {path}"))
+                continue
+            run_datasets.append((str(path), name))
+        if not run_datasets:
+            emit_report(
+                summary_block("SUCCESS (no diagnostic datasets present)", time.time() - t0, 0, 0)
+            )
+            sys.exit(0)
         results = []
         fail_reasons = []
-        for path_str, name in datasets:
+        for path_str, name in run_datasets:
             res = audit_dataset(
                 path_str,
                 name,

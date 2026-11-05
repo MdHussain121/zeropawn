@@ -471,7 +471,22 @@ class TestSY07ToolingAndProvenance:
     def test_validate_tb_offline_exit_code(self):
         from scripts import validate_tb_offline
 
-        # Run on a tiny sample of 2 games
+        # The tool audits private diagnostic run artifacts (docs/resignfix
+        # JSONLs) that are not part of the publication; on checkouts without
+        # them the gate must exit 0 with SKIP lines (SY-07), not fail. When
+        # present, exercise the real validation on a tiny sample of 2 games.
+        data_ok = all(
+            (Path(validate_tb_offline._repo_root) / "docs" / "resignfix" / n).is_file()
+            for n in ("diagnosis_games.jsonl", "diagnosis_step850_games.jsonl")
+        )
+        if not data_ok:
+            with pytest.raises(SystemExit) as excinfo:
+                validate_tb_offline.main(["--max-games", "2", "--min-agreement", "0.90"])
+            assert excinfo.value.code == 0, (
+                "validate_tb_offline must exit 0 (skip) when diagnostic "
+                f"datasets are absent, got {excinfo.value.code}"
+            )
+            pytest.skip("docs/resignfix diagnostic JSONLs not present in this checkout")
         with pytest.raises(SystemExit) as excinfo:
             validate_tb_offline.main(["--max-games", "2", "--min-agreement", "0.90"])
         assert excinfo.value.code == 0, (
