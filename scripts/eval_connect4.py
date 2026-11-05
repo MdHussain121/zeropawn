@@ -37,7 +37,10 @@ def evaluate_vs_random(model_path="models/connect4_model.pt", num_games=100, sim
     model = Connect4Net().to(device)
 
     if os.path.exists(model_path):
-        model.load_state_dict(torch.load(model_path, map_location=device))
+        # SA3-02: the artifact is a raw Connect4Net state_dict (tensors only),
+        # so restrict deserialization to the weights_only unpickler; arbitrary
+        # pickled objects in the file now fail closed instead of executing.
+        model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
         print(f"Loaded trained weights from {model_path}")
     else:
         print("Model checkpoint not found, running with initial weights")

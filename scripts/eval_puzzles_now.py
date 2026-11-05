@@ -147,7 +147,11 @@ def main() -> None:
             )
 
     emit_report(event_line("LOAD", f"loading weights from {weights_path}"))
-    ckpt = torch.load(weights_path, map_location="cpu")
+    # SA3-02: operator-supplied checkpoints are deserialized tensor-only. This
+    # script consumes only primitives (step/num_blocks/num_filters) and a
+    # state_dict, all of which survive the weights_only unpickler; any payload
+    # carrying arbitrary pickled objects now fails closed instead of executing.
+    ckpt = torch.load(weights_path, map_location="cpu", weights_only=True)
     step = ckpt.get("step", "unknown")
     num_blocks = ckpt.get("num_blocks", 12)
     num_filters = ckpt.get("num_filters", 128)

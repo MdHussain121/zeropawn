@@ -351,7 +351,10 @@ def verify_output_differences(
 
     # 1. Baseline CPU FP32 model
     cpu_model = ChessNet(num_blocks=12, num_filters=128).to("cpu")
-    ckpt = torch.load(checkpoint_path, map_location="cpu")
+    # SA3-02: the guardrail checkpoint is consumed as primitives + a state_dict
+    # only; force the tensor-only weights_only unpickler so a payload carrying
+    # arbitrary pickled objects fails closed instead of being deserialized.
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     state_dict = ckpt["model"] if "model" in ckpt else ckpt.get("model_state_dict", ckpt)
     cpu_model.load_state_dict(state_dict)
     cpu_model.eval()

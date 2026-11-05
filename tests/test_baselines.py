@@ -211,7 +211,7 @@ def test_eval_puzzles_now_none_baseline_formatting(tmp_path, monkeypatch, capsys
     monkeypatch.setattr("scripts.eval_puzzles_now.load_puzzles", lambda p: [MagicMock()] * 10)
     monkeypatch.setattr(
         "torch.load",
-        lambda p, map_location=None: {
+        lambda p, map_location=None, **kwargs: {
             "step": 1000,
             "num_blocks": 2,
             "num_filters": 32,

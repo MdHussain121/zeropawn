@@ -208,7 +208,7 @@ def verify_checkpoints() -> tuple[bool, str]:
     for pt in sorted(models_dir.rglob("*.pt")):
         rel = str(pt.relative_to(REPO_ROOT)).replace("\\", "/")
         h = sha256_file(pt)
-        ckpt = torch.load(pt, map_location="cpu", weights_only=False)
+        ckpt = torch.load(pt, map_location="cpu", weights_only=True)
 
         info = {
             "path": rel,
@@ -327,7 +327,7 @@ def verify_puzzles() -> tuple[bool, str]:
 
     model_path = REPO_ROOT / "models" / "checkpoints_scaled" / "best_model.pt"
     net = ChessNet(num_blocks=12, num_filters=128)
-    ck = torch.load(model_path, map_location="cpu", weights_only=False)
+    ck = torch.load(model_path, map_location="cpu", weights_only=True)
     net.load_state_dict(ck["model"])
 
     puzzles = load_puzzles()[:10]

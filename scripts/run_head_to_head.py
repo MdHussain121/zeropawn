@@ -39,7 +39,7 @@ def load_model(ckpt: str, device: str):
     from python.model.chess_net import ChessNet
 
     model = ChessNet(num_blocks=12, num_filters=128).to(device)
-    ck = torch.load(ckpt, map_location="cpu", weights_only=False)
+    ck = torch.load(ckpt, map_location="cpu", weights_only=True)
     model.load_state_dict(ck.get("model") or ck.get("model_state_dict"))
     model.eval()
     return model
