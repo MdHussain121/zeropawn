@@ -361,10 +361,12 @@ def run_fetch_puzzles(args: argparse.Namespace) -> int:
 
     all_to_write = existing_rows + collected_rows if args.append else collected_rows
 
-    with open(out_path, "w", newline="", encoding="utf-8") as f:
+    tmp_path = out_path.with_name(out_path.name + ".tmp")
+    with open(tmp_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(header)
         writer.writerows(all_to_write)
+    tmp_path.replace(out_path)
 
     emit_report(results_table([("saved", f"{len(all_to_write):,} puzzles in {out_path} (M)")]))
     emit_report(summary_block("SUCCESS", time.time() - t0, 0, 0))

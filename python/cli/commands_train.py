@@ -603,6 +603,16 @@ def register_parser(subparsers: argparse._SubParsersAction) -> None:
             "closed)."
         ),
     )
+    parser.add_argument(
+        "--allow-unverified-warm-start",
+        action="store_true",
+        default=False,
+        help=(
+            "Explicit operator override to warm-start from a checkpoint that is "
+            "not a designated registry entry (logged as an override; use only "
+            "with a documented provisional selection)."
+        ),
+    )
     # ────────────────────────────────────────────────────────────────────────
     # Order matters for merge-safety: the supervised argument set may already
     # register --data-role/--allow-uncertified-data; the idempotent helper runs
@@ -1646,6 +1656,9 @@ def run_training(args: argparse.Namespace) -> int:
                 # Audit SR-02: forward the data gate and buffer-mismatch
                 # overrides so the intended RL workflow is reachable from the
                 # CLI (same gates as the standalone launcher, not weaker ones).
+                allow_unverified_warm_start=bool(
+                    getattr(args, "allow_unverified_warm_start", False)
+                ),
                 data_role=getattr(args, "data_role", None),
                 allow_uncertified_data=bool(getattr(args, "allow_uncertified_data", False)),
                 allow_uncertified_eval=bool(getattr(args, "allow_uncertified_eval", False)),
@@ -1696,6 +1709,9 @@ def run_training(args: argparse.Namespace) -> int:
                 # Audit SR-02: forward the data gate and buffer-mismatch
                 # overrides so the intended RL workflow is reachable from the
                 # CLI (same gates as the standalone launcher, not weaker ones).
+                allow_unverified_warm_start=bool(
+                    getattr(args, "allow_unverified_warm_start", False)
+                ),
                 data_role=getattr(args, "data_role", None),
                 allow_uncertified_data=bool(getattr(args, "allow_uncertified_data", False)),
                 allow_uncertified_eval=bool(getattr(args, "allow_uncertified_eval", False)),

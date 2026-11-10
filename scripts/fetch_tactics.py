@@ -147,6 +147,12 @@ def fetch_tactics(
 
     # Publish only a verified selection (audit F-07): row count matches,
     # PuzzleIds are unique, and no excluded eval-set ID leaked in.
+    if len(selected) < total_needed:
+        tmp_path.unlink(missing_ok=True)
+        raise IOError(
+            f"Tactics CSV fetch fell short: collected {len(selected)} of {total_needed} "
+            f"requested puzzles. Nothing was published."
+        )
     with open(tmp_path, newline="", encoding="utf-8") as f:
         written_rows = list(csv.reader(f))
     written_data = written_rows[1:] if written_rows else []

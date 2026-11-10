@@ -302,6 +302,7 @@ def run_build_compile(args: argparse.Namespace) -> int:
                 str(build_dir),
                 "-G",
                 "MinGW Makefiles",
+                "-DCMAKE_BUILD_TYPE=Release",
                 "-DZEROPAWN_BUILD_PYTHON=ON",
                 "-DZEROPAWN_BUILD_TESTS=ON",
             ],

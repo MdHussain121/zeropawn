@@ -648,7 +648,7 @@ class MatchRunner:
         openings_path: Union[str, Path] = "data/openings/eval_openings_50.epd",
         num_workers: int = 8,
         search_mode: str = "serial",
-        seed: int = 42,
+        seed: Optional[int] = 42,
         stockfish_elo: Optional[int] = None,
         use_book: bool = True,
         book_path: Optional[Union[str, Path]] = "data/openings/curated_book.json",
@@ -669,7 +669,7 @@ class MatchRunner:
             self.batch_size = resolve_batch_size(batch_size, workload="match", default=16)
         else:
             self.batch_size = max(1, int(batch_size))
-        self.seed = int(seed)
+        self.seed = 42 if seed is None else int(seed)
         self.stockfish_elo = stockfish_elo
         self.reuse_tree = reuse_tree
         self.enable_value_adjudication = enable_value_adjudication
@@ -691,6 +691,16 @@ class MatchRunner:
         self.opening_book = None
         if self.use_book and self.book_path:
             p_book = Path(self.book_path)
+            if not p_book.is_file() and not p_book.is_absolute():
+                try:
+                    from python.cli.common import REPO_ROOT
+
+                    cand = REPO_ROOT / p_book
+                    if cand.is_file():
+                        p_book = cand
+                        self.book_path = str(p_book)
+                except Exception:
+                    pass
             if p_book.is_file():
                 try:
                     h = hashlib.sha256()

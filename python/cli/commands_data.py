@@ -113,6 +113,12 @@ def register_parser(subparsers: argparse._SubParsersAction) -> None:
     p_bt.add_argument(
         "--max-solver-plies", type=int, default=4, help="Maximum solver plies per puzzle"
     )
+    p_bt.add_argument(
+        "--force",
+        action="store_true",
+        default=False,
+        help="Force overwrite if target directory already contains a dataset",
+    )
     p_bt.set_defaults(func=run_build_tactics)
 
     # 5. Fetch Elite
@@ -667,6 +673,37 @@ def run_build_tactics(args: argparse.Namespace) -> int:
     out_dir = Path(getattr(args, "output_dir", "data/dataset_tactics"))
     if not out_dir.is_absolute():
         out_dir = REPO_ROOT / out_dir
+
+    protected = {REPO_ROOT, REPO_ROOT / "data", REPO_ROOT / "models"}
+    if out_dir.resolve() in {p.resolve() for p in protected}:
+        console.print(
+            f"[bold red]Refusing to build into {out_dir}: repository-critical directory.[/bold red]"
+        )
+        return 1
+
+    if out_dir.exists() and not out_dir.is_dir():
+        console.print(f"[bold red]Output target exists and is not a directory: {out_dir}[/bold red]")
+        return 1
+
+    existing_entries = _existing_dataset_entries(out_dir)
+    if existing_entries and not getattr(args, "force", False):
+        console.print(
+            Panel(
+                f"[bold red]Refusing to build into {out_dir}:[/bold red] it already contains "
+                f"{_describe_existing_dataset(out_dir)}.\n\n"
+                "Building here would replace existing dataset bytes. Re-run with\n"
+                "[yellow]--force[/yellow] to explicitly overwrite, or choose a fresh staging "
+                "directory for [cyan]--output-dir[/cyan].\n\n"
+                "[dim]Certification note: overwriting a certified dataset invalidates its "
+                "validation receipt; re-run 'zeropawn data validate --dir <dataset> "
+                "--write-receipt' after any rebuild.[/dim]",
+                title="[bold red]Existing Dataset Target[/bold red]",
+                box=box.ROUNDED,
+                border_style="red",
+            )
+        )
+        return 1
+
     out_dir.mkdir(parents=True, exist_ok=True)
 
     max_plies = getattr(args, "max_solver_plies", 4)
@@ -835,10 +872,26 @@ def run_data_list(args: argparse.Namespace) -> int:
         total_bytes = sum(f.stat().st_size for f in d.rglob("*") if f.is_file())
         size_mb = total_bytes / (1024 * 1024)
 
-        has_bins = any((d / "train" / f).is_file() for f in _BIN_FILES) or any(
-            (d / f).is_file() for f in _BIN_FILES
-        )
-        status_str = "[bold green]VALID[/bold green]" if has_bins else "[yellow]PARTIAL[/yellow]"
+        train_has_all = all((d / "train" / f).is_file() for f in _BIN_FILES)
+        root_has_all = all((d / f).is_file() for f in _BIN_FILES)
+        has_all_bins = train_has_all or root_has_all
+        if has_all_bins:
+            receipt = d / "validation_receipt.json"
+            if receipt.is_file():
+                try:
+                    from python.data.dataset_validation import verify_receipt
+
+                    status_str = (
+                        "[bold green]VALID[/bold green]"
+                        if verify_receipt(d)
+                        else "[bold red]INVALID[/bold red]"
+                    )
+                except Exception:
+                    status_str = "[yellow]UNCERTIFIED[/yellow]"
+            else:
+                status_str = "[yellow]UNCERTIFIED[/yellow]"
+        else:
+            status_str = "[yellow]PARTIAL[/yellow]"
 
         table.add_row(
             str(idx),

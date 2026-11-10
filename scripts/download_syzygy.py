@@ -103,19 +103,21 @@ def download_single_file(filename: str, expected_hash: str) -> tuple[str, bool, 
             return filename, True, dest_path.stat().st_size, "cached"
 
     url = f"{BASE_URL_HTTPS}/{filename}"
+    part_path = dest_path.with_name(filename + ".part")
     max_retries = 3
     for attempt in range(max_retries):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=30) as resp:
                 data = resp.read()
-            with open(dest_path, "wb") as f:
+            with open(part_path, "wb") as f:
                 f.write(data)
-            actual_hash = compute_md5(dest_path)
+            actual_hash = compute_md5(part_path)
             if actual_hash == expected_hash:
+                part_path.replace(dest_path)
                 return filename, True, len(data), "downloaded"
             else:
-                dest_path.unlink(missing_ok=True)
+                part_path.unlink(missing_ok=True)
                 if attempt == max_retries - 1:
                     return (
                         filename,
@@ -124,6 +126,7 @@ def download_single_file(filename: str, expected_hash: str) -> tuple[str, bool, 
                         f"hash_mismatch: got {actual_hash} expected {expected_hash}",
                     )
         except Exception as e:
+            part_path.unlink(missing_ok=True)
             if attempt == max_retries - 1:
                 return filename, False, 0, f"error: {str(e)}"
             time.sleep(1.0)
@@ -167,6 +170,11 @@ def main():
 
     try:
         DEST_DIR.mkdir(parents=True, exist_ok=True)
+        free_bytes = shutil.disk_usage(DEST_DIR).free
+        if free_bytes < 450 * 1024 * 1024:
+            raise OSError(
+                f"Insufficient disk space for Syzygy download ({free_bytes / (1024*1024):.1f} MB free, need >= 450 MB)"
+            )
         expected_hashes = get_expected_checksums()
     except Exception as e:
         emit_error(

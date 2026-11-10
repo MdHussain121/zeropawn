@@ -22,6 +22,7 @@ if str(_repo_root) not in sys.path:
     sys.path.insert(0, str(_repo_root))
 
 from python.cli.common import setup_logging
+from python.data.dataset_contract import sha256_file
 from python.common.progress import (
     artifacts_list,
     banner,
@@ -282,7 +283,7 @@ def download_file(
 
     part_dest.replace(destination)
 
-    digest = hasher.hexdigest()
+    digest = sha256_file(destination)
     Path(str(destination) + ".sha256").write_text(
         f"{digest}  {destination.name}\n", encoding="utf-8"
     )

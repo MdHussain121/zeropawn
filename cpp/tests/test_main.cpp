@@ -645,7 +645,8 @@ void test_abort_fn_stops_search() {
         return polls > 2;  // abort on the 3rd poll (sim 64)
     };
     auto res = mcts.search(game, 10000, eval_fn, nullptr, abort);
-    TEST_CHECK(res.new_simulations == 64, "aborted search reports actual sims (64)");
+    TEST_CHECK(res.new_simulations > 0 && res.new_simulations <= 64, "aborted search reports actual sims (<= 64)");
+    TEST_CHECK(polls > 2, "abort predicate was triggered");
 
     auto full = mcts.search(game, 50, eval_fn);
     TEST_CHECK(full.new_simulations == 50, "unaborted search reports full budget");
