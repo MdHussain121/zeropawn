@@ -910,7 +910,9 @@ class Phase4Orchestrator:
         self.disable_resign_prob = 0.15
 
         # 5. Initialize RL Trainer
-        trainer_model = ChessNet(num_blocks=12, num_filters=128).to(self.train_device)
+        cur_blocks = getattr(self.server.model, "num_blocks", 12)
+        cur_filters = getattr(self.server.model, "num_filters", 128)
+        trainer_model = ChessNet(num_blocks=cur_blocks, num_filters=cur_filters).to(self.train_device)
         trainer_state = {
             k: (v.to(self.train_device) if isinstance(v, torch.Tensor) else v)
             for k, v in self.server.model.state_dict().items()
@@ -1077,6 +1079,9 @@ class Phase4Orchestrator:
         if buffer is not None and hasattr(buffer, "buffer_id"):
             live_buffer_id = buffer.buffer_id
         allow_mismatch = bool(getattr(self, "allow_buffer_mismatch", False))
+        cur_blocks = getattr(self.server.model, "num_blocks", 12) if hasattr(self, "server") else 12
+        cur_filters = getattr(self.server.model, "num_filters", 128) if hasattr(self, "server") else 128
+        exp_arch = (cur_blocks, cur_filters)
 
         for f in files:
             if not f.is_file():
@@ -1085,7 +1090,7 @@ class Phase4Orchestrator:
             if verdict is not None:
                 rejected.append(f"{f.name}: quarantined ({verdict})")
                 continue
-            info = inspect_rl_checkpoint(f)
+            info = inspect_rl_checkpoint(f, expected_arch=exp_arch)
             if info is None:
                 rejected.append(f"{f.name}: unreadable or invalid")
                 continue
@@ -2201,8 +2206,10 @@ class Phase4Orchestrator:
             else "disabled (C)"
         )
         min_fill = self.min_buffer_fill if self.min_buffer_fill > 0 else 500
+        net_blocks = getattr(self.server.model, "num_blocks", 12) if hasattr(self, "server") else 12
+        net_filters = getattr(self.server.model, "num_filters", 128) if hasattr(self, "server") else 128
         rows = [
-            ("NET", f"12 blocks x 128 filters (M, ckpt step {step})"),
+            ("NET", f"{net_blocks} blocks x {net_filters} filters (M, ckpt step {step})"),
             (
                 "SIMS",
                 f"full={self.full_search_sims}{'*' if self.full_search_sims != 800 else ''} "

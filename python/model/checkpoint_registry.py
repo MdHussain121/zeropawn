@@ -414,7 +414,7 @@ def verify_checkpoint_identity(
     }
 
 
-def _check_architecture(info: CheckpointInfo) -> None:
+def _check_architecture(info: CheckpointInfo, allow_unverified: bool = False) -> None:
     arch = info.metadata.get("arch") or {}
     # Trainer checkpoints store num_blocks/num_filters at the top level.
     num_blocks = info.metadata.get("num_blocks", arch.get("num_blocks"))
@@ -423,6 +423,13 @@ def _check_architecture(info: CheckpointInfo) -> None:
         # 8,631,454 params is the 12x128 ChessNet signature; a different count
         # means the architecture drifted.
         if info.num_params != 8_631_454:
+            if allow_unverified:
+                logger.warning(
+                    "[WARM-START OVERRIDE] Parameter count %s does not match default 8,631,454 (12x128), "
+                    "permitted under allow_unverified=True.",
+                    info.num_params,
+                )
+                return
             raise WarmStartValidationError(
                 f"{info.path}: parameter count {info.num_params} does not match the "
                 "project architecture signature 8,631,454 (12 blocks x 128 filters)."
@@ -432,6 +439,16 @@ def _check_architecture(info: CheckpointInfo) -> None:
         EXPECTED_ARCHITECTURE["num_blocks"],
         EXPECTED_ARCHITECTURE["num_filters"],
     ):
+        if allow_unverified:
+            logger.warning(
+                "[WARM-START OVERRIDE] Custom architecture %sx%s does not match required %sx%s, "
+                "permitted under allow_unverified=True.",
+                num_blocks,
+                num_filters,
+                EXPECTED_ARCHITECTURE["num_blocks"],
+                EXPECTED_ARCHITECTURE["num_filters"],
+            )
+            return
         raise WarmStartValidationError(
             f"{info.path}: architecture {num_blocks}x{num_filters} does not match the "
             f"required {EXPECTED_ARCHITECTURE['num_blocks']}x{EXPECTED_ARCHITECTURE['num_filters']}."
@@ -460,7 +477,7 @@ def validate_warm_start(
         )
 
     info = inspect_checkpoint(p)
-    _check_architecture(info)
+    _check_architecture(info, allow_unverified=allow_unverified)
 
     sha16 = info.sha256[:16]
     try:

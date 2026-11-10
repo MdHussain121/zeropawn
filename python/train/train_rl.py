@@ -167,7 +167,10 @@ def classify_optimizer_state(ckpt: Dict[str, Any]) -> str:
     return content_class
 
 
-def inspect_rl_checkpoint(path: Union[str, Path]) -> Optional[Dict[str, Any]]:
+def inspect_rl_checkpoint(
+    path: Union[str, Path],
+    expected_arch: Optional[Tuple[int, int]] = (12, 128),
+) -> Optional[Dict[str, Any]]:
     """Read an RL checkpoint's metadata cheaply, or return None if unusable.
 
     Used by auto-resume selection: a file that cannot be opened, lacks model
@@ -190,14 +193,17 @@ def inspect_rl_checkpoint(path: Union[str, Path]) -> Optional[Dict[str, Any]]:
         return None
     blocks = ckpt.get("num_blocks")
     filters = ckpt.get("num_filters")
-    if blocks is not None and filters is not None and (int(blocks), int(filters)) != (12, 128):
-        logger.warning(
-            "Skipping checkpoint %s: architecture %sx%s does not match the project 12x128",
-            p,
-            blocks,
-            filters,
-        )
-        return None
+    if blocks is not None and filters is not None and expected_arch is not None:
+        if (int(blocks), int(filters)) != expected_arch:
+            logger.warning(
+                "Skipping checkpoint %s: architecture %sx%s does not match expected %sx%s",
+                p,
+                blocks,
+                filters,
+                expected_arch[0],
+                expected_arch[1],
+            )
+            return None
     ledger = ckpt.get("run_metadata")
     return {
         "path": str(p),
