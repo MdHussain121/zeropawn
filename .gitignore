@@ -108,3 +108,16 @@ graphify-out/
 .graphify_*
 # Mimosa security scanner state / reports / hook ledger
 .mimosa/
+
+.freebuff/
+
+# -- Private Documentation & Audit Reports ------------------------------------
+audit-reports/
+audit-results/
+audits/
+docs/audits/
+*.audit
+*audit_report*
+*audit-report*
+*AUDIT_REPORT*
+_recovery/
